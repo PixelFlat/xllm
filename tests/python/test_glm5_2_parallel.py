@@ -130,6 +130,50 @@ def test_glm_parallel_world_size_defaults_to_tp_dp_product() -> None:
     assert cfg.world_size == cfg.tp_size * cfg.dp_size * cfg.cp_size == 4
 
 
+@pytest.mark.parametrize(("configured", "expected"), [(None, True), (False, False)])
+def test_glm_mlapo_config_defaults_on_and_can_be_disabled(
+    configured: bool | None,
+    expected: bool,
+) -> None:
+    values = _config()
+    if configured is not None:
+        values["enable_mlapo"] = configured
+
+    cfg = Glm52Config.from_dict(values)
+
+    assert cfg.enable_mlapo is expected
+
+
+@pytest.mark.parametrize(
+    ("enable_mlapo", "device_type", "runtime_supported", "expected"),
+    [
+        (True, "npu", True, True),
+        (True, "privateuseone", True, True),
+        (False, "npu", True, False),
+        (True, "cpu", True, False),
+        (True, "npu", False, False),
+    ],
+)
+def test_glm_mlapo_requires_config_device_and_runtime_support(
+    monkeypatch,
+    enable_mlapo: bool,
+    device_type: str,
+    runtime_supported: bool,
+    expected: bool,
+) -> None:
+    cfg = Glm52Config.from_dict(_config(enable_mlapo=enable_mlapo))
+    supports = MagicMock(return_value=runtime_supported)
+    monkeypatch.setattr(glm5_2.kernels, "supports_mla_preprocess_v2", supports, raising=False)
+
+    actual = glm5_2._can_use_mlapo_v2(cfg, MagicMock(type=device_type))
+
+    assert actual is expected
+    if enable_mlapo and device_type in ("npu", "privateuseone"):
+        supports.assert_called_once_with(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
+    else:
+        supports.assert_not_called()
+
+
 def test_glm_parallel_world_size_includes_context_parallel() -> None:
     cfg = Glm52Config.from_dict(_config(cp_size=2, cp_rank=1, world_size=8, ep_size=8))
 
@@ -189,6 +233,7 @@ class _RecordingLoader(W8A8WeightLoader):
     def __init__(self, model, state_dicts, tp_size: int, tp_rank: int) -> None:
         super().__init__(model, state_dicts, tp_size, tp_rank)
         self.loaded: list[str] = []
+        self.fused_projections: list[tuple[str, str, tuple[str, ...]]] = []
         self.shared_shards: list[tuple[str, int, int]] = []
         type(self).latest = self
 
@@ -225,6 +270,14 @@ class _RecordingLoader(W8A8WeightLoader):
 
     def w8a8_projection_uses_dynamic_activation(self, prefix: str, proj: str) -> bool:
         return self.dynamic_activation
+
+    def load_fused_w8a8_projection(
+        self,
+        prefix: str,
+        target_proj: str,
+        source_projs: tuple[str, ...],
+    ) -> None:
+        self.fused_projections.append((prefix, target_proj, source_projs))
 
     def load_w8a8_mlp(
         self,
@@ -311,6 +364,17 @@ def test_glm_weight_loader_reads_only_local_ep_experts(monkeypatch) -> None:
     assert all(".experts.4." in name or ".experts.5." in name for name in expert_names)
     assert loader.tp_size == 2
     assert loader.tp_rank == 0
+    attention_prefix = "model.layers.0.self_attn."
+    attention_projections = [name for name in loader.loaded if name.startswith(attention_prefix)]
+    assert all(
+        name in attention_projections
+        for name in [
+            attention_prefix + "q_a_proj",
+            attention_prefix + "q_b_proj",
+            attention_prefix + "kv_a_proj_with_mqa",
+        ]
+    )
+    assert loader.fused_projections == []
     assert loader.shared_shards == [("model.layers.0.mlp.shared_experts.", 1, 0)]
 
 

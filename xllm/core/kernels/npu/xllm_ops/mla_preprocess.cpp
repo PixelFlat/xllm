@@ -95,6 +95,14 @@ void check_mla_preprocess_shape_and_dtype(const at::Tensor& input,
 
 }  // namespace
 
+bool has_mla_preprocess_v2() {
+  static const bool is_available =
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnMlaPreprocessV2GetWorkspaceSize") != nullptr &&
+      aclnn::detail::get_op_api_func_addr("aclnnMlaPreprocessV2") != nullptr;
+  return is_available;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mla_preprocess(
     const at::Tensor& input,
     const at::Tensor& gamma0,

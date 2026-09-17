@@ -432,6 +432,8 @@ mla_preprocess_v2(const torch::Tensor& input,
                   int64_t wdkv_split_count,
                   bool q_down_out_flag);
 
+bool has_mla_preprocess_v2();
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 compressor(const at::Tensor& x,
            const at::Tensor& wkv,

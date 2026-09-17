@@ -25,6 +25,7 @@ _PYTHON_ROOT = Path(__file__).parents[2] / "xllm" / "python"
 
 def _install_python_package_stub() -> None:
     kernels = types.ModuleType("xllm.python.kernels")
+    kernels.MLA_PREPROCESS_V2_MAX_TOKENS = 1024
     kernels_npu = types.ModuleType("xllm.python.kernels_npu")
     kernels_npu.__path__ = [str(_PYTHON_ROOT / "kernels_npu")]
     distributed = types.ModuleType("xllm.python.distributed")

@@ -629,6 +629,7 @@ TORCH_LIBRARY(xllm_ops, m) {
       "cache_mode, int quant_mode, bool do_rms_norm, int "
       "wdkv_split_count, bool q_down_out_flag) -> (Tensor, Tensor(a!), "
       "Tensor, Tensor(b!), Tensor)");
+  m.def("has_mla_preprocess_v2() -> bool");
   // ---- DeepSeek-V4 DSA kernels ----
   // MoE hash routing gate (returns routed output, expert_idx, token_unpermute).
   m.def(
@@ -746,6 +747,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
 // runs only on the eager prefill path, so it needs no fake/meta registration;
 // decode graph capture is phase-disjoint.
 TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
+  m.impl("has_mla_preprocess_v2",
+         TORCH_FN(xllm::kernel::npu::has_mla_preprocess_v2));
   m.impl("build_cp_context", TORCH_FN(xllm::build_cp_context_npu));
   // These metadata factories allow every Tensor argument to be omitted, so
   // there may be no device key to dispatch on. Their implementations select

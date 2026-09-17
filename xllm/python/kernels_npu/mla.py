@@ -29,6 +29,9 @@ _NZ_CACHE_MODE = 3
 _PER_TENSOR_QUANT_ASYMM_MODE = 0
 _INT8_NZ_ROW_BLOCK_SIZE = 16
 _INT8_NZ_COLUMN_BLOCK_SIZE = 32
+MLA_PREPROCESS_V2_MAX_TOKENS = 1024
+_MLA_PREPROCESS_V2_KV_LORA_RANK = 512
+_MLA_PREPROCESS_V2_QK_ROPE_HEAD_DIM = 64
 _KV_RMSNORM_ROPE_CACHE = getattr(
     torch_npu,
     "npu_kv_rmsnorm_rope_cache",
@@ -37,8 +40,21 @@ _KV_RMSNORM_ROPE_CACHE = getattr(
 
 
 def has_mla_preprocess_v2() -> bool:
-    """Return whether the xLLM MLAPO v2 operator is registered."""
-    return hasattr(torch.ops.xllm_ops, "mla_preprocess_v2")
+    """Return whether the xLLM binding and CANN MLAPO v2 symbols exist."""
+    capability_op = getattr(torch.ops.xllm_ops, "has_mla_preprocess_v2", None)
+    return capability_op is not None and bool(capability_op())
+
+
+def supports_mla_preprocess_v2(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Return whether MLAPO v2 supports this MLA layout."""
+    return (
+        kv_lora_rank == _MLA_PREPROCESS_V2_KV_LORA_RANK
+        and qk_rope_head_dim == _MLA_PREPROCESS_V2_QK_ROPE_HEAD_DIM
+        and has_mla_preprocess_v2()
+    )
 
 
 def _reorder_rope_axis(
@@ -425,9 +441,11 @@ def _deepseek_mla_preprocess_decode_fake(
 
 
 __all__ = [
+    "MLA_PREPROCESS_V2_MAX_TOKENS",
     "deepseek_mla_preprocess_decode",
     "deepseek_mla_preprocess_decode_v2",
     "has_mla_preprocess_v2",
     "prepare_mla_preprocess_v2_q_b",
     "prepare_mla_preprocess_v2_qkv",
+    "supports_mla_preprocess_v2",
 ]

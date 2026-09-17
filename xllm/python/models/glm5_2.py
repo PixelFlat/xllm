@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python import distributed, kernels
-from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.attention.backend import AttentionBackend, MlaIndexContext, MlaPreprocessContext
 
 # The AICPU tiling of ``aclnnQuantLightningIndexer`` requires
 # ``num_heads_q / num_heads_k == 64``. GLM-5.2 uses ``index_n_heads=32`` and
@@ -82,6 +82,17 @@ from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, 
 # shapes; other gSize values are neither exposed nor tested. GLM-5.2 is 32/1 and pads Q
 # up to 64 heads at the caller (see Glm52Indexer._pad_q_heads_to_kernel_gsize).
 _QLI_KERNEL_GSIZE = 64
+
+
+def _can_use_mlapo_v2(cfg: Glm52Config, device: torch.device) -> bool:
+    return (
+        cfg.enable_mlapo
+        and device.type in ("npu", "privateuseone")
+        and kernels.supports_mla_preprocess_v2(
+            cfg.kv_lora_rank,
+            cfg.qk_rope_head_dim,
+        )
+    )
 
 
 class _W8A8AttentionLinear(nn.Module):
@@ -253,6 +264,7 @@ class Glm52Config:
     indexer_rope_interleave: bool = True
     num_nextn_predict_layers: int = 0
     index_share_for_mtp_iteration: bool = False
+    enable_mlapo: bool = True
     layers_to_capture: tuple[int, ...] = ()
 
     @classmethod
@@ -356,6 +368,7 @@ class Glm52Config:
             indexer_rope_interleave=bool(pick("indexer_rope_interleave", default=True)),
             num_nextn_predict_layers=int(pick("num_nextn_predict_layers", default=0)),
             index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
+            enable_mlapo=bool(pick("enable_mlapo", default=True)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
         cfg._resolve_indexer_types()
@@ -502,6 +515,13 @@ class Glm52MLAAttention(Attention):
         self.v_head_dim = v_head
         self.kv_lora_rank = kv_lora
         self.num_heads_local = num_heads
+        self.q_lora_rank = cfg.q_lora_rank
+        self._use_fused_mla_decode = device.type in (
+            "npu",
+            "privateuseone",
+        )
+        self._use_mlapo_v2 = _can_use_mlapo_v2(cfg, device)
+        self._fused_mla_ready = False
 
         self.q_a_proj = _W8A8AttentionLinear(cfg.hidden_size, cfg.q_lora_rank, device)
         self.kv_a_proj_with_mqa = _W8A8AttentionLinear(cfg.hidden_size, kv_lora + qk_rope, device)
@@ -530,6 +550,24 @@ class Glm52MLAAttention(Attention):
         # native executor disables top-k reuse for that step, then reuses the
         # produced indices on later steps.
         is_mtp_topk_fallback = cfg.model_type.endswith("_mtp") and cfg.index_share_for_mtp_iteration
+        for name in (
+            "_mlapo_input_norm_weight",
+            "_mlapo_input_norm_bias",
+            "_mlapo_q_norm_bias",
+            "_mlapo_qkv_input_offset",
+            "_mlapo_qkv_weight",
+            "_mlapo_qkv_deq_scale",
+            "_mlapo_qkv_quant_bias",
+            "_mlapo_q_b_input_offset",
+            "_mlapo_q_b_weight",
+            "_mlapo_q_b_deq_scale",
+            "_mlapo_q_b_quant_bias",
+        ):
+            self.register_buffer(
+                name,
+                torch.empty(0, dtype=dtype, device=device),
+                persistent=False,
+            )
         self.is_shared = (
             not is_mtp_topk_fallback
             and cfg.indexer_types is not None
@@ -540,7 +578,176 @@ class Glm52MLAAttention(Attention):
         if not self.is_shared:
             self.indexer = Glm52Indexer(cfg, dtype, device)
 
+    def _forward_fused_mla_decode(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        backend: AttentionBackend,
+        context: MlaPreprocessContext,
+        prev_topk_indices: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qkv_proj = getattr(self, "qkv_a_proj", None)
+        qkv_input_scale = qkv_proj.input_scale if qkv_proj is not None else self.kv_a_proj_with_mqa.input_scale
+        if self._use_mlapo_v2 and hidden.shape[0] <= kernels.MLA_PREPROCESS_V2_MAX_TOKENS:
+            q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode_v2(
+                hidden,
+                self._mlapo_input_norm_weight,
+                self._mlapo_input_norm_bias,
+                qkv_input_scale,
+                self._mlapo_qkv_input_offset,
+                self._mlapo_qkv_weight,
+                self._mlapo_qkv_deq_scale,
+                self._mlapo_qkv_quant_bias,
+                self.q_a_layernorm.weight,
+                self._mlapo_q_norm_bias,
+                self.q_b_proj.input_scale,
+                self._mlapo_q_b_input_offset,
+                self._mlapo_q_b_weight,
+                self._mlapo_q_b_deq_scale,
+                self._mlapo_q_b_quant_bias,
+                self.kv_a_layernorm.weight,
+                rope_cos,
+                rope_sin,
+                self.W_UK,
+                context.kv_cache,
+                context.rope_cache,
+                context.slot_mapping[: hidden.shape[0]],
+                self.kv_lora_rank,
+                self.q_lora_rank,
+                self.qk_rope_head_dim,
+                self.q_a_layernorm.eps,
+            )
+        else:
+            q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode(
+                hidden,
+                qkv_input_scale,
+                self._mlapo_qkv_input_offset,
+                self._mlapo_qkv_weight,
+                self._mlapo_qkv_deq_scale,
+                self._mlapo_qkv_quant_bias,
+                self.q_a_layernorm.weight,
+                self.q_b_proj.input_scale,
+                self._mlapo_q_b_input_offset,
+                self._mlapo_q_b_weight,
+                self._mlapo_q_b_deq_scale,
+                self._mlapo_q_b_quant_bias,
+                self.W_UK,
+                self.kv_a_layernorm.weight,
+                rope_cos,
+                rope_sin,
+                context.slot_mapping[: hidden.shape[0]],
+                context.kv_cache,
+                context.rope_cache,
+                self.kv_lora_rank,
+                self.q_lora_rank,
+                self.num_heads_local,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.q_a_layernorm.eps,
+                self.kv_a_layernorm.eps,
+            )
+
+        if self.indexer is not None:
+            index_context = backend.mla_index_context(self)
+            topk = self.indexer.select_qli(
+                hidden,
+                q_c,
+                positions,
+                index_context,
+                cos_sin_cache,
+            )
+        else:
+            if prev_topk_indices is None:
+                raise ValueError(
+                    "Shared DSA layers require top-k indices from a previous "
+                    "full indexer layer (prev_topk_indices is None)."
+                )
+            topk = prev_topk_indices
+
+        attn_out = backend.execute_mla(
+            q_latent,
+            q_pe,
+            None,
+            None,
+            self,
+            topk=topk,
+            cache_is_preprocessed=True,
+        )
+        v_full = kernels.batch_matmul_transpose(
+            attn_out.transpose(0, 1),
+            self.W_UV,
+        )
+        v_full = v_full.reshape(hidden.shape[0], self.num_heads_local * self.v_head_dim)
+        output = self.o_proj(v_full)
+        if self.cfg.tp_size > 1:
+            output_dtype = output.dtype
+            output = output.to(torch.float32)
+            distributed.all_reduce_(output)
+            output = output.to(output_dtype)
+        return output, topk
+
     def process_weights_after_loading(self) -> None:
+        static_mla_projections = self._use_fused_mla_decode and all(
+            module._dynamic_activation is False for module in (self.q_a_proj, self.kv_a_proj_with_mqa, self.q_b_proj)
+        )
+        shared_qkv_quant = (
+            static_mla_projections
+            and torch.equal(
+                self.q_a_proj.input_scale,
+                self.kv_a_proj_with_mqa.input_scale,
+            )
+            and torch.equal(
+                self.q_a_proj.input_offset,
+                self.kv_a_proj_with_mqa.input_offset,
+            )
+        )
+        if self._use_mlapo_v2 and not shared_qkv_quant:
+            self._use_mlapo_v2 = False
+
+        if shared_qkv_quant:
+            kv_weight = self.kv_a_proj_with_mqa.weight.data
+            q_weight = self.q_a_proj.weight.data
+            kv_deq_scale = self.kv_a_proj_with_mqa.deq_scale
+            q_deq_scale = self.q_a_proj.deq_scale
+            kv_quant_bias = self.kv_a_proj_with_mqa.quant_bias
+            q_quant_bias = self.q_a_proj.quant_bias
+            (
+                self._mlapo_qkv_weight,
+                self._mlapo_qkv_deq_scale,
+                self._mlapo_qkv_quant_bias,
+            ) = kernels.prepare_mla_preprocess_v2_qkv(
+                torch.cat((kv_weight, q_weight), dim=0),
+                torch.cat((kv_deq_scale, q_deq_scale), dim=0),
+                torch.cat((kv_quant_bias, q_quant_bias), dim=0),
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+            (
+                self._mlapo_q_b_weight,
+                self._mlapo_q_b_deq_scale,
+                self._mlapo_q_b_quant_bias,
+            ) = kernels.prepare_mla_preprocess_v2_q_b(
+                self.q_b_proj.weight.data,
+                self.q_b_proj.deq_scale,
+                self.q_b_proj.quant_bias,
+                self.num_heads_local,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+            self._mlapo_input_norm_weight = torch.ones(
+                self.cfg.hidden_size,
+                dtype=self.q_a_layernorm.weight.dtype,
+                device=self.q_a_layernorm.weight.device,
+            )
+            self._mlapo_input_norm_bias = torch.zeros_like(self._mlapo_input_norm_weight)
+            self._mlapo_q_norm_bias = torch.zeros_like(self.q_a_layernorm.weight)
+            self._mlapo_qkv_input_offset = self.kv_a_proj_with_mqa.input_offset.to(torch.int8)
+            self._mlapo_q_b_input_offset = self.q_b_proj.input_offset.to(torch.int8)
+            self._fused_mla_ready = True
+
         self.q_a_proj.process_weights_after_loading()
         self.kv_a_proj_with_mqa.process_weights_after_loading()
         self.q_b_proj.process_weights_after_loading()
@@ -566,8 +773,6 @@ class Glm52MLAAttention(Attention):
         reuse_topk_indices: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden.shape[0]
-        q_a = self.q_a_proj(hidden)
-        q_c = self.q_a_layernorm(q_a)
         forward_ctx = get_forward_context()
         backend = forward_ctx.attention_backend
         cp_context = forward_ctx.cp_context
@@ -576,6 +781,40 @@ class Glm52MLAAttention(Attention):
         )
         layer_owner = self.layer_id % self.cfg.layerwise_split_size
         owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
+        fused_mla_ready = getattr(self, "_fused_mla_ready", hasattr(self, "qkv_a_proj"))
+        if not reuse_topk_indices and self._use_fused_mla_decode and fused_mla_ready and cp_context is None and not layerwise:
+            preprocess_context = backend.mla_preprocess_context(self)
+            if preprocess_context is not None:
+                cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+                return self._forward_fused_mla_decode(
+                    hidden,
+                    positions,
+                    cos_sin_cache,
+                    cos,
+                    sin,
+                    backend,
+                    preprocess_context,
+                    prev_topk_indices,
+                )
+
+        q_a_proj = getattr(self, "q_a_proj", None)
+        kv_a_proj = getattr(self, "kv_a_proj_with_mqa", None)
+        if q_a_proj is None or kv_a_proj is None:
+            qkv_proj = self.qkv_a_proj
+            input_quant = kernels.quantize_per_tensor(
+                hidden,
+                qkv_proj.input_scale,
+                qkv_proj.input_offset,
+                torch.qint8,
+                -1,
+            )
+            qkv_a = qkv_proj.forward_quantized(input_quant)
+            kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            kv, q_a = qkv_a.split([kv_dim, self.q_lora_rank], dim=-1)
+        else:
+            q_a = q_a_proj(hidden)
+            kv = kv_a_proj(hidden)
+        q_c = self.q_a_layernorm(q_a)
         if reuse_topk_indices:
             if prev_topk_indices is None:
                 raise ValueError("MTP DSA top-k reuse requires indices from the previous draft step")
@@ -629,7 +868,6 @@ class Glm52MLAAttention(Attention):
         q_latent = torch.bmm(q_nope.transpose(0, 1), self.W_UK).transpose(0, 1)
         cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
         q_pe = _interleave_rope_with(q_rope, cos, sin)
-        kv = self.kv_a_proj_with_mqa(hidden)
         k_latent_raw, k_rope_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_latent = self.kv_a_layernorm(k_latent_raw)
         k_pe = _interleave_rope_with(k_rope_raw.unsqueeze(1), cos, sin)

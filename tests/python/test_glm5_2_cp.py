@@ -509,3 +509,145 @@ def test_glm_attention_reuse_updates_index_cache() -> None:
     assert cache_args[2] is backend.mla_index_context.return_value
     assert cache_args[3] is cos_sin_cache
     assert topk is previous_topk
+
+
+@pytest.mark.parametrize(
+    ("use_mlapo_v2", "num_tokens", "expect_mlapo_v2"),
+    [
+        (False, 2, False),
+        (True, 2, True),
+        (
+            True,
+            glm5_2.kernels.MLA_PREPROCESS_V2_MAX_TOKENS + 1,
+            False,
+        ),
+    ],
+)
+def test_glm_attention_fused_decode_preprocesses_and_writes_cache_once(
+    use_mlapo_v2: bool,
+    num_tokens: int,
+    expect_mlapo_v2: bool,
+) -> None:
+    attention = glm5_2.Glm52MLAAttention.__new__(glm5_2.Glm52MLAAttention)
+    nn.Module.__init__(attention)
+    attention._use_fused_mla_decode = True
+    attention._use_mlapo_v2 = use_mlapo_v2
+    attention.indexer = None
+    attention.num_heads_local = 1
+    attention.q_lora_rank = 2
+    attention.qk_nope_head_dim = 1
+    attention.qk_rope_head_dim = 1
+    attention.kv_lora_rank = 1
+    attention.v_head_dim = 2
+    attention.layer_id = 0
+    attention.cfg = SimpleNamespace(
+        tp_size=1,
+        layerwise_split_size=1,
+        layerwise_split_rank=0,
+    )
+    attention.qkv_a_proj = SimpleNamespace(
+        input_scale=torch.ones(1),
+        input_offset=torch.zeros(1),
+        weight=torch.empty(0),
+        deq_scale=torch.empty(0),
+        quant_bias=torch.empty(0),
+        forward_quantized=MagicMock(),
+    )
+    attention.q_b_proj = SimpleNamespace(
+        input_scale=torch.ones(1),
+        input_offset=torch.zeros(1),
+        weight=torch.empty(0),
+        deq_scale=torch.empty(0),
+        quant_bias=torch.empty(0),
+    )
+    attention.q_a_layernorm = SimpleNamespace(weight=torch.ones(2), eps=1e-5)
+    attention.kv_a_layernorm = SimpleNamespace(weight=torch.ones(1), eps=1e-5)
+    attention._mlapo_input_norm_weight = torch.ones(2)
+    attention._mlapo_input_norm_bias = torch.zeros(2)
+    attention._mlapo_q_norm_bias = torch.zeros(2)
+    attention._mlapo_qkv_input_offset = torch.zeros(1, dtype=torch.int8)
+    attention._mlapo_qkv_weight = torch.empty(0)
+    attention._mlapo_qkv_deq_scale = torch.empty(0)
+    attention._mlapo_qkv_quant_bias = torch.empty(0)
+    attention._mlapo_q_b_input_offset = torch.zeros(1, dtype=torch.int8)
+    attention._mlapo_q_b_weight = torch.empty(0)
+    attention._mlapo_q_b_deq_scale = torch.empty(0)
+    attention._mlapo_q_b_quant_bias = torch.empty(0)
+    attention.W_UK = torch.ones(1, 1, 1)
+    attention.W_UV = torch.ones(1, 1, 2)
+    attention.o_proj = nn.Identity()
+
+    hidden = torch.ones(num_tokens, 2)
+    positions = torch.arange(num_tokens)
+    previous_topk = torch.zeros(num_tokens, 1, dtype=torch.int64)
+    q_c = torch.ones(num_tokens, 2)
+    q_latent = torch.ones(num_tokens, 1, 1)
+    q_pe = torch.ones(num_tokens, 1, 1)
+    attn_out = torch.ones(num_tokens, 1, 1)
+    projected = torch.ones(num_tokens, 1, 2)
+    preprocess_context = glm5_2.MlaPreprocessContext(
+        kv_cache=torch.empty(2, 1, 1),
+        rope_cache=torch.empty(2, 1, 1),
+        slot_mapping=torch.arange(num_tokens + 1),
+    )
+    backend = MagicMock()
+    backend.mla_preprocess_context.return_value = preprocess_context
+    backend.execute_mla.return_value = attn_out
+
+    with (
+        patch.object(
+            glm5_2,
+            "get_forward_context",
+            return_value=SimpleNamespace(
+                attention_backend=backend,
+                cp_context=None,
+                metadata=SimpleNamespace(is_prefill=False, is_chunked_prefill=False),
+            ),
+        ),
+        patch.object(
+            glm5_2,
+            "_gather_interleave_cos_sin",
+            return_value=(torch.empty(0), torch.empty(0)),
+        ),
+        patch.object(
+            glm5_2.kernels,
+            "deepseek_mla_preprocess_decode",
+            return_value=(q_c, q_latent, q_pe),
+            create=True,
+        ) as capturable_preprocess,
+        patch.object(
+            glm5_2.kernels,
+            "deepseek_mla_preprocess_decode_v2",
+            return_value=(q_c, q_latent, q_pe),
+            create=True,
+        ) as mlapo_v2,
+        patch.object(
+            glm5_2.kernels,
+            "batch_matmul_transpose",
+            return_value=projected,
+            create=True,
+        ),
+    ):
+        output, topk = attention(hidden, positions, torch.empty(0), previous_topk)
+
+    attention.qkv_a_proj.forward_quantized.assert_not_called()
+    selected_preprocess = mlapo_v2 if expect_mlapo_v2 else capturable_preprocess
+    unselected_preprocess = capturable_preprocess if expect_mlapo_v2 else mlapo_v2
+    selected_preprocess.assert_called_once()
+    unselected_preprocess.assert_not_called()
+    slot_mapping_arg = 21 if expect_mlapo_v2 else 16
+    torch.testing.assert_close(
+        selected_preprocess.call_args.args[slot_mapping_arg],
+        torch.arange(num_tokens),
+    )
+    backend.execute_mla.assert_called_once_with(
+        q_latent,
+        q_pe,
+        None,
+        None,
+        attention,
+        topk=previous_topk,
+        cache_is_preprocessed=True,
+    )
+    torch.testing.assert_close(output, projected.reshape(num_tokens, 2))
+    assert topk is previous_topk

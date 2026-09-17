@@ -32,7 +32,9 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/npu_ops_api.h"
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "core/kernels/xllm_torch_ops.h"
 
 namespace py = pybind11;
@@ -141,6 +143,20 @@ class NpuXllmOpsTest : public ::testing::Test {
     py::module_::import("xllm.python").attr("initialize_runtime")();
   }
 };
+
+TEST(NpuXllmOpsCapabilityTest, MlaPreprocessV2MatchesRuntimeSymbols) {
+  xllm::ensure_xllm_torch_ops_registered();
+  const bool expected =
+      kernel::npu::aclnn::detail::get_op_api_func_addr(
+          "aclnnMlaPreprocessV2GetWorkspaceSize") != nullptr &&
+      kernel::npu::aclnn::detail::get_op_api_func_addr(
+          "aclnnMlaPreprocessV2") != nullptr;
+  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
+      "xllm_ops::has_mla_preprocess_v2", "");
+  const bool actual = op.typed<bool()>().call();
+
+  EXPECT_EQ(actual, expected);
+}
 
 TEST_F(NpuXllmOpsTest, DispatcherRmsNormMatchesReference) {
   py::gil_scoped_acquire gil;
