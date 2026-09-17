@@ -782,7 +782,13 @@ class Glm52MLAAttention(Attention):
         layer_owner = self.layer_id % self.cfg.layerwise_split_size
         owns_layer_cache = self.cfg.layerwise_split_rank == layer_owner
         fused_mla_ready = getattr(self, "_fused_mla_ready", hasattr(self, "qkv_a_proj"))
-        if not reuse_topk_indices and self._use_fused_mla_decode and fused_mla_ready and cp_context is None and not layerwise:
+        if (
+            not reuse_topk_indices
+            and self._use_fused_mla_decode
+            and fused_mla_ready
+            and cp_context is None
+            and not layerwise
+        ):
             preprocess_context = backend.mla_preprocess_context(self)
             if preprocess_context is not None:
                 cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
