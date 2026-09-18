@@ -3061,6 +3061,23 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
 #if defined(USE_NPU)
   const bool use_explicit_spec_verify_replay_update =
       should_use_explicit_spec_verify_replay_update(input);
+  const bool expand_python_mtp_linear_state_ids =
+      num_val_tokens > 1 &&
+      ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
+      !input_params.embedding.linear_state_ids.empty();
+  std::vector<int32_t> expanded_linear_state_ids;
+  if (expand_python_mtp_linear_state_ids) {
+    CHECK_EQ(input_params.embedding.linear_state_ids.size(),
+             static_cast<size_t>(num_sequences));
+    expanded_linear_state_ids.reserve(
+        static_cast<size_t>(total_num_val_tokens));
+    for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+      expanded_linear_state_ids.insert(
+          expanded_linear_state_ids.end(),
+          num_val_tokens,
+          input_params.embedding.linear_state_ids[static_cast<size_t>(seq_id)]);
+    }
+  }
 #else
   const bool use_explicit_spec_verify_replay_update = false;
 #endif
@@ -3329,9 +3346,9 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     extra_int_inputs.push_back({&buf.out_positions,
                                 &validate_input.positions_host,
                                 &validate_input.positions});
-    if (!input_params.embedding.linear_state_ids.empty()) {
+    if (!expanded_linear_state_ids.empty()) {
       extra_int_inputs.push_back(
-          {&input_params.embedding.linear_state_ids,
+          {&expanded_linear_state_ids,
            nullptr,
            &input_params.embedding.linear_state_indices});
     }
@@ -3388,7 +3405,14 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.graph.input_tokens_override = validate_input.token_ids;
     input_params.graph.spec_verify_source_addresses_stable = true;
   } else {
-    input_params.attention.rebuild_device_buffer(device_);
+    std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
+    if (!expanded_linear_state_ids.empty()) {
+      extra_int_inputs.push_back(
+          {&expanded_linear_state_ids,
+           nullptr,
+           &input_params.embedding.linear_state_indices});
+    }
+    input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
     if (supports_explicit_spec_verify_replay_update()) {
       build_expanded_spec_verify_graph_input(
           input_params, device_, options_.block_size());
@@ -3589,6 +3613,27 @@ void MTPWorkerImpl::prepare_validate_inputs(
     token_num = total_num_val_tokens;
   }
 
+#if defined(USE_NPU)
+  const bool use_explicit_spec_verify_replay_update =
+      should_use_explicit_spec_verify_replay_update(input);
+  const bool expand_python_mtp_linear_state_ids =
+      ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
+      !input_params.embedding.linear_state_ids.empty();
+  std::vector<int32_t> expanded_linear_state_ids;
+  if (expand_python_mtp_linear_state_ids) {
+    CHECK_EQ(input_params.embedding.linear_state_ids.size(),
+             static_cast<size_t>(num_sequences));
+    expanded_linear_state_ids.reserve(
+        static_cast<size_t>(total_num_val_tokens));
+    for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+      expanded_linear_state_ids.insert(
+          expanded_linear_state_ids.end(),
+          per_seq_val_tokens[static_cast<size_t>(seq_id)],
+          input_params.embedding.linear_state_ids[static_cast<size_t>(seq_id)]);
+    }
+  }
+#endif
+
   if (use_chunked_prefill_spec_verify_path()) {
     input_params.embedding.input_embedding = torch::Tensor();
     input_params.is_spec_verify = true;
@@ -3620,12 +3665,30 @@ void MTPWorkerImpl::prepare_validate_inputs(
         accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
   }
 
-  input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
-  if (supports_explicit_spec_verify_replay_update()) {
+  if (use_explicit_spec_verify_replay_update) {
+    std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
+    if (!expanded_linear_state_ids.empty()) {
+      extra_int_inputs.push_back(
+          {&expanded_linear_state_ids,
+           nullptr,
+           &input_params.embedding.linear_state_indices});
+    }
+    input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
     build_expanded_spec_verify_graph_input(
         input_params, device_, options_.block_size());
+  } else {
+    std::vector<AttentionInput::PackedIntInput> extra_int_inputs;
+    if (!expanded_linear_state_ids.empty()) {
+      extra_int_inputs.push_back(
+          {&expanded_linear_state_ids,
+           nullptr,
+           &input_params.embedding.linear_state_indices});
+    }
+    input_params.attention.rebuild_device_buffer(device_, extra_int_inputs);
   }
+#else
+  input_params.attention.rebuild_device_buffer(device_);
 #endif
   validate_input.device_tensors_ready = true;
   finish_metadata_prepare(*prepare_stream_, validate_input);
