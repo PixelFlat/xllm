@@ -16,14 +16,13 @@
 
 from __future__ import annotations
 
+from types import ModuleType
 from typing import Any
 
 import pytest
 import torch
 
 torch_npu = pytest.importorskip("torch_npu")
-
-from xllm.python.kernels_npu import mla
 
 _DTYPE = torch.bfloat16
 _TOKEN_NUM = 2
@@ -39,7 +38,7 @@ _CACHE_MODE = 1  # krope_ctkv
 _QUANT_MODE = 0  # per_tensor_quant_asymm
 
 
-def _require_mla_preprocess_v2() -> None:
+def _require_mla_preprocess_v2() -> ModuleType:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("requires an available Ascend NPU")
     try:
@@ -47,13 +46,15 @@ def _require_mla_preprocess_v2() -> None:
 
         # Loading the built export module registers torch.ops.xllm_ops.
         _ = xllm.xllm_export
+        from xllm.python.kernels_npu import mla
     except (ImportError, OSError) as exc:
         pytest.skip(f"xLLM native extension is not built: {exc}")
     if not mla.has_mla_preprocess_v2():
         pytest.skip("aclnnMlaPreprocessV2 is not available in the loaded runtime")
+    return mla
 
 
-def _make_inputs() -> dict[str, torch.Tensor | int | float | bool]:
+def _make_inputs(mla: ModuleType) -> dict[str, torch.Tensor | int | float | bool]:
     device = torch.device("npu")
     torch.manual_seed(0)
 
@@ -201,8 +202,8 @@ def _run_low_level_op(inputs: dict[str, Any]) -> tuple[torch.Tensor, ...]:
 
 
 def test_mla_preprocess_v2_writes_outputs_and_selected_cache_slots() -> None:
-    _require_mla_preprocess_v2()
-    inputs = _make_inputs()
+    mla = _require_mla_preprocess_v2()
+    inputs = _make_inputs(mla)
 
     q_latent, kv_cache, q_pe, rope_cache, q_c = _run_low_level_op(inputs)
     torch.npu.synchronize()
@@ -220,8 +221,8 @@ def test_mla_preprocess_v2_writes_outputs_and_selected_cache_slots() -> None:
 
 
 def test_mla_preprocess_v2_python_wrapper_matches_low_level_op() -> None:
-    _require_mla_preprocess_v2()
-    low_level_inputs = _make_inputs()
+    mla = _require_mla_preprocess_v2()
+    low_level_inputs = _make_inputs(mla)
     wrapper_inputs = {
         name: value.clone() if isinstance(value, torch.Tensor) else value for name, value in low_level_inputs.items()
     }
