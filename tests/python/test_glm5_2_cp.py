@@ -374,6 +374,7 @@ def test_glm_attention_reduces_o_projection_in_fp32_for_tensor_parallel() -> Non
     attention.kv_lora_rank = 1
     attention.v_head_dim = 2
     attention.layer_id = 0
+    attention._use_fused_mla_decode = False
     attention.cfg = SimpleNamespace(
         tp_size=2,
         layerwise_split_size=1,
