@@ -47,6 +47,8 @@ class TokenizerProxy : public Tokenizer {
 
   size_t vocab_size() const override;
 
+  void warmup() const override;
+
   std::unique_ptr<Tokenizer> clone() const override;
 
  private:

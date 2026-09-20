@@ -60,6 +60,10 @@ class AsyncResponseProcessor final {
 
  private:
   DISALLOW_COPY_AND_ASSIGN(AsyncResponseProcessor);
+
+  // tokenizer instance to decode token ids
+  std::unique_ptr<Tokenizer> tokenizer_;
+
   // the threadpool to handle responses
   ThreadPool response_threadpool_;
 
@@ -68,9 +72,6 @@ class AsyncResponseProcessor final {
 
   // the threadpool to generate outputs
   ThreadPool generate_output_threadpool_;
-
-  // tokenizer instance to decode token ids
-  std::unique_ptr<Tokenizer> tokenizer_;
 
   InstanceRole role_ = InstanceRole::DEFAULT;
 

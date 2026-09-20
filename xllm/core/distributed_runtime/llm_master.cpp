@@ -119,8 +119,10 @@ LLMMaster::LLMMaster(const Options& options)
       ChatTemplate::create(engine_->tokenizer_args(), model_args_.model_type());
 
   tokenizer_ = engine_->tokenizer()->clone();
+  Tokenizer* request_tokenizer = tokenizer_.get();
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/options_.num_request_handling_threads(),
+      [request_tokenizer]() { request_tokenizer->warmup(); },
       /*cpu_binding=*/false,
       /*pool_name=*/"LLMMaster.request");
 

@@ -38,9 +38,13 @@ AsyncResponseProcessor::AsyncResponseProcessor(
     bool enable_service_routing,
     bool disable_log_stats,
     std::function<void(std::shared_ptr<Request>)> cancel_request)
-    : response_threadpool_(
+    : tokenizer_(tokenizer->clone()),
+      response_threadpool_(
           /*num_threads=*/::xllm::ServiceConfig::get_instance()
               .num_response_handling_threads(),
+          [response_tokenizer = tokenizer_.get()]() {
+            response_tokenizer->warmup();
+          },
           /*cpu_binding=*/false,
           /*pool_name=*/"AsyncResponseProcessor.response"),
       rpc_threadpool_(/*num_threads=*/1,
@@ -48,9 +52,11 @@ AsyncResponseProcessor::AsyncResponseProcessor(
                       /*pool_name=*/"AsyncResponseProcessor.rpc"),
       generate_output_threadpool_(
           /*num_threads=*/16,
+          [output_tokenizer = tokenizer_.get()]() {
+            output_tokenizer->warmup();
+          },
           /*cpu_binding=*/false,
           /*pool_name=*/"AsyncResponseProcessor.generate_output"),
-      tokenizer_(tokenizer->clone()),
       role_(role.value_or(InstanceRole::DEFAULT)),
       enable_batch_response_(enable_service_routing),
       disable_log_stats_(disable_log_stats),
