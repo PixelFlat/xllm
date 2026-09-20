@@ -69,6 +69,8 @@ size_t TokenizerProxy::vocab_size() const {
   return get_tls_tokenizer()->vocab_size();
 }
 
+void TokenizerProxy::warmup() const { (void)get_tls_tokenizer(); }
+
 Tokenizer* TokenizerProxy::get_tls_tokenizer() const {
   thread_local std::unique_ptr<Tokenizer> tls_tokenizer(tokenizer_->clone());
   return tls_tokenizer.get();

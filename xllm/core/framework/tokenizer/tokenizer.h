@@ -79,6 +79,9 @@ class Tokenizer {
 
   virtual size_t vocab_size() const { return 0; }
 
+  // Initialize any thread-local tokenizer state before serving requests.
+  virtual void warmup() const {}
+
   virtual std::unique_ptr<Tokenizer> clone() const { return nullptr; }
 };
 
