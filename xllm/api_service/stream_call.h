@@ -113,6 +113,10 @@ class StreamCall : public Call {
 
   // For stream response
   bool write(Response& response) {
+    if (stream_finished_.load(std::memory_order_acquire) || pa_ == nullptr) {
+      return false;
+    }
+
     io_buf_.clear();
     io_buf_.append("data: ");
     butil::IOBufAsZeroCopyOutputStream json_output(&io_buf_);
@@ -130,10 +134,20 @@ class StreamCall : public Call {
 
   // For stream response
   bool finish() {
+    if (stream_finished_.exchange(true, std::memory_order_acq_rel)) {
+      return true;
+    }
+
     io_buf_.clear();
     io_buf_.append("data: [DONE]\n\n");
 
-    pa_->Write(io_buf_);
+    if (pa_ != nullptr) {
+      pa_->Write(io_buf_);
+      // ProgressiveAttachment sends the HTTP chunked-response terminator from
+      // its destructor. Release it here instead of waiting for StreamCall to
+      // be destroyed by the scheduler.
+      pa_.reset();
+    }
     XLLM_VERBOSE_TRACE() << "event=stream_closed x-request-id="
                          << x_request_id_;
     return true;
@@ -162,6 +176,7 @@ class StreamCall : public Call {
 
   bool stream_ = false;
   bool use_arena_ = false;
+  std::atomic<bool> stream_finished_{false};
   butil::intrusive_ptr<brpc::ProgressiveAttachment> pa_;
   butil::IOBuf io_buf_;
 
