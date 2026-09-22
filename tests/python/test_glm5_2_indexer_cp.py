@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 import torch
@@ -372,3 +372,258 @@ def test_packed_chunked_pcp4_preserves_segment_owners_and_prefix(quantized: bool
     assert cache.index.view(16, 2)[[0, 1, 2, 8, 9, 11, 12, 13, 14, 15]].tolist() == [[-9, -9]] * 10
     if quantized:
         assert cache.index_scale.view(-1)[[0, 1, 2, 8, 9, 11, 12, 13, 14, 15]].tolist() == [-9.0] * 10
+
+
+def test_indexer_fuses_k_and_weight_projections_after_loading() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=3,
+        q_lora_rank=2,
+        index_n_heads=2,
+        index_head_dim=2,
+        qk_rope_head_dim=1,
+        index_topk=1,
+        indexer_rope_interleave=False,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer.wq_b._set_dynamic_activation(False)
+    with torch.no_grad():
+        indexer.wk.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+        indexer.weights_proj.weight.copy_(torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]))
+
+    hidden = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+    with patch.object(
+        glm5_2.kernels,
+        "prepare_quant_weight",
+        side_effect=lambda weight: weight,
+        create=True,
+    ):
+        indexer.process_weights_after_loading()
+
+    key, weights = indexer._project_index_inputs(hidden, hidden)
+    expected = hidden @ torch.cat((indexer.wk.weight, indexer.weights_proj.weight), dim=0).T
+    assert indexer._wk_weights_proj_ready
+    assert weights.is_contiguous()
+    torch.testing.assert_close(torch.cat((key, weights), dim=-1), expected)
+
+
+def test_indexer_keeps_separate_projections_for_distinct_cache_rows() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=3,
+        q_lora_rank=2,
+        index_n_heads=2,
+        index_head_dim=2,
+        qk_rope_head_dim=1,
+        index_topk=1,
+        indexer_rope_interleave=False,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    with torch.no_grad():
+        indexer.wk.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+        indexer.weights_proj.weight.copy_(torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]))
+
+    hidden = torch.tensor([[1.0, 2.0, 3.0]])
+    cache_hidden = torch.tensor([[3.0, 2.0, 1.0], [1.0, 3.0, 2.0]])
+    key, weights = indexer._project_index_inputs(hidden, cache_hidden)
+
+    torch.testing.assert_close(key, cache_hidden @ indexer.wk.weight.T)
+    torch.testing.assert_close(weights, hidden @ indexer.weights_proj.weight.T)
+
+
+def test_indexer_invalidates_fused_projection_after_state_dict_load() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=3,
+        q_lora_rank=2,
+        index_n_heads=2,
+        index_head_dim=2,
+        qk_rope_head_dim=1,
+        index_topk=1,
+        indexer_rope_interleave=False,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer.wq_b._set_dynamic_activation(False)
+    with patch.object(
+        glm5_2.kernels,
+        "prepare_quant_weight",
+        side_effect=lambda weight: weight,
+        create=True,
+    ):
+        indexer.process_weights_after_loading()
+    assert indexer._wk_weights_proj_ready
+
+    state_dict = {name: value.clone() for name, value in indexer.state_dict().items()}
+    state_dict["wk.weight"] = torch.full_like(indexer.wk.weight, 2.0)
+    state_dict["weights_proj.weight"] = torch.full_like(indexer.weights_proj.weight, 3.0)
+    indexer.load_state_dict(state_dict)
+
+    hidden = torch.ones((1, cfg.hidden_size))
+    key, weights = indexer._project_index_inputs(hidden, hidden)
+    assert not indexer._wk_weights_proj_ready
+    torch.testing.assert_close(key, torch.full((1, cfg.index_head_dim), 6.0))
+    torch.testing.assert_close(weights, torch.full((1, cfg.index_n_heads), 9.0))
+
+
+def test_interleaved_indexer_rope_uses_inplace_partial_kernel() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=4,
+        q_lora_rank=4,
+        index_n_heads=1,
+        index_head_dim=4,
+        qk_rope_head_dim=2,
+        index_topk=1,
+        indexer_rope_interleave=True,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    value = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    positions = torch.tensor([0, 1])
+    cos_sin_cache = torch.empty(2, 2)
+    cos = torch.tensor([[[[2.0, 2.0]]], [[[3.0, 3.0]]]])
+    sin = torch.tensor([[[[1.0, 1.0]]], [[[1.0, 1.0]]]])
+    calls: list[tuple[torch.Size, torch.Size, torch.Size, int, int]] = []
+
+    def inplace_rope(
+        tensor: torch.Tensor,
+        cosine: torch.Tensor,
+        sine: torch.Tensor,
+        start: int,
+        dim: int,
+    ) -> torch.Tensor:
+        calls.append((tensor.shape, cosine.shape, sine.shape, start, dim))
+        first = tensor[..., 0].clone()
+        second = tensor[..., 1].clone()
+        cosine = cosine[:, 0].unsqueeze(1)
+        sine = sine[:, 0].unsqueeze(1)
+        tensor[..., 0] = first * cosine - second * sine
+        tensor[..., 1] = second * cosine + first * sine
+        return tensor
+
+    with (
+        patch.object(glm5_2, "_gather_interleave_cos_sin", return_value=(cos, sin)),
+        patch.object(
+            glm5_2.kernels,
+            "npu_inplace_partial_rotary_mul",
+            side_effect=inplace_rope,
+            create=True,
+        ),
+    ):
+        output = indexer._apply_interleaved_rope(value, positions, cos_sin_cache)
+
+    assert output.data_ptr() == value.data_ptr()
+    assert calls == [((2, 1, 4), (2, 2), (2, 2), 0, 2)]
+    torch.testing.assert_close(output[:, :2], torch.tensor([[0.0, 5.0], [9.0, 23.0]]))
+
+
+def test_indexer_reuses_interleaved_rope_angles_for_query_and_cache() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=2,
+        q_lora_rank=2,
+        index_n_heads=1,
+        index_head_dim=4,
+        qk_rope_head_dim=2,
+        index_topk=1,
+        indexer_rope_interleave=True,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    index_cache = torch.zeros(1, 1, 1, 4)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+    ctx = SimpleNamespace(
+        actual_seq_q=torch.tensor([1]),
+        actual_seq_kv=torch.tensor([1]),
+        cp_context=None,
+        index_cache=index_cache,
+        index_cache_scale=None,
+        materialize_index_cache=lambda: (index_cache, None, block_table),
+    )
+    hidden = torch.ones(1, 2)
+    positions = torch.tensor([0])
+    cos_sin_cache = torch.empty(1, 2)
+    angles = (torch.ones(1, 1, 1, 2), torch.zeros(1, 1, 1, 2))
+
+    with (
+        patch.object(indexer, "_update_index_cache") as update_cache,
+        patch.object(indexer.wq_b, "forward", return_value=torch.zeros(1, 4)),
+        patch.object(glm5_2, "_gather_interleave_cos_sin", return_value=angles) as gather_angles,
+        patch.object(
+            glm5_2.kernels,
+            "npu_inplace_partial_rotary_mul",
+            side_effect=lambda *_args: None,
+            create=True,
+        ),
+        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(execution_state=None)),
+        patch.object(
+            glm5_2.kernels,
+            "lightning_indexer",
+            return_value=torch.zeros(1, 1, 1, dtype=torch.int32),
+            create=True,
+        ),
+    ):
+        indexer.select_qli(hidden, hidden, positions, ctx, cos_sin_cache)
+
+    gather_angles.assert_called_once_with(cos_sin_cache, positions)
+    update_cache.assert_called_once_with(
+        hidden,
+        positions,
+        ctx,
+        cos_sin_cache,
+        projected_k=ANY,
+        rope_angles=angles,
+    )
+
+
+def test_indexer_keeps_distinct_rope_angles_for_distinct_cache_positions() -> None:
+    cfg = glm5_2.Glm52Config(
+        hidden_size=2,
+        q_lora_rank=2,
+        index_n_heads=1,
+        index_head_dim=4,
+        qk_rope_head_dim=2,
+        index_topk=1,
+        indexer_rope_interleave=True,
+    )
+    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    index_cache = torch.zeros(1, 1, 1, 4)
+    block_table = torch.zeros(1, 1, dtype=torch.int32)
+    ctx = SimpleNamespace(
+        actual_seq_q=torch.tensor([1]),
+        actual_seq_kv=torch.tensor([1]),
+        cp_context=None,
+        index_cache=index_cache,
+        index_cache_scale=None,
+        materialize_index_cache=lambda: (index_cache, None, block_table),
+        update_index_cache=lambda *_args: None,
+    )
+    hidden = torch.ones(1, 2)
+    positions = torch.tensor([0])
+    cache_positions = torch.tensor([0])
+    cos_sin_cache = torch.empty(1, 2)
+    angles = (torch.ones(1, 1, 1, 2), torch.zeros(1, 1, 1, 2))
+
+    with (
+        patch.object(indexer.wk, "forward", return_value=torch.zeros(1, 4)),
+        patch.object(indexer.k_norm, "forward", return_value=torch.zeros(1, 4)),
+        patch.object(indexer.wq_b, "forward", return_value=torch.zeros(1, 4)),
+        patch.object(glm5_2, "_gather_interleave_cos_sin", return_value=angles) as gather_angles,
+        patch.object(
+            glm5_2.kernels,
+            "npu_inplace_partial_rotary_mul",
+            side_effect=lambda *_args: None,
+            create=True,
+        ),
+        patch.object(glm5_2, "get_forward_context", return_value=SimpleNamespace(execution_state=None)),
+        patch.object(
+            glm5_2.kernels,
+            "lightning_indexer",
+            return_value=torch.zeros(1, 1, 1, dtype=torch.int32),
+            create=True,
+        ),
+    ):
+        indexer.select_qli(
+            hidden,
+            hidden,
+            positions,
+            ctx,
+            cos_sin_cache,
+            cache_hidden=hidden,
+            cache_positions=cache_positions,
+        )
+
+    assert gather_angles.call_count == 2

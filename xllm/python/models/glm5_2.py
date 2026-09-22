@@ -36,6 +36,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from xllm.python import distributed, kernels
 from xllm.python.attention.backend import AttentionBackend, MlaIndexContext, MlaPreprocessContext
@@ -1003,6 +1004,12 @@ class Glm52Indexer(nn.Module):
         self.wq_b = _W8A8AttentionLinear(cfg.q_lora_rank, self.n_head * self.head_dim, device)
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim, bias=False, dtype=dtype, device=device)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head, bias=False, dtype=dtype, device=device)
+        self.register_buffer(
+            "_wk_weights_proj_weight",
+            torch.empty(self.head_dim + self.n_head, cfg.hidden_size, dtype=dtype, device=device),
+            persistent=False,
+        )
+        self._wk_weights_proj_ready = False
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6, dtype=dtype, device=device)
         self.register_buffer(
             "hadamard",
@@ -1012,6 +1019,45 @@ class Glm52Indexer(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         self.wq_b.process_weights_after_loading()
+        with torch.no_grad():
+            self._wk_weights_proj_weight.copy_(torch.cat((self.wk.weight, self.weights_proj.weight), dim=0))
+        self._wk_weights_proj_ready = True
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._wk_weights_proj_ready = False
+
+    def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._wk_weights_proj_ready:
+            projected = F.linear(hidden, self._wk_weights_proj_weight)
+            return projected[..., : self.head_dim], projected[..., self.head_dim :].contiguous()
+        return self.wk(hidden), self.weights_proj(hidden)
+
+    def _project_index_inputs(
+        self,
+        hidden: torch.Tensor,
+        cache_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cache_hidden is hidden:
+            return self._project_k_and_weights(hidden)
+        return self.wk(cache_hidden), self.weights_proj(hidden)
 
     def _pad_q_heads_to_kernel_gsize(
         self,
@@ -1046,22 +1092,43 @@ class Glm52Indexer(nn.Module):
         )
         return q, q_scale, weights
 
+    def _apply_interleaved_rope(
+        self,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_angles: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Apply indexer RoPE in place without materializing split tensors."""
+        if rope_angles is None:
+            rope_angles = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        cos, sin = rope_angles
+        cos = cos.view(-1, self.rope_dim)
+        sin = sin.view(-1, self.rope_dim)
+        if value.dim() == 2:
+            value = value.view(-1, 1, self.head_dim)
+            kernels.npu_inplace_partial_rotary_mul(value, cos, sin, 0, self.rope_dim)
+            return value.view(-1, self.head_dim)
+        kernels.npu_inplace_partial_rotary_mul(value, cos, sin, 0, self.rope_dim)
+        return value
+
     def _update_index_cache(
         self,
         cache_hidden: torch.Tensor,
         cache_positions: torch.Tensor,
         ctx: MlaIndexContext,
         cos_sin_cache: torch.Tensor,
+        projected_k: torch.Tensor | None = None,
+        rope_angles: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
-        k = self.wk(cache_hidden)
+        k = self.wk(cache_hidden) if projected_k is None else projected_k
         k = self.k_norm(k)
-        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         if self.indexer_rope_interleave:
-            k_cos, k_sin = _gather_interleave_cos_sin(cos_sin_cache, cache_positions)
-            k_pe = _interleave_rope_with(k_pe.unsqueeze(1), k_cos, k_sin).squeeze(1)
+            k = self._apply_interleaved_rope(k, cache_positions, cos_sin_cache, rope_angles)
         else:
+            k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
             k_pe = _apply_half_rope(cos_sin_cache, k_pe.unsqueeze(1), cache_positions).squeeze(1)
-        k = torch.cat([k_pe, k_nope], dim=-1)
+            k = torch.cat([k_pe, k_nope], dim=-1)
         if ctx.cp_context is not None:
             # Only the padded K rows obey the equal-size CP gather contract.
             k = cp_gather_kv(k, ctx.cp_context).contiguous()
@@ -1090,9 +1157,22 @@ class Glm52Indexer(nn.Module):
     ) -> torch.Tensor:
         actual_seq_q = ctx.actual_seq_q
         actual_seq_kv = ctx.actual_seq_kv
+        cache_positions_are_query_positions = cache_positions is None or cache_positions is positions
         cache_hidden = hidden if cache_hidden is None else cache_hidden
         cache_positions = positions if cache_positions is None else cache_positions
-        self._update_index_cache(cache_hidden, cache_positions, ctx, cos_sin_cache)
+        k, weights = self._project_index_inputs(hidden, cache_hidden)
+        query_is_empty = ctx.cp_context is not None and ctx.cp_context.query_index.numel() == 0
+        shared_rope_angles = None
+        if self.indexer_rope_interleave and cache_positions_are_query_positions and not query_is_empty:
+            shared_rope_angles = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        self._update_index_cache(
+            cache_hidden,
+            cache_positions,
+            ctx,
+            cos_sin_cache,
+            projected_k=k,
+            rope_angles=shared_rope_angles,
+        )
         index_cache = ctx.index_cache
         index_cache_scale = ctx.index_cache_scale
         use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
@@ -1108,14 +1188,12 @@ class Glm52Indexer(nn.Module):
             )
 
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         if self.indexer_rope_interleave:
-            cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
-            q_pe = _interleave_rope_with(q_pe, cos, sin)
+            q = self._apply_interleaved_rope(q, positions, cos_sin_cache, shared_rope_angles)
         else:
+            q_pe, q_nope = torch.split(q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
             q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        weights = self.weights_proj(hidden)
+            q = torch.cat([q_pe, q_nope], dim=-1)
         if use_quant_indexer:
             rotation_scale = self.head_dim**-0.5
             q = torch.matmul(q, self.hadamard) * rotation_scale
