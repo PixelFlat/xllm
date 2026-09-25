@@ -552,6 +552,10 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor? offset, Tensor? pertoken_scale, Tensor? bias, ScalarType? "
       "output_dtype) -> Tensor");
   m.def(
+      "quant_matmul_out(Tensor x1, Tensor x2, bool transpose2, Tensor scale, "
+      "Tensor? offset, Tensor? pertoken_scale, Tensor? bias, ScalarType? "
+      "output_dtype, Tensor(a!) output) -> Tensor(a!)");
+  m.def(
       "quantize_per_tensor(Tensor self, Tensor scales, Tensor zero_points, "
       "ScalarType dtype, int axis) -> Tensor");
   m.def(
@@ -717,6 +721,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("update_decode_graph_metadata",
          TORCH_FN(xllm::update_decode_graph_metadata_npu));
   m.impl("quant_matmul", TORCH_FN(xllm::kernel::npu::quant_matmul));
+  m.impl("quant_matmul_out", TORCH_FN(xllm::kernel::npu::quant_matmul_out));
   m.impl("quantize_per_tensor",
          TORCH_FN(xllm::kernel::npu::quantize_per_tensor));
   m.impl("dynamic_quant", TORCH_FN(xllm::kernel::npu::dynamic_quant));

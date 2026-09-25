@@ -493,6 +493,24 @@ class W8A8DynamicLinear(nn.Module):
             torch.bfloat16,
         )
 
+    def forward_quantized_out(
+        self,
+        x_int8: torch.Tensor,
+        pertoken: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return kernels.quant_matmul_out(
+            x_int8,
+            self.weight,
+            not self._weight_is_transposed,
+            self.weight_scale,
+            None,
+            pertoken,
+            None,
+            torch.bfloat16,
+            output,
+        )
+
     def forward_accumulated(self, x_int8: torch.Tensor) -> torch.Tensor:
         return kernels.quant_matmul(
             x_int8,
@@ -579,6 +597,7 @@ class DeepseekV3MLP(nn.Module):
         self,
         x: torch.Tensor,
         tp_reduce_add: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_int8, pertoken = kernels.dynamic_quant(x)
         gate_up = self.gate_up_proj.forward_accumulated(x_int8)
@@ -588,7 +607,10 @@ class DeepseekV3MLP(nn.Module):
             pertoken,
         )
         reduce_result = self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None)
-        out = self.down_proj.forward_quantized(act_int8, act_scale)
+        if output is None:
+            out = self.down_proj.forward_quantized(act_int8, act_scale)
+        else:
+            out = self.down_proj.forward_quantized_out(act_int8, act_scale, output)
         if tp_reduce_add is not None:
             out = out + tp_reduce_add
         if reduce_result:
@@ -1239,7 +1261,18 @@ class DeepseekV3MoE(nn.Module):
 
     def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._fuse_shared_expert:
-            return self.shared_experts.forward_dequant_swiglu_quant(hidden)
+            output = None
+            if get_forward_context().execution_state is not None:
+                output_shape = (hidden.shape[0], self.hidden)
+                output = get_execution_buffer(
+                    ("MOE_SHARED_EXPERT_OUTPUT", self.layer_id, *output_shape, torch.bfloat16),
+                    lambda: torch.empty(
+                        output_shape,
+                        dtype=torch.bfloat16,
+                        device=hidden.device,
+                    ),
+                )
+            return self.shared_experts.forward_dequant_swiglu_quant(hidden, output=output)
         return self.shared_experts(hidden)
 
     def _combine_expert_outputs(

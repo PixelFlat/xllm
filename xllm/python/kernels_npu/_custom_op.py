@@ -321,6 +321,21 @@ def _quant_matmul_fake(
     return x1.new_empty(out_shape, dtype=dtype)
 
 
+def _quant_matmul_out_fake(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    transpose2: bool,
+    scale: torch.Tensor,
+    offset: torch.Tensor | None,
+    pertoken_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    del x1, x2, transpose2, scale, offset, pertoken_scale, bias, output_dtype
+    return out
+
+
 def _quantize_per_tensor_fake(
     self: torch.Tensor,
     scales: torch.Tensor,
@@ -1079,6 +1094,7 @@ register_fake("xllm_ops::reshape_paged_cache", _reshape_paged_cache_fake)
 register_fake("xllm_ops::mla_preprocess_v2", _mla_preprocess_v2_fake)
 register_fake("xllm_ops::update_decode_graph_metadata", _update_decode_graph_metadata_fake)
 register_fake("xllm_ops::quant_matmul", _quant_matmul_fake)
+register_fake("xllm_ops::quant_matmul_out", _quant_matmul_out_fake)
 register_fake("xllm_ops::quantize_per_tensor", _quantize_per_tensor_fake)
 register_fake("xllm_ops::dynamic_quant", _dynamic_quant_fake)
 register_fake(

@@ -143,6 +143,16 @@ at::Tensor quant_matmul(const at::Tensor& x1,
                         const c10::optional<at::Tensor>& bias,
                         c10::optional<at::ScalarType> output_dtype);
 
+at::Tensor quant_matmul_out(const at::Tensor& x1,
+                            const at::Tensor& x2,
+                            const bool transpose2,
+                            const at::Tensor& scale,
+                            const c10::optional<at::Tensor>& offset,
+                            const c10::optional<at::Tensor>& pertoken_scale,
+                            const c10::optional<at::Tensor>& bias,
+                            c10::optional<at::ScalarType> output_dtype,
+                            at::Tensor& output);
+
 at::Tensor quantize_per_tensor(const at::Tensor& self,
                                const at::Tensor& scales,
                                const at::Tensor& zero_points,

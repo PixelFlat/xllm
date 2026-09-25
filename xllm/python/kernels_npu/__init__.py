@@ -78,7 +78,13 @@ _EXPORTS = {
         "rms_norm_dynamic_quant",
         "rms_norm_gated",
     ),
-    "quantization": ("dynamic_quant", "quant_matmul", "quantize_per_tensor"),
+    "quantization": (
+        "dynamic_quant",
+        "quant_matmul",
+        "quant_matmul_out",
+        "supports_quant_matmul_out",
+        "quantize_per_tensor",
+    ),
     "rotary_embedding": (
         "fused_qk_norm_rope",
         "interleaved_rotary_embedding",
@@ -150,6 +156,8 @@ __all__ = [
     "prepare_mla_preprocess_v2_qkv",
     "supports_mla_preprocess_v2",
     "quant_matmul",
+    "quant_matmul_out",
+    "supports_quant_matmul_out",
     "quantize_per_tensor",
     "dynamic_quant",
     "lightning_indexer",

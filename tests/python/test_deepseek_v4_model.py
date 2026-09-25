@@ -286,6 +286,43 @@ def test_dynamic_linear_preserves_v3_and_v4_weight_layout_contracts(
     assert calls == [False, True]
 
 
+def test_dequant_swiglu_quant_can_write_into_caller_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = DeepseekV4Config.from_dict(_DSV4_CONFIG)
+    mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))
+    gate_up = torch.ones((1, 2 * mlp.down_proj.in_features), dtype=torch.int8)
+    act_int8 = torch.ones((1, mlp.down_proj.in_features), dtype=torch.int8)
+    output = torch.empty((1, cfg.hidden_size), dtype=torch.bfloat16)
+    calls: list[torch.Tensor] = []
+
+    monkeypatch.setattr(
+        deepseek_v32.kernels,
+        "dynamic_quant",
+        lambda _x: (torch.ones((1, cfg.hidden_size), dtype=torch.int8), torch.ones(1)),
+        raising=False,
+    )
+    monkeypatch.setattr(mlp.gate_up_proj, "forward_accumulated", lambda _x: gate_up)
+    monkeypatch.setattr(
+        deepseek_v32.kernels,
+        "dequant_swiglu_quant",
+        lambda *_args: (act_int8, torch.ones(1)),
+        raising=False,
+    )
+
+    def fake_quant_matmul_out(*_args: object) -> torch.Tensor:
+        out = _args[-1]
+        assert isinstance(out, torch.Tensor)
+        calls.append(out)
+        return out
+
+    monkeypatch.setattr(deepseek_v32.kernels, "quant_matmul_out", fake_quant_matmul_out, raising=False)
+    result = mlp.forward_dequant_swiglu_quant(torch.ones((1, cfg.hidden_size)), output=output)
+
+    assert result is output
+    assert calls == [output]
+
+
 def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     cfg = DeepseekV4Config.from_dict({**_DSV4_CONFIG, "tp_size": 2})
     mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))

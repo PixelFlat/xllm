@@ -67,6 +67,55 @@ def quant_matmul(
     )
 
 
+def quant_matmul_out(
+    x1: torch.Tensor,
+    x2: torch.Tensor,
+    transpose2: bool,
+    scale: torch.Tensor,
+    offset: torch.Tensor | None,
+    pertoken_scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Run quantized matmul into a caller-owned output tensor.
+
+    The out variant is used by graph-captured paths to keep the result in a
+    stable execution buffer and avoid allocating a temporary tensor per step.
+    """
+    op = getattr(torch.ops.xllm_ops, "quant_matmul_out", None)
+    if op is None:
+        out.copy_(
+            quant_matmul(
+                x1,
+                x2,
+                transpose2,
+                scale,
+                offset,
+                pertoken_scale,
+                bias,
+                output_dtype,
+            )
+        )
+        return out
+    return op(
+        x1,
+        x2,
+        transpose2,
+        scale,
+        offset,
+        pertoken_scale,
+        bias,
+        output_dtype,
+        out,
+    )
+
+
+def supports_quant_matmul_out() -> bool:
+    """Return whether the native out variant is registered."""
+    return getattr(torch.ops.xllm_ops, "quant_matmul_out", None) is not None
+
+
 def quantize_per_tensor(
     value: torch.Tensor,
     scales: torch.Tensor,
@@ -111,6 +160,8 @@ def dynamic_quant(
 
 __all__ = [
     "quant_matmul",
+    "quant_matmul_out",
+    "supports_quant_matmul_out",
     "quantize_per_tensor",
     "dynamic_quant",
 ]

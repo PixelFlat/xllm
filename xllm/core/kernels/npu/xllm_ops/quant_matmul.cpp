@@ -19,10 +19,9 @@ limitations under the License.
 namespace xllm::kernel::npu {
 namespace {
 
-at::Tensor construct_quant_matmul_output_tensor(const at::Tensor& x1,
-                                                const at::Tensor& x2,
-                                                at::ScalarType output_dtype,
-                                                bool transpose2) {
+std::vector<int64_t> infer_quant_matmul_output_shape(const at::Tensor& x1,
+                                                     const at::Tensor& x2,
+                                                     bool transpose2) {
   TORCH_CHECK(x1.dim() >= 2, "x1 dim must be >= 2 for quant matmul");
   TORCH_CHECK(x2.dim() >= 2, "x2 dim must be >= 2 for quant matmul");
   if (transpose2) {
@@ -43,6 +42,14 @@ at::Tensor construct_quant_matmul_output_tensor(const at::Tensor& x1,
 
   auto out_shape = x1.sizes().vec();
   out_shape.back() = transpose2 ? x2.size(0) : x2.size(1);
+  return out_shape;
+}
+
+at::Tensor construct_quant_matmul_output_tensor(const at::Tensor& x1,
+                                                const at::Tensor& x2,
+                                                at::ScalarType output_dtype,
+                                                bool transpose2) {
+  auto out_shape = infer_quant_matmul_output_shape(x1, x2, transpose2);
   return at::empty(out_shape, x1.options().dtype(output_dtype));
 }
 
@@ -75,6 +82,47 @@ at::Tensor quant_matmul(const at::Tensor& x1,
                transpose2,
                result);
   return result;
+}
+
+at::Tensor quant_matmul_out(const at::Tensor& x1,
+                            const at::Tensor& x2,
+                            const bool transpose2,
+                            const at::Tensor& scale,
+                            const c10::optional<at::Tensor>& offset,
+                            const c10::optional<at::Tensor>& pertoken_scale,
+                            const c10::optional<at::Tensor>& bias,
+                            c10::optional<at::ScalarType> output_dtype,
+                            at::Tensor& output) {
+  const at::ScalarType out_dtype = output_dtype.value_or(at::kChar);
+  const auto expected_shape =
+      infer_quant_matmul_output_shape(x1, x2, transpose2);
+  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(output.scalar_type() == out_dtype,
+              "output dtype must match output_dtype, got ",
+              output.scalar_type(),
+              " vs ",
+              out_dtype);
+  TORCH_CHECK(output.sizes().vec() == expected_shape,
+              "output shape must match quant matmul result, got ",
+              output.sizes(),
+              " vs ",
+              expected_shape);
+
+  const at::Tensor& offset_real = offset.value_or(at::Tensor());
+  const at::Tensor& pertoken_scale_real = pertoken_scale.value_or(at::Tensor());
+  const at::Tensor& bias_real = bias.value_or(at::Tensor());
+  const bool transpose1 = false;
+  EXEC_NPU_CMD(aclnnQuantMatmulV4,
+               x1,
+               x2,
+               scale,
+               offset_real,
+               pertoken_scale_real,
+               bias_real,
+               transpose1,
+               transpose2,
+               output);
+  return output;
 }
 
 }  // namespace xllm::kernel::npu
