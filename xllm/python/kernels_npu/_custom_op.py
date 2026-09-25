@@ -336,6 +336,40 @@ def _quant_matmul_out_fake(
     return out
 
 
+def _moe_grouped_matmul_swiglu_quant_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    group_list: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight_scale, x_scale, group_list
+    return (
+        x.new_empty((x.size(0), weight.size(-1) // 2), dtype=torch.int8),
+        x.new_empty((x.size(0),), dtype=torch.float32),
+    )
+
+
+def _moe_init_routing_v3_fake(
+    x: torch.Tensor,
+    expert_idx: torch.Tensor,
+    active_num: int,
+    expert_num: int,
+    active_expert_range: list[int],
+    quant_mode: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del active_expert_range
+    token_count = x.size(0) * expert_idx.size(1)
+    output_tokens = min(token_count, active_num) if active_num > 0 else token_count
+    output_dtype = torch.int8 if quant_mode != -1 else x.dtype
+    return (
+        x.new_empty((output_tokens, x.size(1)), dtype=output_dtype),
+        expert_idx.new_empty((token_count,), dtype=torch.int32),
+        expert_idx.new_empty((expert_num, 2), dtype=torch.int64),
+        x.new_empty((output_tokens,), dtype=torch.float32),
+    )
+
+
 def _quantize_per_tensor_fake(
     self: torch.Tensor,
     scales: torch.Tensor,
@@ -1095,6 +1129,11 @@ register_fake("xllm_ops::mla_preprocess_v2", _mla_preprocess_v2_fake)
 register_fake("xllm_ops::update_decode_graph_metadata", _update_decode_graph_metadata_fake)
 register_fake("xllm_ops::quant_matmul", _quant_matmul_fake)
 register_fake("xllm_ops::quant_matmul_out", _quant_matmul_out_fake)
+register_fake(
+    "xllm_ops::moe_grouped_matmul_swiglu_quant",
+    _moe_grouped_matmul_swiglu_quant_fake,
+)
+register_fake("xllm_ops::moe_init_routing_v3", _moe_init_routing_v3_fake)
 register_fake("xllm_ops::quantize_per_tensor", _quantize_per_tensor_fake)
 register_fake("xllm_ops::dynamic_quant", _dynamic_quant_fake)
 register_fake(

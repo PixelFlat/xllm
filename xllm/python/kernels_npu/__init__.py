@@ -68,6 +68,7 @@ _EXPORTS = {
         "moe_token_dispatch",
         "prepare_grouped_moe_weights",
         "supports_cutlass_moe",
+        "supports_fused_moe_gmm1",
     ),
     "normalization": (
         "fused_add_rms_norm",
@@ -145,6 +146,7 @@ __all__ = [
     "grouped_moe_with_selected_experts",
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
+    "supports_fused_moe_gmm1",
     "prepare_row_parallel_weight",
     "prepare_quant_weight",
     "MLA_PREPROCESS_V2_MAX_TOKENS",

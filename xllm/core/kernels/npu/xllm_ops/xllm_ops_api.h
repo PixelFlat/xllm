@@ -153,6 +153,25 @@ at::Tensor quant_matmul_out(const at::Tensor& x1,
                             c10::optional<at::ScalarType> output_dtype,
                             at::Tensor& output);
 
+bool has_moe_grouped_matmul_swiglu_quant();
+
+std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& group_list);
+
+bool has_moe_init_routing_v3();
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+moe_init_routing_v3(const torch::Tensor& x,
+                    const torch::Tensor& expert_idx,
+                    int64_t active_num,
+                    int64_t expert_num,
+                    torch::IntArrayRef active_expert_range,
+                    int64_t quant_mode);
+
 at::Tensor quantize_per_tensor(const at::Tensor& self,
                                const at::Tensor& scales,
                                const at::Tensor& zero_points,

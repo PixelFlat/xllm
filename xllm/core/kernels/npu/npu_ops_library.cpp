@@ -556,6 +556,16 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor? offset, Tensor? pertoken_scale, Tensor? bias, ScalarType? "
       "output_dtype, Tensor(a!) output) -> Tensor(a!)");
   m.def(
+      "moe_grouped_matmul_swiglu_quant(Tensor x, Tensor weight, "
+      "Tensor weight_scale, Tensor x_scale, Tensor group_list) -> "
+      "(Tensor, Tensor)");
+  m.def(
+      "moe_init_routing_v3(Tensor x, Tensor expert_idx, int active_num, "
+      "int expert_num, int[] active_expert_range, int quant_mode) -> "
+      "(Tensor, Tensor, Tensor, Tensor)");
+  m.def("has_moe_grouped_matmul_swiglu_quant() -> bool");
+  m.def("has_moe_init_routing_v3() -> bool");
+  m.def(
       "quantize_per_tensor(Tensor self, Tensor scales, Tensor zero_points, "
       "ScalarType dtype, int axis) -> Tensor");
   m.def(
@@ -722,6 +732,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::update_decode_graph_metadata_npu));
   m.impl("quant_matmul", TORCH_FN(xllm::kernel::npu::quant_matmul));
   m.impl("quant_matmul_out", TORCH_FN(xllm::kernel::npu::quant_matmul_out));
+  m.impl("moe_grouped_matmul_swiglu_quant",
+         TORCH_FN(xllm::kernel::npu::moe_grouped_matmul_swiglu_quant));
+  m.impl("moe_init_routing_v3",
+         TORCH_FN(xllm::kernel::npu::moe_init_routing_v3));
   m.impl("quantize_per_tensor",
          TORCH_FN(xllm::kernel::npu::quantize_per_tensor));
   m.impl("dynamic_quant", TORCH_FN(xllm::kernel::npu::dynamic_quant));
@@ -764,6 +778,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
 // runs only on the eager prefill path, so it needs no fake/meta registration;
 // decode graph capture is phase-disjoint.
 TORCH_LIBRARY_IMPL(xllm_ops, CompositeExplicitAutograd, m) {
+  m.impl("has_moe_grouped_matmul_swiglu_quant",
+         TORCH_FN(xllm::kernel::npu::has_moe_grouped_matmul_swiglu_quant));
+  m.impl("has_moe_init_routing_v3",
+         TORCH_FN(xllm::kernel::npu::has_moe_init_routing_v3));
   m.impl("has_mla_preprocess_v2",
          TORCH_FN(xllm::kernel::npu::has_mla_preprocess_v2));
   m.impl("build_cp_context", TORCH_FN(xllm::build_cp_context_npu));

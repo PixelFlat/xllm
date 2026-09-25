@@ -12,6 +12,8 @@ cc_library(
     mtp_prepare_next_draft.cpp
     top_k_top_p.cpp
     quant_matmul.cpp
+    moe_grouped_matmul_swiglu_quant.cpp
+    moe_init_routing_v3.cpp
     quantize.cpp
     quant_dynamic.cpp
     dequant_swiglu_quant.cpp
