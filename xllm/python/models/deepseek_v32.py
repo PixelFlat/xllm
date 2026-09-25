@@ -1262,7 +1262,8 @@ class DeepseekV3MoE(nn.Module):
     def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._fuse_shared_expert:
             output = None
-            if get_forward_context().execution_state is not None:
+            context = get_forward_context()
+            if context.execution_state is not None and context.acl_graph is None:
                 output_shape = (hidden.shape[0], self.hidden)
                 output = get_execution_buffer(
                     ("MOE_SHARED_EXPERT_OUTPUT", self.layer_id, *output_shape, torch.bfloat16),
