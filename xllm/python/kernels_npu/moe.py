@@ -92,6 +92,88 @@ def _grouped_matmul_swiglu_quant_v2(
     )
 
 
+def _graph_gmm2_output(
+    act_i8: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor | None:
+    """Return a stable graph buffer for the routed down projection."""
+    from xllm.python.model_executor.forward_context import (
+        get_execution_buffer,
+        get_forward_context,
+    )
+
+    if get_forward_context().execution_state is None:
+        return None
+
+    output_shape = (act_i8.shape[0], weight.shape[-1])
+    return get_execution_buffer(
+        ("MOE_GMM2_OUTPUT", int(weight.data_ptr()), *output_shape, torch.bfloat16),
+        lambda: torch.empty(
+            output_shape,
+            dtype=torch.bfloat16,
+            device=act_i8.device,
+        ),
+    )
+
+
+def _grouped_matmul_gmm2(
+    *,
+    act_i8: torch.Tensor,
+    act_pertoken_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run GMM2, optionally writing into a graph-owned output buffer."""
+    if weight_scale.dtype != torch.bfloat16:
+        weight_scale = weight_scale.to(torch.bfloat16)
+    if output is None:
+        output = _graph_gmm2_output(act_i8, weight)
+
+    if output is None:
+        return torch.ops.npu.npu_grouped_matmul(
+            x=[act_i8],
+            weight=[weight],
+            scale=[weight_scale],
+            per_token_scale=[act_pertoken_scale],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=torch.bfloat16,
+        )[0]
+
+    grouped_matmul_out = getattr(torch.ops.xllm_ops, "grouped_matmul_out", None)
+    if grouped_matmul_out is None:
+        output.copy_(
+            torch.ops.npu.npu_grouped_matmul(
+                x=[act_i8],
+                weight=[weight],
+                scale=[weight_scale],
+                per_token_scale=[act_pertoken_scale],
+                split_item=2,
+                group_list_type=0,
+                group_type=0,
+                group_list=group_list,
+                output_dtype=torch.bfloat16,
+            )[0]
+        )
+        return output
+
+    return grouped_matmul_out(
+        act_i8,
+        weight,
+        weight_scale,
+        act_pertoken_scale,
+        group_list,
+        2,
+        0,
+        0,
+        output,
+    )
+
+
 def dequant_swiglu_quant(
     x: torch.Tensor,
     weight_scale: torch.Tensor | None,
@@ -298,17 +380,13 @@ def grouped_moe(
             group_list,
         )
         gmm2_group_list = group_list
-    output = torch.ops.npu.npu_grouped_matmul(
-        x=[act_i8],
-        weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
-        per_token_scale=[act_pt],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
+    output = _grouped_matmul_gmm2(
+        act_i8=act_i8,
+        act_pertoken_scale=act_pt,
+        weight=w2,
+        weight_scale=w2_scale,
         group_list=gmm2_group_list,
-        output_dtype=torch.bfloat16,
-    )[0]
+    )
     if expert_range[0] != 0 or expert_range[1] != num_experts:
         local_mask = (topk_ids >= expert_range[0]) & (topk_ids < expert_range[1])
         topk_weights = topk_weights * local_mask
@@ -801,17 +879,13 @@ def moe_expert_compute(
             group_list,
         )
         gmm2_group_list = group_list
-    output = torch.ops.npu.npu_grouped_matmul(
-        x=[act_i8],
-        weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
-        per_token_scale=[act_pt],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
+    output = _grouped_matmul_gmm2(
+        act_i8=act_i8,
+        act_pertoken_scale=act_pt,
+        weight=w2,
+        weight_scale=w2_scale,
         group_list=gmm2_group_list,
-        output_dtype=torch.bfloat16,
-    )[0]
+    )
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,
         sorted_indices=expanded_row_idx.abs(),
@@ -905,17 +979,13 @@ def moe_gmm2_combine(
     expanded_row_idx: torch.Tensor,
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
-    output = torch.ops.npu.npu_grouped_matmul(
-        x=[act_i8],
-        weight=[w2],
-        scale=[w2_scale.to(torch.bfloat16)],
-        per_token_scale=[act_pertoken_scale],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
+    output = _grouped_matmul_gmm2(
+        act_i8=act_i8,
+        act_pertoken_scale=act_pertoken_scale,
+        weight=w2,
+        weight_scale=w2_scale,
         group_list=group_list,
-        output_dtype=torch.bfloat16,
-    )[0]
+    )
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,
         sorted_indices=expanded_row_idx.abs(),

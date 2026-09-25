@@ -556,6 +556,11 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor? offset, Tensor? pertoken_scale, Tensor? bias, ScalarType? "
       "output_dtype, Tensor(a!) output) -> Tensor(a!)");
   m.def(
+      "grouped_matmul_out(Tensor x, Tensor weight, Tensor scale, "
+      "Tensor per_token_scale, Tensor group_list, int split_item, "
+      "int group_type, int group_list_type, Tensor(a!) output) -> "
+      "Tensor(a!)");
+  m.def(
       "moe_grouped_matmul_swiglu_quant(Tensor x, Tensor weight, "
       "Tensor weight_scale, Tensor x_scale, Tensor group_list) -> "
       "(Tensor, Tensor)");
@@ -732,6 +737,7 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::update_decode_graph_metadata_npu));
   m.impl("quant_matmul", TORCH_FN(xllm::kernel::npu::quant_matmul));
   m.impl("quant_matmul_out", TORCH_FN(xllm::kernel::npu::quant_matmul_out));
+  m.impl("grouped_matmul_out", TORCH_FN(xllm::kernel::npu::grouped_matmul_out));
   m.impl("moe_grouped_matmul_swiglu_quant",
          TORCH_FN(xllm::kernel::npu::moe_grouped_matmul_swiglu_quant));
   m.impl("moe_init_routing_v3",

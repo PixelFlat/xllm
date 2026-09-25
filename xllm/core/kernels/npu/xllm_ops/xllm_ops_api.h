@@ -153,6 +153,16 @@ at::Tensor quant_matmul_out(const at::Tensor& x1,
                             c10::optional<at::ScalarType> output_dtype,
                             at::Tensor& output);
 
+at::Tensor grouped_matmul_out(const at::Tensor& x,
+                              const at::Tensor& weight,
+                              const at::Tensor& scale,
+                              const at::Tensor& per_token_scale,
+                              const at::Tensor& group_list,
+                              int64_t split_item,
+                              int64_t group_type,
+                              int64_t group_list_type,
+                              at::Tensor& output);
+
 bool has_moe_grouped_matmul_swiglu_quant();
 
 std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(

@@ -336,6 +336,22 @@ def _quant_matmul_out_fake(
     return out
 
 
+def _grouped_matmul_out_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    per_token_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    split_item: int,
+    group_type: int,
+    group_list_type: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    del x, weight, scale, per_token_scale, group_list
+    del split_item, group_type, group_list_type
+    return out
+
+
 def _moe_grouped_matmul_swiglu_quant_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1129,6 +1145,7 @@ register_fake("xllm_ops::mla_preprocess_v2", _mla_preprocess_v2_fake)
 register_fake("xllm_ops::update_decode_graph_metadata", _update_decode_graph_metadata_fake)
 register_fake("xllm_ops::quant_matmul", _quant_matmul_fake)
 register_fake("xllm_ops::quant_matmul_out", _quant_matmul_out_fake)
+register_fake("xllm_ops::grouped_matmul_out", _grouped_matmul_out_fake)
 register_fake(
     "xllm_ops::moe_grouped_matmul_swiglu_quant",
     _moe_grouped_matmul_swiglu_quant_fake,
