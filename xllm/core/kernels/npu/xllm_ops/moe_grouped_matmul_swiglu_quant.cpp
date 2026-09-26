@@ -24,10 +24,15 @@ namespace xllm::kernel::npu {
 
 bool has_moe_grouped_matmul_swiglu_quant() {
   static const bool available =
-      aclnn::detail::get_op_api_func_addr(
-          "aclnnGroupedMatmulSwigluQuantWeightNZGetWorkspaceSize") != nullptr &&
-      aclnn::detail::get_op_api_func_addr(
-          "aclnnGroupedMatmulSwigluQuantWeightNZ") != nullptr;
+      (aclnn::detail::get_op_api_func_addr(
+           "aclnnMoeGroupedMatmulSwigluQuantGetWorkspaceSize") != nullptr &&
+       aclnn::detail::get_op_api_func_addr(
+           "aclnnMoeGroupedMatmulSwigluQuant") != nullptr) ||
+      (aclnn::detail::get_op_api_func_addr(
+           "aclnnGroupedMatmulSwigluQuantWeightNZGetWorkspaceSize") !=
+           nullptr &&
+       aclnn::detail::get_op_api_func_addr(
+           "aclnnGroupedMatmulSwigluQuantWeightNZ") != nullptr);
   return available;
 }
 
@@ -45,15 +50,48 @@ std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(
       << "group_list must be [E, 2]";
   CHECK(weight.size(2) % 2 == 0) << "the fused projection width must be even";
 
+  const bool exact_moe_api =
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnMoeGroupedMatmulSwigluQuantGetWorkspaceSize") != nullptr &&
+      aclnn::detail::get_op_api_func_addr("aclnnMoeGroupedMatmulSwigluQuant") !=
+          nullptr;
   const int64_t output_width = weight.size(2) / 2;
   torch::Tensor output =
       torch::empty({x.size(0), output_width}, x.options().dtype(torch::kInt8));
   torch::Tensor output_scale =
       torch::empty({x.size(0)}, x.options().dtype(torch::kFloat32));
-  torch::Tensor output_offset =
-      torch::empty({}, x.options().dtype(torch::kFloat32));
   const c10::optional<torch::Tensor> bias = c10::nullopt;
   const c10::optional<torch::Tensor> offset = c10::nullopt;
+  if (exact_moe_api) {
+    const int64_t expert_count = weight.size(0);
+    const int64_t input_width = weight.size(1);
+    const int64_t fused_width = weight.size(2);
+    CHECK(input_width % 16 == 0 && fused_width % 32 == 0)
+        << "private NZ weight dimensions must be aligned to 16 and 32";
+    const std::vector<int64_t> physical_shape = {
+        expert_count, fused_width / 32, input_width / 16, 16, 32};
+    const std::vector<int64_t> physical_stride = {
+        physical_shape[1] * physical_shape[2] * physical_shape[3] *
+            physical_shape[4],
+        physical_shape[2] * physical_shape[3] * physical_shape[4],
+        physical_shape[3] * physical_shape[4],
+        physical_shape[4],
+        1};
+    torch::Tensor physical_weight = weight.as_strided(
+        physical_shape, physical_stride, weight.storage_offset());
+    EXEC_NPU_CMD(aclnnMoeGroupedMatmulSwigluQuant,
+                 x,
+                 physical_weight,
+                 weight_scale,
+                 x_scale,
+                 group_list,
+                 output,
+                 output_scale);
+    return std::make_tuple(output, output_scale);
+  }
+
+  torch::Tensor output_offset =
+      torch::empty({}, x.options().dtype(torch::kFloat32));
   torch::Tensor cumulative_group_list =
       torch::cumsum(group_list.select(1, 1).to(torch::kInt64), 0);
   EXEC_NPU_CMD(aclnnGroupedMatmulSwigluQuantWeightNZ,

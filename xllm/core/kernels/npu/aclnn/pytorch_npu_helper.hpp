@@ -403,6 +403,21 @@ inline aclTensor* convert_type(const at::Tensor& at_tensor) {
     // descriptor must expose the [E, N/32, K/16, 16, 32] tiles.
     storage_dims.clear();
     const auto sizes = at_tensor.sizes();
+    if (sizes.size() == 5) {
+      // Some ACLNN custom operators consume the physical five-dimensional NZ
+      // view directly.  The tensor already carries the matching physical
+      // strides, so preserve both descriptors verbatim.
+      storage_dims.assign(sizes.begin(), sizes.end());
+      return acl_create_tensor(sizes.data(),
+                               sizes.size(),
+                               acl_data_type,
+                               at_tensor.strides().data(),
+                               at_tensor.storage_offset(),
+                               format,
+                               storage_dims.data(),
+                               storage_dims.size(),
+                               const_cast<void*>(at_tensor.storage().data()));
+    }
     CHECK(sizes.size() == 2 || sizes.size() == 3)
         << "FRACTAL_NZ tensor must have two or three view dimensions, got "
         << sizes.size();
