@@ -311,3 +311,67 @@ def test_moe_weight_format_cast_enables_internal_format(
     assert moe.format_cast_nz(weight) is weight
     assert config.allow_internal_format is True
     assert calls == [(weight, 29)]
+
+
+@pytest.mark.parametrize("group_list_type", [0, 2])
+@pytest.mark.parametrize("output_mode", ["eager", "graph_native", "graph_copy"])
+def test_gmm2_preserves_routing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    group_list_type: int,
+    output_mode: str,
+) -> None:
+    moe = _load_npu_moe_module()
+    activations = torch.ones(3, 16, dtype=torch.int8)
+    activation_scale = torch.ones(3, dtype=torch.float32)
+    weight = torch.ones(4, 16, 32, dtype=torch.int8)
+    weight_scale = torch.ones(4, 32, dtype=torch.bfloat16)
+    # Include empty/non-consecutive experts to distinguish counts from offsets.
+    groups = torch.tensor(
+        [[1, 1], [3, 2]] if group_list_type == 2 else [0, 1, 1, 3],
+        dtype=torch.int64,
+    )
+    expected = torch.full((3, 32), 7, dtype=torch.bfloat16)
+    output = None if output_mode == "eager" else torch.empty_like(expected)
+    native_gmm = MagicMock(return_value=[expected])
+    out_gmm = MagicMock(return_value=output)
+    monkeypatch.setattr(moe, "_graph_gmm2_output", lambda *args: output)
+    monkeypatch.setattr(moe.torch.ops.npu, "npu_grouped_matmul", native_gmm, raising=False)
+    monkeypatch.setattr(
+        moe.torch.ops.xllm_ops,
+        "grouped_matmul_out",
+        out_gmm if output_mode == "graph_native" else None,
+        raising=False,
+    )
+
+    actual = moe._grouped_matmul_gmm2(
+        act_i8=activations,
+        act_pertoken_scale=activation_scale,
+        weight=weight,
+        weight_scale=weight_scale,
+        group_list=groups,
+        group_list_type=group_list_type,
+    )
+
+    if output_mode == "graph_native":
+        native_gmm.assert_not_called()
+        out_gmm.assert_called_once_with(
+            activations,
+            weight,
+            weight_scale,
+            activation_scale,
+            groups,
+            2,
+            group_list_type,
+            0,
+            output,
+        )
+        assert actual is output
+    else:
+        out_gmm.assert_not_called()
+        native_gmm.assert_called_once()
+        kwargs = native_gmm.call_args.kwargs
+        assert kwargs["group_list"] is groups
+        assert kwargs["group_list_type"] == group_list_type
+        assert kwargs["per_token_scale"][0] is activation_scale
+        assert actual is (expected if output_mode == "eager" else output)
+        torch.testing.assert_close(actual, expected)

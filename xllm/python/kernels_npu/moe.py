@@ -134,7 +134,7 @@ def _grouped_matmul_gmm2(
             scale=[weight_scale],
             per_token_scale=[act_pertoken_scale],
             split_item=2,
-            group_list_type=0,
+            group_list_type=group_list_type,
             group_type=0,
             group_list=group_list,
             output_dtype=torch.bfloat16,
