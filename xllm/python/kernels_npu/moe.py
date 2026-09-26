@@ -60,11 +60,6 @@ def _moe_init_routing_v3(
     )
 
 
-def _key_value_group_list_to_cumulative(group_list: torch.Tensor) -> torch.Tensor:
-    """Convert V3 [expert, count] metadata to cumulative GMM metadata."""
-    return torch.cumsum(group_list[:, 1].to(torch.int64), dim=0)
-
-
 def _enable_internal_format() -> None:
     """Enable private NPU formats before casting grouped-MoE weights."""
     torch.npu.config.allow_internal_format = True
@@ -123,6 +118,7 @@ def _grouped_matmul_gmm2(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     group_list: torch.Tensor,
+    group_list_type: int = 0,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run GMM2, optionally writing into a graph-owned output buffer."""
@@ -153,7 +149,7 @@ def _grouped_matmul_gmm2(
                 scale=[weight_scale],
                 per_token_scale=[act_pertoken_scale],
                 split_item=2,
-                group_list_type=0,
+                group_list_type=group_list_type,
                 group_type=0,
                 group_list=group_list,
                 output_dtype=torch.bfloat16,
@@ -168,7 +164,7 @@ def _grouped_matmul_gmm2(
         act_pertoken_scale,
         group_list,
         2,
-        0,
+        group_list_type,
         0,
         output,
     )
@@ -370,7 +366,12 @@ def grouped_moe(
             pertoken_scale,
             group_list,
         )
-        gmm2_group_list = _key_value_group_list_to_cumulative(group_list)
+        # Routing V3 produces [expert_id, token_count] pairs.  The fused
+        # gate-up operator and the following down projection share this
+        # metadata format; converting it to cumulative offsets changes the
+        # group-list contract expected by the paired grouped matmul.
+        gmm2_group_list = group_list
+        gmm2_group_list_type = 2
     else:
         act_i8, act_pt = _grouped_matmul_swiglu_quant_v2(
             sorted_hidden_i8,
@@ -380,12 +381,14 @@ def grouped_moe(
             group_list,
         )
         gmm2_group_list = group_list
+        gmm2_group_list_type = 0
     output = _grouped_matmul_gmm2(
         act_i8=act_i8,
         act_pertoken_scale=act_pt,
         weight=w2,
         weight_scale=w2_scale,
         group_list=gmm2_group_list,
+        group_list_type=gmm2_group_list_type,
     )
     if expert_range[0] != 0 or expert_range[1] != num_experts:
         local_mask = (topk_ids >= expert_range[0]) & (topk_ids < expert_range[1])
@@ -858,7 +861,8 @@ def moe_expert_compute(
             pertoken_scale,
             group_list,
         )
-        gmm2_group_list = _key_value_group_list_to_cumulative(group_list)
+        gmm2_group_list = group_list
+        gmm2_group_list_type = 2
     else:
         sorted_hidden_i8, expanded_row_idx, group_list, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
@@ -879,12 +883,14 @@ def moe_expert_compute(
             group_list,
         )
         gmm2_group_list = group_list
+        gmm2_group_list_type = 0
     output = _grouped_matmul_gmm2(
         act_i8=act_i8,
         act_pertoken_scale=act_pt,
         weight=w2,
         weight_scale=w2_scale,
         group_list=gmm2_group_list,
+        group_list_type=gmm2_group_list_type,
     )
     return torch_npu.npu_moe_token_unpermute(
         permuted_tokens=output,
