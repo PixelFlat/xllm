@@ -69,39 +69,21 @@ void run_quant_matmul(const at::Tensor& x1,
                       const at::Tensor& pertoken_scale,
                       const at::Tensor& bias,
                       at::Tensor& output) {
-  const bool use_weight_nz =
-      !transpose2 && get_tensor_npu_format(x2) == ACL_FORMAT_FRACTAL_NZ;
-  bool transpose1 = false;
-  int64_t group_size = 0;
-  if (use_weight_nz) {
-    static const bool weight_nz_available =
-        aclnn::detail::get_op_api_func_addr("aclnnQuantMatmulWeightNz") !=
-            nullptr &&
-        aclnn::detail::get_op_api_func_addr(
-            "aclnnQuantMatmulWeightNzGetWorkspaceSize") != nullptr;
-    if (weight_nz_available) {
-      const auto empty_options = output.options();
-      at::Tensor y_scale = at::empty({0}, empty_options);
-      at::Tensor x1_offset = at::empty({0}, empty_options);
-      at::Tensor y_offset = at::empty({0}, empty_options);
-      EXEC_NPU_CMD(aclnnQuantMatmulWeightNz,
-                   x1,
-                   x2,
-                   pertoken_scale,
-                   scale,
-                   y_scale,
-                   x1_offset,
-                   offset,
-                   y_offset,
-                   bias,
-                   transpose1,
-                   transpose2,
-                   group_size,
-                   output);
-      return;
-    }
+  const bool nz_decode_available =
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnQuantMatmulNzDecodeGetWorkspaceSize") != nullptr &&
+      aclnn::detail::get_op_api_func_addr("aclnnQuantMatmulNzDecode") !=
+          nullptr;
+  const bool use_nz_decode =
+      nz_decode_available && !transpose2 && x1.dim() == 2 && x1.size(0) > 0 &&
+      x1.size(0) <= 16 && x2.dim() == 2 && bias.defined() &&
+      output.scalar_type() == at::kBFloat16 &&
+      get_tensor_npu_format(x2) == ACL_FORMAT_FRACTAL_NZ;
+  if (use_nz_decode) {
+    EXEC_NPU_CMD(aclnnQuantMatmulNzDecode, x1, x2, scale, bias, output);
+    return;
   }
-
+  bool transpose1 = false;
   EXEC_NPU_CMD(aclnnQuantMatmulV4,
                x1,
                x2,
