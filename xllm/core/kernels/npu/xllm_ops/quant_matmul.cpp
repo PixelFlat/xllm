@@ -19,6 +19,14 @@ limitations under the License.
 namespace xllm::kernel::npu {
 namespace {
 
+int64_t get_tensor_npu_format(const at::Tensor& tensor) {
+#ifdef TORCH_HIGHER_THAN_PTA6
+  return at_npu::native::get_npu_format(tensor);
+#else
+  return at_npu::native::NPUNativeFunctions::get_npu_format(tensor);
+#endif
+}
+
 std::vector<int64_t> infer_quant_matmul_output_shape(const at::Tensor& x1,
                                                      const at::Tensor& x2,
                                                      bool transpose2) {
@@ -53,6 +61,59 @@ at::Tensor construct_quant_matmul_output_tensor(const at::Tensor& x1,
   return at::empty(out_shape, x1.options().dtype(output_dtype));
 }
 
+void run_quant_matmul(const at::Tensor& x1,
+                      const at::Tensor& x2,
+                      bool transpose2,
+                      const at::Tensor& scale,
+                      const at::Tensor& offset,
+                      const at::Tensor& pertoken_scale,
+                      const at::Tensor& bias,
+                      at::Tensor& output) {
+  const bool use_weight_nz =
+      !transpose2 && get_tensor_npu_format(x2) == ACL_FORMAT_FRACTAL_NZ;
+  bool transpose1 = false;
+  int64_t group_size = 0;
+  if (use_weight_nz) {
+    static const bool weight_nz_available =
+        aclnn::detail::get_op_api_func_addr("aclnnQuantMatmulWeightNz") !=
+            nullptr &&
+        aclnn::detail::get_op_api_func_addr(
+            "aclnnQuantMatmulWeightNzGetWorkspaceSize") != nullptr;
+    if (weight_nz_available) {
+      const auto empty_options = output.options();
+      at::Tensor y_scale = at::empty({0}, empty_options);
+      at::Tensor x1_offset = at::empty({0}, empty_options);
+      at::Tensor y_offset = at::empty({0}, empty_options);
+      EXEC_NPU_CMD(aclnnQuantMatmulWeightNz,
+                   x1,
+                   x2,
+                   pertoken_scale,
+                   scale,
+                   y_scale,
+                   x1_offset,
+                   offset,
+                   y_offset,
+                   bias,
+                   transpose1,
+                   transpose2,
+                   group_size,
+                   output);
+      return;
+    }
+  }
+
+  EXEC_NPU_CMD(aclnnQuantMatmulV4,
+               x1,
+               x2,
+               scale,
+               offset,
+               pertoken_scale,
+               bias,
+               transpose1,
+               transpose2,
+               output);
+}
+
 }  // namespace
 
 at::Tensor quant_matmul(const at::Tensor& x1,
@@ -66,21 +127,18 @@ at::Tensor quant_matmul(const at::Tensor& x1,
   const at::Tensor& offset_real = offset.value_or(at::Tensor());
   const at::Tensor& pertoken_scale_real = pertoken_scale.value_or(at::Tensor());
   const at::Tensor& bias_real = bias.value_or(at::Tensor());
-  const bool transpose1 = false;
   const at::ScalarType out_dtype = output_dtype.value_or(at::kChar);
 
   at::Tensor result =
       construct_quant_matmul_output_tensor(x1, x2, out_dtype, transpose2);
-  EXEC_NPU_CMD(aclnnQuantMatmulV4,
-               x1,
-               x2,
-               scale,
-               offset_real,
-               pertoken_scale_real,
-               bias_real,
-               transpose1,
-               transpose2,
-               result);
+  run_quant_matmul(x1,
+                   x2,
+                   transpose2,
+                   scale,
+                   offset_real,
+                   pertoken_scale_real,
+                   bias_real,
+                   result);
   return result;
 }
 
@@ -111,17 +169,14 @@ at::Tensor quant_matmul_out(const at::Tensor& x1,
   const at::Tensor& offset_real = offset.value_or(at::Tensor());
   const at::Tensor& pertoken_scale_real = pertoken_scale.value_or(at::Tensor());
   const at::Tensor& bias_real = bias.value_or(at::Tensor());
-  const bool transpose1 = false;
-  EXEC_NPU_CMD(aclnnQuantMatmulV4,
-               x1,
-               x2,
-               scale,
-               offset_real,
-               pertoken_scale_real,
-               bias_real,
-               transpose1,
-               transpose2,
-               output);
+  run_quant_matmul(x1,
+                   x2,
+                   transpose2,
+                   scale,
+                   offset_real,
+                   pertoken_scale_real,
+                   bias_real,
+                   output);
   return output;
 }
 

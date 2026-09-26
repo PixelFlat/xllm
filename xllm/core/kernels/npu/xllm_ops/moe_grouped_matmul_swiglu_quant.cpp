@@ -25,9 +25,9 @@ namespace xllm::kernel::npu {
 bool has_moe_grouped_matmul_swiglu_quant() {
   static const bool available =
       aclnn::detail::get_op_api_func_addr(
-          "aclnnMoeGroupedMatmulSwigluQuantGetWorkspaceSize") != nullptr &&
-      aclnn::detail::get_op_api_func_addr("aclnnMoeGroupedMatmulSwigluQuant") !=
-          nullptr;
+          "aclnnGroupedMatmulSwigluQuantWeightNZGetWorkspaceSize") != nullptr &&
+      aclnn::detail::get_op_api_func_addr(
+          "aclnnGroupedMatmulSwigluQuantWeightNZ") != nullptr;
   return available;
 }
 
@@ -50,14 +50,23 @@ std::tuple<torch::Tensor, torch::Tensor> moe_grouped_matmul_swiglu_quant(
       torch::empty({x.size(0), output_width}, x.options().dtype(torch::kInt8));
   torch::Tensor output_scale =
       torch::empty({x.size(0)}, x.options().dtype(torch::kFloat32));
-  EXEC_NPU_CMD(aclnnMoeGroupedMatmulSwigluQuant,
+  torch::Tensor output_offset =
+      torch::empty({}, x.options().dtype(torch::kFloat32));
+  const c10::optional<torch::Tensor> bias = c10::nullopt;
+  const c10::optional<torch::Tensor> offset = c10::nullopt;
+  torch::Tensor cumulative_group_list =
+      torch::cumsum(group_list.select(1, 1).to(torch::kInt64), 0);
+  EXEC_NPU_CMD(aclnnGroupedMatmulSwigluQuantWeightNZ,
                x,
                weight,
+               bias,
+               offset,
                weight_scale,
                x_scale,
-               group_list,
+               cumulative_group_list,
                output,
-               output_scale);
+               output_scale,
+               output_offset);
   return std::make_tuple(output, output_scale);
 }
 
