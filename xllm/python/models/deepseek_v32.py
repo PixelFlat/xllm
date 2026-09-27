@@ -643,12 +643,17 @@ class DeepseekV3MLP(nn.Module):
             int(self.gate_up_proj.weight.data_ptr()),
             num_tokens,
         )
+
+        def create_group_list() -> torch.Tensor:
+            group_list = torch.empty((1, 2), dtype=torch.int64, device=device)
+            group_list[0, 0] = 0
+            group_list[0, 1] = num_tokens
+            return group_list
+
         group_list = get_execution_buffer(
             key,
-            lambda: torch.empty((1, 2), dtype=torch.int64, device=device),
+            create_group_list,
         )
-        group_list[0, 0] = 0
-        group_list[0, 1] = num_tokens
         return group_list
 
     def quantize_and_project_gate_up(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
