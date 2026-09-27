@@ -125,10 +125,10 @@ torch::Tensor quant_matmul_out(
     const torch::Tensor& x2,
     const bool transpose2,
     const torch::Tensor& scale,
-    const c10::optional<torch::Tensor>& offset,
-    const c10::optional<torch::Tensor>& pertoken_scale,
-    const c10::optional<torch::Tensor>& bias,
-    c10::optional<torch::ScalarType> output_dtype,
+    const std::optional<torch::Tensor>& offset,
+    const std::optional<torch::Tensor>& pertoken_scale,
+    const std::optional<torch::Tensor>& bias,
+    std::optional<torch::ScalarType> output_dtype,
     torch::Tensor& output) {
   const torch::ScalarType out_dtype = output_dtype.value_or(torch::kChar);
   const auto expected_shape =

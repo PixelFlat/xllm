@@ -143,25 +143,26 @@ at::Tensor quant_matmul(const at::Tensor& x1,
                         const c10::optional<at::Tensor>& bias,
                         c10::optional<at::ScalarType> output_dtype);
 
-at::Tensor quant_matmul_out(const at::Tensor& x1,
-                            const at::Tensor& x2,
-                            const bool transpose2,
-                            const at::Tensor& scale,
-                            const c10::optional<at::Tensor>& offset,
-                            const c10::optional<at::Tensor>& pertoken_scale,
-                            const c10::optional<at::Tensor>& bias,
-                            c10::optional<at::ScalarType> output_dtype,
-                            at::Tensor& output);
+torch::Tensor quant_matmul_out(
+    const torch::Tensor& x1,
+    const torch::Tensor& x2,
+    const bool transpose2,
+    const torch::Tensor& scale,
+    const std::optional<torch::Tensor>& offset,
+    const std::optional<torch::Tensor>& pertoken_scale,
+    const std::optional<torch::Tensor>& bias,
+    std::optional<torch::ScalarType> output_dtype,
+    torch::Tensor& output);
 
-at::Tensor grouped_matmul_out(const at::Tensor& x,
-                              const at::Tensor& weight,
-                              const at::Tensor& scale,
-                              const at::Tensor& per_token_scale,
-                              const at::Tensor& group_list,
-                              int64_t split_item,
-                              int64_t group_type,
-                              int64_t group_list_type,
-                              at::Tensor& output);
+torch::Tensor grouped_matmul_out(const torch::Tensor& x,
+                                 const torch::Tensor& weight,
+                                 const torch::Tensor& scale,
+                                 const torch::Tensor& per_token_scale,
+                                 const torch::Tensor& group_list,
+                                 int64_t split_item,
+                                 int64_t group_type,
+                                 int64_t group_list_type,
+                                 torch::Tensor& output);
 
 bool has_moe_grouped_matmul_swiglu_quant();
 
