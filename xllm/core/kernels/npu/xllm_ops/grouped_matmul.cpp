@@ -24,38 +24,34 @@ namespace xllm::kernel::npu {
 namespace {
 
 std::vector<int64_t> infer_grouped_matmul_output_shape(
-    const at::Tensor& x,
-    const at::Tensor& weight) {
-  TORCH_CHECK(x.dim() == 2, "x must have shape [M, K]");
-  TORCH_CHECK(weight.dim() == 3, "weight must have shape [E, K, N]");
-  TORCH_CHECK(x.size(1) == weight.size(1),
-              "x K dimension must match weight K dimension, got ",
-              x.size(1),
-              " vs ",
-              weight.size(1));
+    const torch::Tensor& x,
+    const torch::Tensor& weight) {
+  CHECK(x.dim() == 2) << "x must have shape [M, K]";
+  CHECK(weight.dim() == 3) << "weight must have shape [E, K, N]";
+  CHECK(x.size(1) == weight.size(1))
+      << "x K dimension must match weight K dimension, got " << x.size(1)
+      << " vs " << weight.size(1);
   return {x.size(0), weight.size(2)};
 }
 
 }  // namespace
 
-at::Tensor grouped_matmul_out(const at::Tensor& x,
-                              const at::Tensor& weight,
-                              const at::Tensor& scale,
-                              const at::Tensor& per_token_scale,
-                              const at::Tensor& group_list,
-                              int64_t split_item,
-                              int64_t group_type,
-                              int64_t group_list_type,
-                              at::Tensor& output) {
+torch::Tensor grouped_matmul_out(const torch::Tensor& x,
+                                 const torch::Tensor& weight,
+                                 const torch::Tensor& scale,
+                                 const torch::Tensor& per_token_scale,
+                                 const torch::Tensor& group_list,
+                                 int64_t split_item,
+                                 int64_t group_type,
+                                 int64_t group_list_type,
+                                 torch::Tensor& output) {
   const auto expected_shape = infer_grouped_matmul_output_shape(x, weight);
-  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-  TORCH_CHECK(output.sizes().vec() == expected_shape,
-              "output shape must match grouped matmul result, got ",
-              output.sizes(),
-              " vs ",
-              expected_shape);
-  TORCH_CHECK(output.device() == x.device(),
-              "output and x must be on the same device");
+  CHECK(output.is_contiguous()) << "output must be contiguous";
+  CHECK(output.sizes().vec() == expected_shape)
+      << "output shape must match grouped matmul result, got " << output.sizes()
+      << " vs " << expected_shape;
+  CHECK(output.device() == x.device())
+      << "output and x must be on the same device";
 
   std::vector<torch::Tensor> x_storage{x};
   std::vector<torch::Tensor> weight_storage{weight};
