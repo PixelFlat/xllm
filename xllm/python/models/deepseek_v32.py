@@ -502,13 +502,13 @@ class W8A8DynamicLinear(nn.Module):
         return kernels.quant_matmul_out(
             x_int8,
             self.weight,
-            not self._weight_is_transposed,
-            self.weight_scale,
-            None,
-            pertoken,
-            None,
-            torch.bfloat16,
-            output,
+            transpose2=not self._weight_is_transposed,
+            scale=self.weight_scale,
+            offset=None,
+            pertoken_scale=pertoken,
+            bias=None,
+            output_dtype=torch.bfloat16,
+            out=output,
         )
 
     def forward_accumulated(self, x_int8: torch.Tensor) -> torch.Tensor:
