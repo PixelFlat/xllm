@@ -252,12 +252,13 @@ class TestDeepseekV3MoEForward:
         shared = torch.full((4, 64), 2.0)
         moe._run_routed_experts = MagicMock(return_value=routed)
         moe._run_shared_experts = MagicMock(return_value=shared)
+        expected = routed + shared
 
         ctx = _mock_forward_context(dp_execution_token_counts=(4,), is_graph=True)
         with forward_context(ctx):
             result = moe.forward(torch.randn(4, 64))
 
-        torch.testing.assert_close(result, routed + shared)
+        torch.testing.assert_close(result, expected)
         moe._run_routed_experts.assert_called_once()
         moe._run_shared_experts.assert_called_once()
 
