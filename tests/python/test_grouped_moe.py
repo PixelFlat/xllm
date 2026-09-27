@@ -36,6 +36,14 @@ def _load_npu_moe_module():
     return module
 
 
+def test_moe_metadata_dtype_reuse() -> None:
+    moe = _load_npu_moe_module()
+    metadata = torch.empty(2, dtype=torch.int32)
+
+    assert moe._to_dtype_if_needed(metadata, torch.int32) is metadata
+    assert moe._to_dtype_if_needed(metadata, torch.int64).dtype == torch.int64
+
+
 def test_selected_expert_moe_matches_native_call_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
