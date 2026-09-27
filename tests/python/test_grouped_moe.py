@@ -361,8 +361,8 @@ def test_gmm2_preserves_routing_metadata(
             activation_scale,
             groups,
             2,
-            group_list_type,
             0,
+            group_list_type,
             output,
         )
         assert actual is output

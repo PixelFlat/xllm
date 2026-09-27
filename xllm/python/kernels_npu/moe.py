@@ -164,8 +164,8 @@ def _grouped_matmul_gmm2(
         act_pertoken_scale,
         group_list,
         2,
-        group_list_type,
         0,
+        group_list_type,
         output,
     )
 
