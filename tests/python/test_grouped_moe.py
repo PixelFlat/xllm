@@ -360,10 +360,10 @@ def test_gmm2_preserves_routing_metadata(
             weight_scale,
             activation_scale,
             groups,
-            2,
-            0,
-            group_list_type,
-            output,
+            split_item=2,
+            group_type=0,
+            group_list_type=group_list_type,
+            output=output,
         )
         assert actual is output
     else:
