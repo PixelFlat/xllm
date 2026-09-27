@@ -245,6 +245,22 @@ class TestDeepseekV3MoEForward:
 
         distributed.all_gather.assert_not_called()
 
+    def test_graph_uses_current_stream_for_expert_paths(self):
+        moe = _make_moe(dp_size=1)
+        moe._expert_parallel_enabled = True
+        routed = torch.ones(4, 64)
+        shared = torch.full((4, 64), 2.0)
+        moe._run_routed_experts = MagicMock(return_value=routed)
+        moe._run_shared_experts = MagicMock(return_value=shared)
+
+        ctx = _mock_forward_context(dp_execution_token_counts=(4,), is_graph=True)
+        with forward_context(ctx):
+            result = moe.forward(torch.randn(4, 64))
+
+        torch.testing.assert_close(result, routed + shared)
+        moe._run_routed_experts.assert_called_once()
+        moe._run_shared_experts.assert_called_once()
+
     def test_dp2_calls_gather(self):
         moe = _make_moe(dp_size=2, dp_rank=0)
         hidden = torch.randn(3, 64)

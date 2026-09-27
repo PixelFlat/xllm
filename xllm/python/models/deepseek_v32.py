@@ -1403,6 +1403,11 @@ class DeepseekV3MoE(nn.Module):
 
         return self._combine_expert_outputs(routed, shared)
 
+    def _forward_graph(self, hidden: torch.Tensor) -> torch.Tensor:
+        routed = self._run_routed_experts(hidden)
+        shared = self._run_shared_experts(hidden)
+        return self._combine_expert_outputs(routed, shared)
+
     def _forward_fine_grained_parallel(self, hidden: torch.Tensor) -> torch.Tensor:
         self._ensure_expert_parallel_resources()
         shared_stream = _shared_expert_stream(hidden.device)
@@ -1497,7 +1502,10 @@ class DeepseekV3MoE(nn.Module):
                     "dp",
                 )
 
-        if self._fine_overlap_enabled:
+        context = get_forward_context()
+        if self._expert_parallel_enabled and context.execution_state is not None:
+            final = self._forward_graph(hidden)
+        elif self._fine_overlap_enabled:
             final = self._forward_fine_grained_parallel(hidden)
         elif self._expert_parallel_enabled:
             final = self._forward_parallel(hidden)
