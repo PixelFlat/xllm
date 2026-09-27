@@ -261,6 +261,16 @@ class TestDeepseekV3MoEForward:
         moe._run_routed_experts.assert_called_once()
         moe._run_shared_experts.assert_called_once()
 
+    def test_combine_reuses_routed_buffer(self):
+        moe = _make_moe()
+        routed = torch.ones(4, 64)
+        shared = torch.full_like(routed, 2)
+
+        output = moe._combine_expert_outputs(routed, shared)
+
+        assert output.data_ptr() == routed.data_ptr()
+        assert torch.equal(output, torch.full_like(output, 3))
+
     def test_dp2_calls_gather(self):
         moe = _make_moe(dp_size=2, dp_rank=0)
         hidden = torch.randn(3, 64)

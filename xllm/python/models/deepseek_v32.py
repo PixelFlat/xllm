@@ -1328,12 +1328,12 @@ class DeepseekV3MoE(nn.Module):
         if self.ep_size > 1:
             distributed.all_reduce_(routed, "moe_ep")
 
-        final = routed + shared
+        routed.add_(shared)
         if self.moe_tp_size > 1:
-            distributed.all_reduce_(final, "moe_tp")
+            distributed.all_reduce_(routed, "moe_tp")
         elif self.cfg.tp_size > 1 and self.ep_size == 1:
-            distributed.all_reduce_(final)
-        return final
+            distributed.all_reduce_(routed)
+        return routed
 
     def _ensure_expert_parallel_resources(self) -> None:
         if self._shared_expert_start_event is not None:
