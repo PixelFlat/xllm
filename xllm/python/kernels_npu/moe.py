@@ -43,6 +43,23 @@ def supports_fused_moe_gmm1(device: torch.device) -> bool:
     return device.type in ("npu", "privateuseone") and _has_fused_moe_ops()
 
 
+def moe_grouped_matmul_swiglu_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    x_scale: torch.Tensor,
+    group_list: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fused W8A8 gate-up projection, SwiGLU, and quantization."""
+    return torch.ops.xllm_ops.moe_grouped_matmul_swiglu_quant(
+        x,
+        weight,
+        weight_scale,
+        x_scale,
+        group_list,
+    )
+
+
 def _moe_init_routing_v3(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,

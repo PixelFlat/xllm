@@ -600,12 +600,22 @@ class DeepseekV3MLP(nn.Module):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_int8, pertoken = kernels.dynamic_quant(x)
-        gate_up = self.gate_up_proj.forward_accumulated(x_int8)
-        act_int8, act_scale = kernels.dequant_swiglu_quant(
-            gate_up,
-            self.gate_up_proj.weight_scale,
-            pertoken,
-        )
+        if self._can_use_fused_swiglu_quant(x):
+            group_list = self._shared_expert_group_list(x.shape[0], x.device)
+            act_int8, act_scale = kernels.moe_grouped_matmul_swiglu_quant(
+                x_int8,
+                self.gate_up_proj.weight.unsqueeze(0),
+                self.gate_up_proj.weight_scale.unsqueeze(0),
+                pertoken,
+                group_list,
+            )
+        else:
+            gate_up = self.gate_up_proj.forward_accumulated(x_int8)
+            act_int8, act_scale = kernels.dequant_swiglu_quant(
+                gate_up,
+                self.gate_up_proj.weight_scale,
+                pertoken,
+            )
         reduce_result = self.tp > 1 and (not self.skip_tp_reduce or tp_reduce_add is not None)
         if output is None:
             out = self.down_proj.forward_quantized(act_int8, act_scale)
@@ -616,6 +626,30 @@ class DeepseekV3MLP(nn.Module):
         if reduce_result:
             distributed.tp_all_reduce(out)
         return out
+
+    def _can_use_fused_swiglu_quant(self, x: torch.Tensor) -> bool:
+        return (
+            self.swiglu_limit == 0.0
+            and x.device.type in ("npu", "privateuseone")
+            and kernels.supports_fused_moe_gmm1(x.device)
+        )
+
+    def _shared_expert_group_list(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        context = get_forward_context()
+        if context.execution_state is None:
+            return torch.tensor([[0, num_tokens]], dtype=torch.int64, device=device)
+        key = (
+            "MOE_SHARED_EXPERT_GROUP_LIST",
+            int(self.gate_up_proj.weight.data_ptr()),
+            num_tokens,
+        )
+        group_list = get_execution_buffer(
+            key,
+            lambda: torch.empty((1, 2), dtype=torch.int64, device=device),
+        )
+        group_list[0, 0] = 0
+        group_list[0, 1] = num_tokens
+        return group_list
 
     def quantize_and_project_gate_up(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_int8, pertoken = kernels.dynamic_quant(x)
