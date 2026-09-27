@@ -658,8 +658,15 @@ class DeepseekV3MLP(nn.Module):
     def activate_and_quantize(self, gate_up: torch.Tensor, pertoken: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return kernels.dequant_swiglu_quant(gate_up, self.gate_up_proj.weight_scale, pertoken)
 
-    def project_down(self, act_int8: torch.Tensor, act_scale: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward_quantized(act_int8, act_scale)
+    def project_down(
+        self,
+        act_int8: torch.Tensor,
+        act_scale: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if output is None:
+            return self.down_proj.forward_quantized(act_int8, act_scale)
+        return self.down_proj.forward_quantized_out(act_int8, act_scale, output)
 
     def _forward_gate_up(
         self,
@@ -1295,20 +1302,23 @@ class DeepseekV3MoE(nn.Module):
 
     def _run_shared_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._fuse_shared_expert:
-            output = None
-            context = get_forward_context()
-            if context.execution_state is not None:
-                output_shape = (hidden.shape[0], self.hidden)
-                output = get_execution_buffer(
-                    ("MOE_SHARED_EXPERT_OUTPUT", self.layer_id, *output_shape, torch.bfloat16),
-                    lambda: torch.empty(
-                        output_shape,
-                        dtype=torch.bfloat16,
-                        device=hidden.device,
-                    ),
-                )
+            output = self._shared_expert_output_buffer(hidden)
             return self.shared_experts.forward_dequant_swiglu_quant(hidden, output=output)
         return self.shared_experts(hidden)
+
+    def _shared_expert_output_buffer(self, hidden: torch.Tensor) -> torch.Tensor | None:
+        context = get_forward_context()
+        if context.execution_state is None:
+            return None
+        output_shape = (hidden.shape[0], self.hidden)
+        return get_execution_buffer(
+            ("MOE_SHARED_EXPERT_OUTPUT", self.layer_id, *output_shape, torch.bfloat16),
+            lambda: torch.empty(
+                output_shape,
+                dtype=torch.bfloat16,
+                device=hidden.device,
+            ),
+        )
 
     def _combine_expert_outputs(
         self,
@@ -1451,7 +1461,11 @@ class DeepseekV3MoE(nn.Module):
             shared_stream.wait_event(before_dispatch_event)
             act_int8, act_scale = self.shared_experts.activate_and_quantize(gate_up, pertoken)
             shared_stream.wait_event(before_gmm2_event)
-            shared = self.shared_experts.project_down(act_int8, act_scale)
+            shared = self.shared_experts.project_down(
+                act_int8,
+                act_scale,
+                output=self._shared_expert_output_buffer(hidden),
+            )
 
         current_stream.wait_stream(shared_stream)
         return self._combine_expert_outputs(routed, shared)
