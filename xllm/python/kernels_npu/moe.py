@@ -73,7 +73,7 @@ def _moe_init_routing_v3(
         active_num,
         expert_num,
         active_expert_range,
-        1,
+        quant_mode=1,
     )
 
 
@@ -180,10 +180,10 @@ def _grouped_matmul_gmm2(
         weight_scale,
         act_pertoken_scale,
         group_list,
-        2,
-        0,
-        group_list_type,
-        output,
+        split_item=2,
+        group_type=0,
+        group_list_type=group_list_type,
+        output=output,
     )
 
 
