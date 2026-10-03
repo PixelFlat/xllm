@@ -77,15 +77,27 @@ from xllm.python.models.deepseek_v32 import (
 )
 from xllm.python.models.weight_utils import W8A8WeightLoader, effective_moe_tp, mla_head_split
 
+_MLAPO_V2_Q_LORA_RANK = 1536
+_MLAPO_V2_KV_LORA_RANK = 512
+_MLAPO_V2_QK_NOPE_HEAD_DIM = 128
+_MLAPO_V2_QK_ROPE_HEAD_DIM = 64
+_MLAPO_V2_V_HEAD_DIM = 128
+
 
 def _can_use_mlapo_v2(cfg: Glm52Config, device: torch.device) -> bool:
-    return (
-        cfg.enable_mlapo
-        and device.type in ("npu", "privateuseone")
-        and kernels.supports_mla_preprocess_v2(
-            cfg.kv_lora_rank,
-            cfg.qk_rope_head_dim,
-        )
+    if not cfg.enable_mlapo or device.type not in ("npu", "privateuseone"):
+        return False
+    if (
+        cfg.q_lora_rank != _MLAPO_V2_Q_LORA_RANK
+        or cfg.kv_lora_rank != _MLAPO_V2_KV_LORA_RANK
+        or cfg.qk_nope_head_dim != _MLAPO_V2_QK_NOPE_HEAD_DIM
+        or cfg.qk_rope_head_dim != _MLAPO_V2_QK_ROPE_HEAD_DIM
+        or cfg.v_head_dim != _MLAPO_V2_V_HEAD_DIM
+    ):
+        return False
+    return kernels.supports_mla_preprocess_v2(
+        cfg.kv_lora_rank,
+        cfg.qk_rope_head_dim,
     )
 
 

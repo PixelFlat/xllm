@@ -169,7 +169,16 @@ def test_glm_mlapo_requires_config_device_and_runtime_support(
     runtime_supported: bool,
     expected: bool,
 ) -> None:
-    cfg = Glm52Config.from_dict(_config(enable_mlapo=enable_mlapo))
+    cfg = Glm52Config.from_dict(
+        _config(
+            enable_mlapo=enable_mlapo,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+    )
     supports = MagicMock(return_value=runtime_supported)
     monkeypatch.setattr(glm5_2.kernels, "supports_mla_preprocess_v2", supports, raising=False)
 
@@ -180,6 +189,35 @@ def test_glm_mlapo_requires_config_device_and_runtime_support(
         supports.assert_called_once_with(cfg.kv_lora_rank, cfg.qk_rope_head_dim)
     else:
         supports.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    ],
+)
+def test_glm_mlapo_rejects_unsupported_projection_geometry(dimension: str) -> None:
+    values = _config(
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+    )
+    values[dimension] += 1
+    cfg = Glm52Config.from_dict(values)
+    supports = MagicMock(return_value=True)
+
+    with patch.object(glm5_2.kernels, "supports_mla_preprocess_v2", supports):
+        actual = glm5_2._can_use_mlapo_v2(cfg, MagicMock(type="npu"))
+
+    assert actual is False
+    supports.assert_not_called()
 
 
 def test_glm_parallel_world_size_includes_context_parallel() -> None:
