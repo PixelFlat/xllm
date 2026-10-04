@@ -321,6 +321,9 @@ class ModelExecutor:
                 dp_rank,
             )
         elif graph_backend == "aclgraph":
+            from xllm.python.model_executor.runners.block_draft_acl_graph import (
+                BlockDraftAclGraphRunner,
+            )
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
@@ -348,17 +351,28 @@ class ModelExecutor:
                     execution_model, self.attention_backend, device, max_graph_tokens, dp_size, dp_rank
                 )
             else:
-                self.decode_graph_runner = DecodeAclGraphRunner(
-                    execution_model,
-                    self.attention_backend,
-                    device,
-                    max_graph_tokens,
-                    int(config["max_position_embeddings"]),
-                    dp_size,
-                    dp_rank,
-                    decode_batch_size_limit,
-                    num_decoding_tokens,
-                )
+                if config.get("model_type") == "DSparkDraftModel":
+                    if dp_size != 1:
+                        raise NotImplementedError("DSpark ACL graphs currently require dp_size == 1")
+                    self.decode_graph_runner = BlockDraftAclGraphRunner(
+                        execution_model,
+                        self.attention_backend,
+                        device,
+                        local_graph_sequence_capacity,
+                        int(config["max_position_embeddings"]),
+                    )
+                else:
+                    self.decode_graph_runner = DecodeAclGraphRunner(
+                        execution_model,
+                        self.attention_backend,
+                        device,
+                        max_graph_tokens,
+                        int(config["max_position_embeddings"]),
+                        dp_size,
+                        dp_rank,
+                        decode_batch_size_limit,
+                        num_decoding_tokens,
+                    )
         else:
             if self.layerwise_split_size > 1:
                 raise NotImplementedError(

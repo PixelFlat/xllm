@@ -271,9 +271,7 @@ py::dict PyCausalLM::build_config_dict(
       << "--enable_attn_dp_weight_sharding only supports Python GLM MLA models";
   d["enable_attn_dp_weight_sharding"] = enable_attn_dp_weight_sharding;
   const bool requires_eager_execution =
-      !model_args_.layers_to_capture().empty() ||
       model_args_.model_type() == "DFlashDraftModel" ||
-      model_args_.model_type() == "DSparkDraftModel" ||
       is_dflash2_draft_model_type(model_args_.model_type());
   d["enable_graph"] = requires_eager_execution
                           ? false

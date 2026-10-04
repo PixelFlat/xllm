@@ -500,11 +500,18 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if prepared is not None:
             if self._is_mla or not isinstance(prepared, _PreparedPagedAttention):
                 raise ValueError("prepared paged state requires ordinary attention")
-            if graph_mode and (metadata.is_prefill or metadata.is_chunked_prefill):
+            if (
+                graph_mode
+                and (metadata.is_prefill or metadata.is_chunked_prefill)
+                and not (metadata.is_chunked_prefill and prepared.device_kv_lengths is not None)
+            ):
                 raise ValueError("prepared graph attention requires decode")
-            # Graph task-update closures retain this backend. Retaining the
-            # selected entry here would create an ownership cycle.
-            self._metadata = None if graph_mode else metadata
+            # Keep the static metadata available to execute().  The graph
+            # task-update closures retain the backend, but this metadata only
+            # owns tensors and the prepared state; it does not retain the
+            # graph entry, so keeping it here does not create an ownership
+            # cycle.
+            self._metadata = metadata
             self._use_expanded_decode = False
             self._block_table_i32 = prepared.block_table
             if prepared.device_kv_lengths is not None:

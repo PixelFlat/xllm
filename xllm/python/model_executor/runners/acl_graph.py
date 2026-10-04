@@ -52,9 +52,11 @@ class StaticGraphAttentionMetadata:
     paged_kv_last_page_len: torch.Tensor
     qo_indptr: torch.Tensor | None = None
     q_cu_seq_lens: torch.Tensor | None = None
+    q_cu_seq_lens_host_values: list[int] | None = None
     kv_cu_seq_lens: torch.Tensor | None = None
     kv_seq_lens_host: torch.Tensor | None = None
     kv_seq_lens_host_values: list[int] | None = None
+    q_seq_lens_host: torch.Tensor | None = None
     new_cache_slots_host_values: list[int] | None = None
     paged_kv_indptr_host: torch.Tensor | None = None
     paged_kv_last_page_len_host: torch.Tensor | None = None
