@@ -117,7 +117,7 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         self._validate_inputs(input_ids, positions, metadata)
         sequence_count = metadata.q_seq_lens.numel()
         query_width = int(metadata.q_seq_lens[0].item())
-        graph_key = self._graph_key(input_ids, metadata, sequence_count, query_width)
+        graph_key = self._graph_key(input_ids, sequence_count, query_width)
         if graph_key in self._graphs:
             return graph_key
         self._prepare_graph_entry(input_ids, positions, metadata, graph_key=graph_key)
@@ -126,18 +126,21 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
     @staticmethod
     def _graph_key(
         input_ids: torch.Tensor,
-        metadata: AttentionMetadata,
         sequence_count: int,
         query_width: int,
     ) -> _BlockGraphKey:
-        block_table = metadata.block_table
         return (
             sequence_count,
             query_width,
-            int(block_table.shape[1]),
             input_ids.dtype,
             input_ids.device,
         )
+
+    def _max_block_table_cols(self) -> int:
+        page_size = self._logical_page_size
+        if page_size <= 0:
+            raise ValueError("DSpark ACL graph requires a positive logical page size")
+        return (self.max_model_len + page_size - 1) // page_size + 1
 
     def _validate_inputs(
         self,
@@ -191,20 +194,30 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         del positions
         sequence_count = metadata.q_seq_lens.numel()
         query_width = int(metadata.q_seq_lens[0].item())
-        block_cols = metadata.block_table.shape[1]
+        block_cols = int(metadata.block_table.shape[1])
+        max_block_cols = self._max_block_table_cols()
+        if block_cols > max_block_cols:
+            raise ValueError(
+                "DSpark ACL graph block table exceeds the configured model capacity: "
+                f"columns={block_cols}, capacity={max_block_cols}"
+            )
         token_count = sequence_count * query_width
         device = input_ids.device
         page_size = self._logical_page_size
-        kv_capacity = block_cols * page_size
+        kv_capacity = max_block_cols * page_size
         query_ends = self._query_ends(metadata, [query_width] * sequence_count)
         if query_ends is None:
             raise ValueError("DSpark ACL graph requires canonical query ends")
-        static_block_table = torch.zeros_like(metadata.block_table, dtype=torch.int32).contiguous()
+        static_block_table = torch.zeros(
+            (sequence_count, max_block_cols),
+            dtype=torch.int32,
+            device=device,
+        )
         static_kv_lens = torch.empty(sequence_count, dtype=torch.int32, device=device)
         static_metadata = StaticGraphAttentionMetadata(
             slot_mapping=torch.zeros(token_count, dtype=metadata.slot_mapping.dtype, device=device),
             paged_kv_indptr=torch.zeros(sequence_count + 1, dtype=torch.int32, device=device),
-            paged_kv_indices=torch.zeros(sequence_count * block_cols, dtype=torch.int32, device=device),
+            paged_kv_indices=torch.zeros(sequence_count * max_block_cols, dtype=torch.int32, device=device),
             paged_kv_last_page_len=torch.ones(sequence_count, dtype=torch.int32, device=device),
             q_cu_seq_lens=(
                 metadata.q_cu_seq_lens.clone()
@@ -256,7 +269,14 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         entry.static_input_ids.copy_(input_ids)
         entry.static_positions.copy_(positions.to(torch.int32))
         static.slot_mapping.copy_(metadata.slot_mapping)
-        static.block_table.copy_(metadata.block_table.to(torch.int32))
+        source_block_table = metadata.block_table.to(torch.int32)
+        if source_block_table.shape[1] > static.block_table.shape[1]:
+            raise ValueError(
+                "DSpark ACL graph block table exceeds the captured capacity: "
+                f"columns={source_block_table.shape[1]}, capacity={static.block_table.shape[1]}"
+            )
+        static.block_table.zero_()
+        static.block_table[:, : source_block_table.shape[1]].copy_(source_block_table)
         static.kv_seq_lens.copy_(metadata.kv_seq_lens)
         if metadata.paged_kv_indptr is not None:
             static.paged_kv_indptr.copy_(metadata.paged_kv_indptr)

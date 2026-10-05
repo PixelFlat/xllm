@@ -23,6 +23,9 @@ import torch.nn as nn
 
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
+from xllm.python.model_executor.runners.block_draft_acl_graph import (
+    BlockDraftAclGraphRunner,
+)
 from xllm.python.model_executor.runners.decode_acl_graph import (
     DecodeAclGraphRunner,
 )
@@ -59,6 +62,72 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
         is_chunked_prefill=False,
         is_spec_verify=False,
     )
+
+
+def _block_draft_runner() -> BlockDraftAclGraphRunner:
+    attention_backend = SimpleNamespace(
+        page_size=4,
+        is_mla=False,
+        prepare_metadata=lambda metadata, **_: metadata,
+    )
+    return BlockDraftAclGraphRunner(
+        nn.Identity(),
+        attention_backend,
+        torch.device("cpu"),
+        max_batch=8,
+        max_model_len=16,
+    )
+
+
+def _block_draft_metadata(block_cols: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        q_seq_lens=torch.tensor([7], dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([7], dtype=torch.int32),
+        q_cu_seq_lens_host_values=[7],
+        q_seq_lens_host=None,
+        kv_cu_seq_lens=None,
+        slot_mapping=torch.arange(7, dtype=torch.int32),
+        block_table=torch.arange(block_cols, dtype=torch.int32).view(1, block_cols),
+        kv_seq_lens=torch.tensor([block_cols * 4], dtype=torch.int32),
+        kv_seq_lens_host_values=[block_cols * 4],
+        paged_kv_indptr=torch.tensor([0, block_cols], dtype=torch.int32),
+        paged_kv_indices=torch.arange(block_cols, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([4], dtype=torch.int32),
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=False,
+    )
+
+
+def test_block_draft_graph_key_ignores_live_page_table_width() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.zeros(7, dtype=torch.int32)
+    narrow = _block_draft_metadata(block_cols=1)
+    wide = _block_draft_metadata(block_cols=2)
+
+    narrow_key = runner._graph_key(input_ids, narrow.q_seq_lens.numel(), int(narrow.q_seq_lens[0]))
+    wide_key = runner._graph_key(input_ids, wide.q_seq_lens.numel(), int(wide.q_seq_lens[0]))
+    assert narrow_key == wide_key
+
+
+def test_block_draft_graph_uses_stable_page_table_capacity() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.zeros(7, dtype=torch.int32)
+    positions = torch.arange(7, dtype=torch.int32)
+    metadata = _block_draft_metadata(block_cols=1)
+    entry = runner._allocate_entry(input_ids, positions, metadata)
+
+    assert entry.static_metadata.block_table.shape == (1, 5)
+    assert entry.static_metadata.paged_kv_indices.numel() == 5
+
+    metadata.block_table = torch.tensor([[10]], dtype=torch.int32)
+    runner._fill_entry(entry, input_ids, positions, metadata)
+    assert entry.static_metadata.block_table.tolist() == [[10, 0, 0, 0, 0]]
+
+    metadata = _block_draft_metadata(block_cols=2)
+    metadata.block_table = torch.tensor([[11, 12]], dtype=torch.int32)
+    runner._fill_entry(entry, input_ids, positions, metadata)
+    assert entry.static_metadata.block_table.tolist() == [[11, 12, 0, 0, 0]]
 
 
 def test_linear_state_indices_use_stable_graph_buffer() -> None:
