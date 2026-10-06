@@ -15,6 +15,7 @@
 """Tests for the NPU paged-attention backend."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -171,6 +172,48 @@ def test_prepared_block_query_uses_cumulative_query_ends() -> None:
     prepared = backend.prepare_metadata(metadata, device_kv_lengths=True)
 
     assert prepared.actual_seq_q == [4, 8]
+
+
+@pytest.mark.parametrize("use_fia_v2", [False, True])
+@pytest.mark.parametrize(
+    ("query_ends", "batch_size", "query_tokens"),
+    [([7], 1, 7), ([4, 8], 2, 8), ([1, 2], 2, 2), ([], 2, 2)],
+)
+def test_graph_workspace_uses_packed_query_token_count(
+    use_fia_v2: bool,
+    query_ends: list[int],
+    batch_size: int,
+    query_tokens: int,
+) -> None:
+    backend = _ordinary_backend()
+    backend._use_fia_v2 = use_fia_v2
+    backend._actual_seq_q = list(query_ends)
+    backend._actual_seq_kv = [6] * batch_size
+    block_table = torch.zeros(batch_size, 2, dtype=torch.int32)
+    kv_capacity = [256] * batch_size
+    workspace = torch.empty(1, dtype=torch.uint8)
+    helper_name = (
+        "_npu_fused_infer_attention_score_v2_get_max_workspace"
+        if use_fia_v2
+        else "_npu_fused_infer_attention_score_get_max_workspace"
+    )
+
+    with patch(
+        f"xllm.python.attention.npu_paged_attention.torch_npu.{helper_name}",
+        return_value=workspace,
+        create=True,
+    ) as allocate:
+        result = backend._allocate_graph_workspace(batch_size, block_table, actual_seq_kv=kv_capacity)
+
+    assert result is workspace
+    allocate.assert_called_once()
+    kwargs = allocate.call_args.kwargs
+    assert kwargs["query"].shape == (query_tokens, backend.num_heads, backend.head_dim)
+    assert kwargs["block_table"] is block_table
+    query_lengths_key = "actual_seq_qlen" if use_fia_v2 else "actual_seq_lengths"
+    kv_lengths_key = "actual_seq_kvlen" if use_fia_v2 else "actual_seq_lengths_kv"
+    assert kwargs[query_lengths_key] == query_ends
+    assert kwargs[kv_lengths_key] == kv_capacity
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "query", "kv", "verify", "shard", "expanded"])

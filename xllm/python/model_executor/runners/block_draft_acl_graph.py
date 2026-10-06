@@ -249,7 +249,6 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
                 metadata.block_table.shape[1],
             )
             entry = self._allocate_entry(input_ids, positions, metadata)
-            self._graphs[graph_key] = entry
         if self._stream is None:
             self._stream = torch.npu.Stream(device=input_ids.device)
             self._initialize_task_updates()
@@ -263,6 +262,7 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         self._prepare_attention(entry, entry.static_metadata)
         if first_capture:
             self._capture(entry, self._stream)
+            self._graphs[graph_key] = entry
         return entry
 
     def _allocate_entry(
@@ -343,9 +343,6 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         metadata: AttentionMetadata,
     ) -> None:
         static = entry.static_metadata
-        entry.static_input_ids.copy_(input_ids)
-        entry.static_positions.copy_(positions.to(torch.int32))
-        static.slot_mapping.copy_(metadata.slot_mapping)
         block_table = metadata.block_table.to(torch.int32)
         if block_table.dim() != 2 or block_table.shape[0] != static.block_table.shape[0]:
             raise ValueError("DSpark ACL graph block_table shape changed within a graph bucket")
@@ -361,6 +358,22 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
                 "DSpark ACL graph block_table exceeds the captured page-table capacity: "
                 f"live={max(page_counts)}, capacity={static.block_table.shape[1]}"
             )
+        if (
+            metadata.paged_kv_indices is not None
+            and metadata.paged_kv_indices.numel() > static.paged_kv_indices.numel()
+        ):
+            raise RuntimeError("DSpark ACL graph paged KV indices exceed the captured capacity")
+        kv_host = getattr(metadata, "kv_seq_lens_host_values", None)
+        if kv_host is None or len(kv_host) != block_table.shape[0]:
+            raise ValueError("DSpark ACL graph requires one Host KV length per sequence")
+        kv_host = [int(length) for length in kv_host]
+        prepared = static.prepared_attention_state
+        if prepared is None:
+            raise RuntimeError("DSpark ACL graph prepared attention state is missing")
+
+        entry.static_input_ids.copy_(input_ids)
+        entry.static_positions.copy_(positions.to(torch.int32))
+        static.slot_mapping.copy_(metadata.slot_mapping)
         static.block_table.zero_()
         for row, page_count in enumerate(page_counts):
             static.block_table[row, :page_count].copy_(block_table[row, :page_count])
@@ -371,17 +384,9 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
             static.paged_kv_last_page_len.copy_(metadata.paged_kv_last_page_len)
         if metadata.paged_kv_indices is not None:
             static.paged_kv_indices.zero_()
-            if metadata.paged_kv_indices.numel() > static.paged_kv_indices.numel():
-                raise RuntimeError("DSpark ACL graph paged KV indices exceed the captured capacity")
             static.paged_kv_indices[: metadata.paged_kv_indices.numel()].copy_(metadata.paged_kv_indices)
-        kv_host = getattr(metadata, "kv_seq_lens_host_values", None)
-        if kv_host is None or len(kv_host) != block_table.shape[0]:
-            raise ValueError("DSpark ACL graph requires one Host KV length per sequence")
-        static.kv_seq_lens_host_values[:] = [int(length) for length in kv_host]
+        static.kv_seq_lens_host_values[:] = kv_host
 
-        prepared = static.prepared_attention_state
-        if prepared is None:
-            raise RuntimeError("DSpark ACL graph prepared attention state is missing")
         prepared.actual_seq_q[:] = list(static.q_cu_seq_lens_host_values)
         prepared.actual_seq_kv[:] = list(static.kv_seq_lens_host_values)
         if prepared.query_ends is not None:

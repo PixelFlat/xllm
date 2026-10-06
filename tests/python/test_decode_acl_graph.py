@@ -23,6 +23,7 @@ import torch.nn as nn
 
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
+from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
 from xllm.python.model_executor.runners.block_draft_acl_graph import (
     BlockDraftAclGraphRunner,
 )
@@ -197,6 +198,52 @@ def test_dspark_request_reuses_startup_page_bucket() -> None:
     )
 
 
+def test_dspark_graph_is_cached_only_after_successful_capture() -> None:
+    runner = _block_draft_runner()
+    runner._stream = object()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    metadata = _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32))
+    graph_key = runner._graph_key(input_ids, metadata, 1, 2)
+
+    def capture_entry(entry: AclGraphEntry, stream: object) -> None:
+        assert graph_key not in runner._graphs
+        assert stream is runner._stream
+        entry.graph = object()
+
+    with (
+        patch.object(runner, "_prepare_attention"),
+        patch.object(runner, "_capture", side_effect=capture_entry) as capture,
+    ):
+        entry = runner._prepare_graph_entry(input_ids, positions, metadata, graph_key=graph_key)
+        assert runner._graphs[graph_key] is entry
+        assert entry.graph is not None
+        assert runner._prepare_graph_entry(input_ids, positions, metadata, graph_key=graph_key) is entry
+        capture.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_stage", ["_fill_entry", "_prepare_attention", "_capture"])
+def test_dspark_failed_graph_preparation_is_not_cached(failure_stage: str) -> None:
+    runner = _block_draft_runner()
+    runner._stream = object()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    metadata = _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32))
+    graph_key = runner._graph_key(input_ids, metadata, 1, 2)
+
+    with (
+        patch.object(runner, "_fill_entry", wraps=runner._fill_entry) as fill,
+        patch.object(runner, "_prepare_attention") as prepare,
+        patch.object(runner, "_capture") as capture,
+    ):
+        steps = {"_fill_entry": fill, "_prepare_attention": prepare, "_capture": capture}
+        steps[failure_stage].side_effect = RuntimeError("graph preparation failed")
+        with pytest.raises(RuntimeError, match="graph preparation failed"):
+            runner._prepare_graph_entry(input_ids, positions, metadata, graph_key=graph_key)
+
+    assert graph_key not in runner._graphs
+
+
 def test_dspark_graph_replay_refreshes_prepared_lengths() -> None:
     runner = _block_draft_runner()
     input_ids = torch.arange(2, dtype=torch.int32)
@@ -258,6 +305,68 @@ def test_dspark_graph_replay_clears_stale_page_table_tail() -> None:
             positions,
             _block_draft_metadata(torch.zeros(1, 5, dtype=torch.int32)),
         )
+
+
+@pytest.mark.parametrize(
+    ("invalid", "error_type", "message"),
+    [
+        ("indices_capacity", RuntimeError, "paged KV indices exceed the captured capacity"),
+        ("table_capacity", RuntimeError, "exceeds the captured page-table capacity"),
+        ("host_lengths", ValueError, "requires one Host KV length per sequence"),
+        ("prepared_state", RuntimeError, "prepared attention state is missing"),
+    ],
+)
+def test_dspark_graph_validation_preserves_static_inputs(
+    invalid: str,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    metadata = _block_draft_metadata(torch.tensor([[10, 11, 12]], dtype=torch.int32))
+    entry = runner._allocate_entry(input_ids, positions, metadata)
+    runner._fill_entry(entry, input_ids, positions, metadata)
+    static = entry.static_metadata
+    tensor_names = (
+        "slot_mapping",
+        "block_table",
+        "kv_seq_lens",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "paged_kv_last_page_len",
+    )
+    snapshots = {name: getattr(static, name).clone() for name in tensor_names}
+    old_input_ids = entry.static_input_ids.clone()
+    old_positions = entry.static_positions.clone()
+    old_host_lengths = list(static.kv_seq_lens_host_values)
+    prepared = static.prepared_attention_state
+    old_query_ends = list(prepared.query_ends)
+    old_query_lengths = list(prepared.actual_seq_q)
+    old_kv_lengths = list(prepared.actual_seq_kv)
+    invalid_metadata = _block_draft_metadata(torch.tensor([[20]], dtype=torch.int32))
+    invalid_metadata.slot_mapping.add_(100)
+    if invalid == "indices_capacity":
+        invalid_metadata.paged_kv_indices = torch.arange(5, dtype=torch.int32)
+        invalid_metadata.paged_kv_indptr = torch.tensor([0, 5], dtype=torch.int32)
+    elif invalid == "table_capacity":
+        invalid_metadata = _block_draft_metadata(torch.zeros(1, 5, dtype=torch.int32))
+    elif invalid == "host_lengths":
+        invalid_metadata.kv_seq_lens_host_values = None
+    else:
+        static.prepared_attention_state = None
+
+    with pytest.raises(error_type, match=message):
+        runner._fill_entry(entry, input_ids + 100, positions + 100, invalid_metadata)
+
+    torch.testing.assert_close(entry.static_input_ids, old_input_ids)
+    torch.testing.assert_close(entry.static_positions, old_positions)
+    for name, snapshot in snapshots.items():
+        torch.testing.assert_close(getattr(static, name), snapshot)
+    assert static.kv_seq_lens_host_values == old_host_lengths
+    assert prepared.query_ends == old_query_ends
+    assert prepared.actual_seq_q == old_query_lengths
+    assert prepared.actual_seq_kv == old_kv_lengths
 
 
 def test_linear_state_indices_use_stable_graph_buffer() -> None:

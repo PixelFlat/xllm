@@ -708,8 +708,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     ) -> torch.Tensor:
         block_size = self.page_size
         workspace_actual_seq_kv = self._actual_seq_kv if actual_seq_kv is None else actual_seq_kv
+        query_tokens = self._actual_seq_q[-1] if self._actual_seq_q else graph_batch_size
         dummy_q = torch.empty(
-            graph_batch_size,
+            query_tokens,
             self.num_heads,
             self.head_dim,
             dtype=self.dtype,
