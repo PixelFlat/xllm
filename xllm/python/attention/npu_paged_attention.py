@@ -405,7 +405,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             kv_lengths = metadata.kv_seq_lens_host_values
             if kv_lengths is None or len(kv_lengths) != batch_size:
                 raise ValueError("prepared Host KV lengths must match the batch")
-            actual_seq_q = list(range(1, batch_size + 1))
+            actual_seq_q = list(query_ends)
             actual_seq_kv = list(kv_lengths)
         if self._is_mla:
             if block_table is None:
@@ -514,13 +514,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._metadata = metadata
             self._use_expanded_decode = False
             self._block_table_i32 = prepared.block_table
-            if prepared.device_kv_lengths is not None:
+            if prepared.device_kv_lengths is not None and not graph_mode:
                 self._block_table_i32 = prepared.block_table[:, : prepared.kv_capacity // self.page_size].contiguous()
             self._actual_seq_lens = None if graph_mode else prepared.query_ends
             self._actual_seq_q = prepared.actual_seq_q
             self._actual_seq_kv = prepared.actual_seq_kv
             if graph_mode:
-                self._prepare_paged_graph()
+                workspace_kv_length = None
+                if prepared.device_kv_lengths is not None:
+                    workspace_kv_length = prepared.block_table.shape[1] * self.page_size
+                self._prepare_paged_graph(workspace_kv_length=workspace_kv_length)
             return
         self._metadata = metadata
         expanded = resolve_expanded_decode_metadata(metadata, block_size=self.logical_page_size)
@@ -661,7 +664,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
 
         self._prepare_kv_shard_materialization(metadata)
 
-    def _prepare_paged_graph(self) -> None:
+    def _prepare_paged_graph(self, *, workspace_kv_length: int | None = None) -> None:
         if self._block_table_i32 is None:
             raise ValueError("paged graph attention requires a block table")
         graph_batch_size = self._block_table_i32.shape[0]
@@ -670,8 +673,15 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             raise RuntimeError("paged graph attention requires an execution entry")
         state = graph_state.paged_attention.get(graph_batch_size)
         if state is None:
+            workspace_actual_seq_kv = self._actual_seq_kv
+            if workspace_kv_length is not None:
+                workspace_actual_seq_kv = [workspace_kv_length] * graph_batch_size
             state = PagedAttentionGraphState(
-                workspace=self._allocate_graph_workspace(graph_batch_size, self._block_table_i32),
+                workspace=self._allocate_graph_workspace(
+                    graph_batch_size,
+                    self._block_table_i32,
+                    actual_seq_kv=workspace_actual_seq_kv,
+                ),
                 output=torch.empty(
                     graph_batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device
                 ),
@@ -693,8 +703,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self,
         graph_batch_size: int,
         block_table: torch.Tensor,
+        *,
+        actual_seq_kv: list[int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         block_size = self.page_size
+        workspace_actual_seq_kv = self._actual_seq_kv if actual_seq_kv is None else actual_seq_kv
         dummy_q = torch.empty(
             graph_batch_size,
             self.num_heads,
@@ -718,7 +731,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 input_layout="TND",
                 block_size=block_size,
                 actual_seq_qlen=self._actual_seq_q,
-                actual_seq_kvlen=self._actual_seq_kv,
+                actual_seq_kvlen=workspace_actual_seq_kv,
                 num_key_value_heads=self.num_kv_heads,
                 num_query_heads=self.num_heads,
                 sparse_mode=_SPARSE_MODE_NONE,
@@ -733,7 +746,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             input_layout="TND",
             block_size=block_size,
             actual_seq_lengths=self._actual_seq_q,
-            actual_seq_lengths_kv=self._actual_seq_kv,
+            actual_seq_lengths_kv=workspace_actual_seq_kv,
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             sparse_mode=_SPARSE_MODE_NONE,

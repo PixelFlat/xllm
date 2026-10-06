@@ -153,6 +153,26 @@ def test_private_metadata_preparation_preserves_active_slot(paged: bool, monkeyp
     assert backend._block_table_i32 is metadata.block_table
 
 
+def test_prepared_block_query_uses_cumulative_query_ends() -> None:
+    backend = _ordinary_backend()
+    metadata = SimpleNamespace(
+        q_cu_seq_lens=torch.tensor([0, 4, 8], dtype=torch.int32),
+        q_cu_seq_lens_host_values=[4, 8],
+        q_seq_lens=torch.tensor([4, 4], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        kv_seq_lens=torch.tensor([6, 7], dtype=torch.int32),
+        kv_seq_lens_host_values=[6, 7],
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=False,
+        has_kv_shard=False,
+    )
+
+    prepared = backend.prepare_metadata(metadata, device_kv_lengths=True)
+
+    assert prepared.actual_seq_q == [4, 8]
+
+
 @pytest.mark.parametrize("invalid", ["dtype", "query", "kv", "verify", "shard", "expanded"])
 def test_private_metadata_rejection_preserves_active_slot(invalid: str) -> None:
     backend = _ordinary_backend()

@@ -65,70 +65,199 @@ def _metadata(linear_state_indices: torch.Tensor) -> SimpleNamespace:
     )
 
 
+class _FakeBlockDraftAttentionBackend:
+    page_size = 4
+    logical_page_size = 4
+    is_mla = False
+
+    @staticmethod
+    def prepare_metadata(metadata: SimpleNamespace, *, device_kv_lengths: bool) -> SimpleNamespace:
+        assert device_kv_lengths
+        return SimpleNamespace(
+            actual_seq_q=list(metadata.q_cu_seq_lens_host_values),
+            actual_seq_kv=list(metadata.kv_seq_lens_host_values),
+            query_ends=list(metadata.q_cu_seq_lens_host_values),
+        )
+
+
 def _block_draft_runner() -> BlockDraftAclGraphRunner:
-    attention_backend = SimpleNamespace(
-        page_size=4,
-        is_mla=False,
-        prepare_metadata=lambda metadata, **_: metadata,
-    )
+    attention_backend = _FakeBlockDraftAttentionBackend()
     return BlockDraftAclGraphRunner(
         nn.Identity(),
         attention_backend,
         torch.device("cpu"),
-        max_batch=8,
-        max_model_len=16,
+        max_batch=1,
+        max_model_len=8,
     )
 
 
-def _block_draft_metadata(block_cols: int) -> SimpleNamespace:
+def _block_draft_metadata(block_table: torch.Tensor) -> SimpleNamespace:
+    sequence_count, block_cols = block_table.shape
+    query_width = 2
+    token_count = sequence_count * query_width
     return SimpleNamespace(
-        q_seq_lens=torch.tensor([7], dtype=torch.int32),
-        q_cu_seq_lens=torch.tensor([7], dtype=torch.int32),
-        q_cu_seq_lens_host_values=[7],
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=False,
+        q_seq_lens=torch.full((sequence_count,), query_width, dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([0, token_count], dtype=torch.int32),
+        q_cu_seq_lens_host_values=[token_count],
         q_seq_lens_host=None,
+        block_table=block_table,
+        slot_mapping=torch.arange(token_count, dtype=torch.int32),
+        kv_seq_lens=torch.full((sequence_count,), block_cols * 4, dtype=torch.int32),
         kv_cu_seq_lens=None,
-        slot_mapping=torch.arange(7, dtype=torch.int32),
-        block_table=torch.arange(block_cols, dtype=torch.int32).view(1, block_cols),
-        kv_seq_lens=torch.tensor([block_cols * 4], dtype=torch.int32),
         kv_seq_lens_host_values=[block_cols * 4],
         paged_kv_indptr=torch.tensor([0, block_cols], dtype=torch.int32),
         paged_kv_indices=torch.arange(block_cols, dtype=torch.int32),
         paged_kv_last_page_len=torch.tensor([4], dtype=torch.int32),
-        is_prefill=False,
-        is_chunked_prefill=True,
-        is_spec_verify=False,
     )
 
 
-def test_block_draft_graph_key_ignores_live_page_table_width() -> None:
+def test_dspark_graph_key_buckets_live_page_table_width() -> None:
     runner = _block_draft_runner()
-    input_ids = torch.zeros(7, dtype=torch.int32)
-    narrow = _block_draft_metadata(block_cols=1)
-    wide = _block_draft_metadata(block_cols=2)
+    input_ids = torch.zeros(2, dtype=torch.int32)
+    key = runner._graph_key(
+        input_ids,
+        _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32)),
+        sequence_count=1,
+        query_width=2,
+    )
+    wider_key = runner._graph_key(
+        input_ids,
+        _block_draft_metadata(torch.zeros(1, 4, dtype=torch.int32)),
+        sequence_count=1,
+        query_width=2,
+    )
+    assert key == wider_key
+    assert key != runner._graph_key(
+        input_ids,
+        _block_draft_metadata(torch.zeros(1, 5, dtype=torch.int32)),
+        sequence_count=1,
+        query_width=2,
+    )
 
-    narrow_key = runner._graph_key(input_ids, narrow.q_seq_lens.numel(), int(narrow.q_seq_lens[0]))
-    wide_key = runner._graph_key(input_ids, wide.q_seq_lens.numel(), int(wide.q_seq_lens[0]))
-    assert narrow_key == wide_key
 
-
-def test_block_draft_graph_uses_stable_page_table_capacity() -> None:
+@pytest.mark.parametrize(
+    ("block_cols", "capacity"),
+    [(1, 4), (2, 4), (3, 4), (4, 4), (5, 8), (15, 16), (16, 16), (17, 32)],
+)
+def test_dspark_page_table_capacity_grows_geometrically(block_cols: int, capacity: int) -> None:
     runner = _block_draft_runner()
-    input_ids = torch.zeros(7, dtype=torch.int32)
-    positions = torch.arange(7, dtype=torch.int32)
-    metadata = _block_draft_metadata(block_cols=1)
+    metadata = _block_draft_metadata(torch.zeros(1, block_cols, dtype=torch.int32))
+    assert runner._page_table_capacity(metadata) == capacity
+
+
+def test_dspark_graph_capacity_does_not_use_model_maximum() -> None:
+    runner = _block_draft_runner()
+    runner.max_model_len = 1_048_576
+    runner.attention_backend.logical_page_size = 128
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    metadata = _block_draft_metadata(torch.zeros(1, 128, dtype=torch.int32))
+    metadata.kv_seq_lens.fill_(15 * 128)
+    metadata.kv_seq_lens_host_values = [15 * 128]
+
     entry = runner._allocate_entry(input_ids, positions, metadata)
 
-    assert entry.static_metadata.block_table.shape == (1, 5)
-    assert entry.static_metadata.paged_kv_indices.numel() == 5
+    assert entry.static_metadata.block_table.shape == (1, 32)
+    assert entry.static_metadata.paged_kv_indices.numel() == 32
+    assert entry.static_metadata.kv_seq_lens_host_values == [4096]
 
-    metadata.block_table = torch.tensor([[10]], dtype=torch.int32)
-    runner._fill_entry(entry, input_ids, positions, metadata)
-    assert entry.static_metadata.block_table.tolist() == [[10, 0, 0, 0, 0]]
 
-    metadata = _block_draft_metadata(block_cols=2)
-    metadata.block_table = torch.tensor([[11, 12]], dtype=torch.int32)
-    runner._fill_entry(entry, input_ids, positions, metadata)
-    assert entry.static_metadata.block_table.tolist() == [[11, 12, 0, 0, 0]]
+def test_dspark_warmup_captures_once_per_page_capacity_bucket() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+
+    def prepare_entry(*args: object, graph_key: tuple[object, ...]) -> None:
+        runner._graphs[graph_key] = object()
+
+    with patch.object(runner, "_prepare_graph_entry", side_effect=prepare_entry) as prepare:
+        keys = [
+            runner.warmup(input_ids, positions, _block_draft_metadata(torch.zeros(1, width, dtype=torch.int32)))
+            for width in (3, 4, 5, 3)
+        ]
+    assert prepare.call_count == 2
+    assert keys[0] == keys[1] == keys[3]
+    assert keys[0] != keys[2]
+
+
+def test_dspark_request_reuses_startup_page_bucket() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    startup_metadata = _block_draft_metadata(torch.zeros(1, 4, dtype=torch.int32))
+    request_metadata = _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32))
+
+    assert runner._graph_key(input_ids, startup_metadata, 1, 2) == runner._graph_key(
+        input_ids,
+        request_metadata,
+        1,
+        2,
+    )
+
+
+def test_dspark_graph_replay_refreshes_prepared_lengths() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    first_metadata = _block_draft_metadata(torch.tensor([[10, 11, 12]], dtype=torch.int32))
+    entry = runner._allocate_entry(input_ids, positions, first_metadata)
+
+    second_metadata = _block_draft_metadata(torch.tensor([[20]], dtype=torch.int32))
+    second_metadata.kv_seq_lens.fill_(4)
+    second_metadata.kv_seq_lens_host_values = [4]
+    runner._fill_entry(entry, input_ids, positions, second_metadata)
+
+    prepared = entry.static_metadata.prepared_attention_state
+    assert prepared.actual_seq_q == [2]
+    assert prepared.actual_seq_kv == [4]
+    assert prepared.query_ends == [2]
+
+
+def test_dspark_graph_rejects_missing_host_kv_lengths() -> None:
+    runner = _block_draft_runner()
+    metadata = _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = None
+
+    assert not runner.can_execute(torch.zeros(2, dtype=torch.int32), metadata)
+
+
+def test_dspark_graph_rejects_inconsistent_paged_metadata() -> None:
+    runner = _block_draft_runner()
+    metadata = _block_draft_metadata(torch.zeros(1, 3, dtype=torch.int32))
+    metadata.paged_kv_indptr = torch.tensor([0, 1], dtype=torch.int32)
+
+    assert not runner.can_execute(torch.zeros(2, dtype=torch.int32), metadata)
+
+
+def test_dspark_graph_replay_clears_stale_page_table_tail() -> None:
+    runner = _block_draft_runner()
+    input_ids = torch.arange(2, dtype=torch.int32)
+    positions = input_ids.clone()
+    first_metadata = _block_draft_metadata(
+        torch.tensor([[10, 11, 12]], dtype=torch.int32),
+    )
+    entry = runner._allocate_entry(input_ids, positions, first_metadata)
+
+    runner._fill_entry(entry, input_ids, positions, first_metadata)
+    assert entry.static_metadata.block_table.shape == (1, 4)
+    assert entry.static_metadata.block_table[0].tolist() == [10, 11, 12, 0]
+
+    second_metadata = _block_draft_metadata(
+        torch.tensor([[20]], dtype=torch.int32),
+    )
+    runner._fill_entry(entry, input_ids, positions, second_metadata)
+    assert entry.static_metadata.block_table[0].tolist() == [20, 0, 0, 0]
+    assert entry.static_metadata.paged_kv_indices.tolist() == [0, 0, 0, 0]
+
+    with pytest.raises(RuntimeError, match="exceeds the captured page-table capacity"):
+        runner._fill_entry(
+            entry,
+            input_ids,
+            positions,
+            _block_draft_metadata(torch.zeros(1, 5, dtype=torch.int32)),
+        )
 
 
 def test_linear_state_indices_use_stable_graph_buffer() -> None:
