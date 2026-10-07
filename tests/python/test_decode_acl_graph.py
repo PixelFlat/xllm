@@ -14,8 +14,9 @@
 
 """Tests for the NPU ACL decode-graph runner."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -367,6 +368,79 @@ def test_dspark_graph_validation_preserves_static_inputs(
     assert prepared.query_ends == old_query_ends
     assert prepared.actual_seq_q == old_query_lengths
     assert prepared.actual_seq_kv == old_kv_lengths
+
+
+@pytest.mark.parametrize("has_tasks", [False, True])
+def test_replay_selects_stream_without_changing_output_ownership(has_tasks: bool) -> None:
+    runner = _runner()
+    caller = Mock()
+    capture = Mock()
+    runner._stream = capture
+    entry = SimpleNamespace(
+        graph_tasks=[Mock()] if has_tasks else [],
+        graph=Mock(),
+        static_output=torch.ones((4, 2)),
+        replay_logged=True,
+    )
+    update = Mock()
+    with (
+        patch.object(runner, "_prepare_graph_entry", return_value=entry),
+        patch.object(runner, "_update_after_replay", update),
+        patch.object(torch.npu, "current_stream", return_value=caller),
+        patch.object(torch.npu, "stream", side_effect=lambda _: nullcontext()) as stream_context,
+        patch.object(torch.npu, "Stream", return_value=Mock()),
+        patch.object(torch.npu, "Event", return_value=Mock()),
+    ):
+        output = runner.execute(torch.zeros(1, dtype=torch.int32), torch.zeros(1), _metadata(torch.zeros(1)))
+    replay_stream = capture if has_tasks else caller
+    stream_context.assert_called_once_with(replay_stream)
+    entry.graph.replay.assert_called_once_with()
+    assert output.data_ptr() != entry.static_output.data_ptr()
+    if has_tasks:
+        update.assert_called_once_with(entry, capture, runner._update_done_event)
+        capture.wait_stream.assert_called_once_with(caller)
+        caller.wait_stream.assert_called_once_with(capture)
+        caller.wait_event.assert_called_once_with(runner._update_done_event)
+    else:
+        update.assert_not_called()
+        caller.wait_stream.assert_not_called()
+        caller.wait_event.assert_not_called()
+        assert runner._update_stream is None
+        assert runner._replay_done_event is None
+        assert runner._taskless_replay_stream is caller
+
+
+def test_taskless_update_does_not_require_events() -> None:
+    runner = _runner()
+    runner._update_after_replay(SimpleNamespace(graph_tasks=[]), Mock())
+    assert runner._replay_done_event is None
+
+
+@pytest.mark.parametrize("same_stream", [False, True])
+def test_taskless_metadata_fill_waits_only_when_stream_changes(same_stream: bool) -> None:
+    runner = _runner()
+    runner._stream = Mock()
+    previous = Mock(npu_stream=1)
+    current = Mock(npu_stream=1 if same_stream else 2)
+    runner._taskless_replay_stream = previous
+    metadata = _metadata(torch.zeros(1, dtype=torch.int32))
+    input_ids = torch.zeros(1, dtype=torch.int32)
+    key = runner._graph_key(1, False, None, None)
+    entry = SimpleNamespace(static_metadata=metadata)
+    runner._graphs[key] = entry
+
+    def fill_entry(*args: object) -> None:
+        if same_stream:
+            current.wait_stream.assert_not_called()
+        else:
+            current.wait_stream.assert_called_once_with(previous)
+
+    with (
+        patch.object(torch.npu, "current_stream", return_value=current),
+        patch.object(runner, "_prepare_attention"),
+        patch.object(runner, "_fill_entry", side_effect=fill_entry),
+    ):
+        assert runner._prepare_graph_entry(input_ids, input_ids, metadata, None, graph_key=key) is entry
 
 
 def test_linear_state_indices_use_stable_graph_buffer() -> None:

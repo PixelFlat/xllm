@@ -140,8 +140,12 @@ class AclGraphRunner(BaseRunner):
         entry.mega_moe_token_counts = token_counts
 
     def _initialize_task_updates(self) -> None:
+        self._initialize_replay_state()
         if self._update_stream is None:
             self._update_stream = torch.npu.Stream(device=self.device, priority=-1)
+
+    def _initialize_replay_state(self) -> None:
+        if self._replay_done_event is None:
             self._replay_done_event = torch.npu.Event()
 
     def _prepare_attention(self, entry: AclGraphEntry, metadata: AttentionMetadata, *, replay: bool = False) -> None:
@@ -164,6 +168,8 @@ class AclGraphRunner(BaseRunner):
         stream: torch.npu.Stream,
         completion_event: torch.npu.Event | None = None,
     ) -> None:
+        if not entry.graph_tasks:
+            return
         assert self._update_stream is not None
         assert self._replay_done_event is not None
         with torch.npu.stream(self._update_stream):

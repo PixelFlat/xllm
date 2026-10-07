@@ -66,11 +66,21 @@ _GraphKey = tuple[
 ]
 
 
+def _same_npu_stream(lhs: object, rhs: object) -> bool:
+    """Compare the underlying stream, not just its Python wrapper."""
+    if lhs is rhs:
+        return True
+    lhs_id = getattr(lhs, "npu_stream", None)
+    rhs_id = getattr(rhs, "npu_stream", None)
+    return lhs_id is not None and rhs_id is not None and lhs_id == rhs_id
+
+
 class DecodeAclGraphRunner(AclGraphRunner):
     """Owns static inputs and lazily captures decode graphs on a private stream.
 
     Inputs are copied into entry-owned storage; returned outputs are detached
-    from replay buffers. Slot-bound execution uses PreparedAclGraphRunner.
+    from replay buffers. Taskless graphs replay on the caller's stream.
+    Slot-bound execution uses PreparedAclGraphRunner.
     """
 
     def __init__(
@@ -106,6 +116,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         self._stream: torch.npu.Stream | None = None
         self._update_done_event: torch.npu.Event | None = None
         self._update_done_recorded = False
+        self._taskless_replay_stream: torch.npu.Stream | None = None
 
     def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
         super().bind_layer_caches(layer_caches)
@@ -651,11 +662,12 @@ class DecodeAclGraphRunner(AclGraphRunner):
         )
 
         assert self._stream is not None
-        assert self._update_stream is not None
-        assert self._replay_done_event is not None
-
-        self._stream.wait_stream(torch.npu.current_stream())
-        with torch.npu.stream(self._stream):
+        current_stream = torch.npu.current_stream()
+        has_task_updates = bool(entry.graph_tasks)
+        replay_stream = self._stream if has_task_updates else current_stream
+        if has_task_updates:
+            self._stream.wait_stream(current_stream)
+        with torch.npu.stream(replay_stream):
             entry.graph.replay()
             output = self._slice_output(entry.static_output, batch_size)
 
@@ -669,19 +681,24 @@ class DecodeAclGraphRunner(AclGraphRunner):
             )
             entry.replay_logged = True
 
-        assert self._update_done_event is not None
-        self._update_after_replay(entry, self._stream, self._update_done_event)
-        self._update_done_recorded = True
-
-        torch.npu.current_stream().wait_stream(self._stream)
+        if has_task_updates:
+            self._initialize_task_updates()
+            if self._update_done_event is None:
+                self._update_done_event = torch.npu.Event()
+            self._update_after_replay(entry, replay_stream, self._update_done_event)
+            self._taskless_replay_stream = None
+            current_stream.wait_stream(replay_stream)
+        else:
+            self._taskless_replay_stream = replay_stream
+        self._update_done_recorded = has_task_updates
         # The graph replay waits on each task's external event, but the task
         # update itself runs on a separate stream.  Schedule-overlap returns
         # to C++ without a device-wide synchronize, so the next MTP draft or
         # target graph can otherwise start while this runner is still updating
         # FIA/MLA task parameters.  Order the caller's compute stream after
         # those updates before exposing the output to the next model stage.
-        assert self._update_done_event is not None
-        torch.npu.current_stream().wait_event(self._update_done_event)
+        if has_task_updates:
+            current_stream.wait_event(self._update_done_event)
         return output
 
     @staticmethod
@@ -772,18 +789,12 @@ class DecodeAclGraphRunner(AclGraphRunner):
 
         if self._stream is None:
             self._stream = torch.npu.Stream(device=input_ids.device)
-            self._initialize_task_updates()
-            self._update_done_event = torch.npu.Event()
 
         # The previous replay may still be reading the capture buffers on the
         # graph stream while the scheduler prepares the next step on the
         # current stream.  Wait before mutating static inputs/metadata; the
         # later graph-stream wait only orders the new replay after these
         # writes and cannot protect this earlier update.
-        if self._replay_done_event is not None:
-            # All buckets share the paged-KV index buffer, including a newly
-            # allocated bucket whose graph has not been captured yet.
-            torch.npu.current_stream().wait_event(self._replay_done_event)
         if self._update_done_recorded:
             # Task updates run on a separate stream and read the same static
             # metadata tensors that _fill_entry mutates.  Waiting only for the
@@ -791,6 +802,12 @@ class DecodeAclGraphRunner(AclGraphRunner):
             # scheduler advances quickly under overlap.
             assert self._update_done_event is not None
             torch.npu.current_stream().wait_event(self._update_done_event)
+
+        current_stream = torch.npu.current_stream()
+        if self._taskless_replay_stream is not None and not _same_npu_stream(
+            current_stream, self._taskless_replay_stream
+        ):
+            current_stream.wait_stream(self._taskless_replay_stream)
 
         self._fill_entry(
             entry,
