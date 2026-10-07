@@ -192,7 +192,13 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
     backend = NpuPagedAttentionBackend(8, 2, 64, 0.125, 0, False, torch.device("cpu"), torch.float16)
     cache = torch.empty(4, 128, 2, 64)
     backend.bind_kv_caches([LayerCache(key=cache, value=cache)])
-    allocate_workspace = Mock(side_effect=lambda *args, **kwargs: torch.empty(1))
+
+    def _allocate_workspace(batch_size: int, block_table: torch.Tensor, *, actual_seq_kv: list[int]) -> torch.Tensor:
+        assert block_table.shape[0] == batch_size
+        assert actual_seq_kv == [1] * batch_size
+        return torch.empty(1)
+
+    allocate_workspace = Mock(side_effect=_allocate_workspace)
     monkeypatch.setattr(backend, "_allocate_graph_workspace", allocate_workspace)
     calls = []
 
@@ -238,6 +244,7 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
     assert len({id(lengths.kv) for lengths in captured_lengths}) == len(inputs)
     assert backend._paged_graph_state is captured_lengths[-1]
     workspace_count = allocate_workspace.call_count
+    assert workspace_count == len(inputs)
     capture_count = npu.NPUGraph.call_count
 
     def reject_allocation(*args: object, **kwargs: object) -> torch.Tensor:
