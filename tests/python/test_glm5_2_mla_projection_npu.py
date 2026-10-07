@@ -133,3 +133,69 @@ def test_projection(
             assert not torch.equal(current, previous), "Projection reused stale input values"
         previous = current
     torch.npu.synchronize()
+
+
+@pytest.mark.parametrize("layout", ("q_contiguous", "q_split", "q_offset", "v_contiguous"))
+@pytest.mark.parametrize("heads,q_dim,v_dim", ((4, 192, 256), (8, 128, 128)), ids=("glm", "deepseek"))
+def test_atb_ein_sum_projection(
+    project: _Project,
+    layout: str,
+    heads: int,
+    q_dim: int,
+    v_dim: int,
+) -> None:
+    _, x, weight = _make_inputs(4, layout, heads, q_dim, v_dim)
+    actual = project(x, weight)
+    baseline = torch.ops.npu.npu_transpose_batchmatmul(
+        x, weight, perm_x1=(1, 0, 2), perm_x2=(0, 1, 2), perm_y=(1, 0, 2)
+    )
+    torch.npu.synchronize()
+    reference = torch.einsum("thd,hdo->tho", x.cpu().float(), weight.cpu().float())
+    assert actual.shape == reference.shape
+    assert actual.dtype == x.dtype and actual.device == x.device and actual.is_contiguous()
+    torch.testing.assert_close(actual.cpu().float(), reference, rtol=_RTOL, atol=_ATOL)
+    torch.testing.assert_close(baseline.cpu().float(), reference, rtol=_RTOL, atol=_ATOL)
+    max_abs = (actual.float() - baseline.float()).abs().max().item()
+    assert max_abs <= (0 if layout.startswith("q_") else 0.25), f"ATB/TBMM {layout} max_abs={max_abs}"
+
+
+@pytest.mark.parametrize("tokens", (1, 4, 8))
+@pytest.mark.parametrize("layout", ("q_split", "q_offset", "v_contiguous", "v_narrow"))
+@pytest.mark.parametrize("mode", ("eager", "graph"))
+def test_projection_out_updates_caller_buffer(project: _Project, tokens: int, layout: str, mode: str) -> None:
+    from xllm.python.kernels_npu.linear import atb_matmul_ein_sum_out
+
+    backing, x, weight = _make_inputs(tokens, layout, 4, 192, 256)
+    original = backing.cpu()
+    output = torch.empty((tokens, 4, weight.shape[2]), dtype=_DTYPE, device=x.device)
+    output_address = output.data_ptr()
+    graph = None
+    if mode == "graph":
+        stream = torch.npu.Stream()
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            for _ in range(3):
+                atb_matmul_ein_sum_out(x, weight, output)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream):
+            result = atb_matmul_ein_sum_out(x, weight, output)
+
+    previous = None
+    for scale in (1.0, -0.5):
+        backing.copy_(original * scale)
+        torch.npu.synchronize()
+        if graph is None:
+            result = atb_matmul_ein_sum_out(x, weight, output)
+        else:
+            graph.replay()
+        expected = project(x, weight)
+        torch.npu.synchronize()
+        assert result.data_ptr() == output.data_ptr() == output_address
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        reference = torch.einsum("thd,hdo->tho", x.cpu().float(), weight.cpu().float())
+        torch.testing.assert_close(output.cpu().float(), reference, rtol=_RTOL, atol=_ATOL)
+        current = output.cpu()
+        if previous is not None:
+            assert not torch.equal(current, previous), "Output buffer retained stale projection values"
+        previous = current

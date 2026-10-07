@@ -32,6 +32,10 @@ namespace xllm::kernel::npu {
 torch::Tensor atb_matmul_ein_sum(const torch::Tensor& input,
                                  const torch::Tensor& weight);
 
+torch::Tensor atb_matmul_ein_sum_out(const torch::Tensor& input,
+                                     const torch::Tensor& weight,
+                                     torch::Tensor& output);
+
 void reshape_paged_cache(torch::Tensor& key,
                          std::optional<torch::Tensor>& value,
                          torch::Tensor& k_cache,

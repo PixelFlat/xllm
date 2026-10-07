@@ -706,23 +706,24 @@ def test_dp_graph_variant_ids_distinguish_mtp_input_signatures() -> None:
     assert [int(call.args[0].item()) for call in gather.call_args_list] == [1, 2, 1]
 
 
-def test_mtp_graph_output_slices_and_detaches_replay_buffers() -> None:
+@pytest.mark.parametrize("detach", [False, True], ids=["view", "detached"])
+def test_mtp_graph_output_slices_and_detaches_replay_buffers(detach: bool) -> None:
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     topk = torch.arange(24, dtype=torch.int64).reshape(4, 2, 3)
 
-    sliced = DecodeAclGraphRunner._slice_output((hidden, None, topk), 2)
+    sliced = DecodeAclGraphRunner._slice_output((hidden, None, topk), 2, detach=detach)
 
     assert isinstance(sliced, tuple)
     sliced_hidden, sliced_aux, sliced_topk = sliced
     assert sliced_aux is None
     assert torch.equal(sliced_hidden, hidden[:2])
     assert torch.equal(sliced_topk, topk[:2])
-    assert sliced_hidden.data_ptr() != hidden.data_ptr()
-    assert sliced_topk.data_ptr() != topk.data_ptr()
+    assert (sliced_hidden.data_ptr() != hidden.data_ptr()) is detach
+    assert (sliced_topk.data_ptr() != topk.data_ptr()) is detach
     hidden.zero_()
     topk.zero_()
-    assert torch.count_nonzero(sliced_hidden) > 0
-    assert torch.count_nonzero(sliced_topk) > 0
+    assert (torch.count_nonzero(sliced_hidden).item() > 0) is detach
+    assert (torch.count_nonzero(sliced_topk).item() > 0) is detach
 
 
 def test_mtp_graph_key_separates_first_step_and_topk_shapes() -> None:

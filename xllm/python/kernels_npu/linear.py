@@ -72,8 +72,25 @@ def atb_matmul_ein_sum(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.ops.xllm_ops.atb_matmul_ein_sum(x, weight)
 
 
+def atb_matmul_ein_sum_out(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Run fixed ATB EIN_SUM directly into a caller-owned ND output.
+
+    The output must be contiguous BF16 [T,H,O] on the operands' NPU and
+    must not alias either operand. The math and input packing match the
+    allocating variant.
+    """
+    return torch.ops.xllm_ops.atb_matmul_ein_sum_out(x, weight, out)
+
+
+def supports_atb_matmul_ein_sum_out() -> bool:
+    """Check the native output-buffer capability during model initialization."""
+    return getattr(torch.ops.xllm_ops, "atb_matmul_ein_sum_out", None) is not None
+
+
 __all__ = [
     "atb_matmul_ein_sum",
+    "atb_matmul_ein_sum_out",
+    "supports_atb_matmul_ein_sum_out",
     "prepare_row_parallel_weight",
     "prepare_quant_weight",
 ]

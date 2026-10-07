@@ -43,19 +43,29 @@ void check_operands(const torch::Tensor& input, const torch::Tensor& weight) {
       << "ATB EIN_SUM weight must have ND format";
 }
 
-}  // namespace
+void check_output(const torch::Tensor& input,
+                  const torch::Tensor& weight,
+                  const torch::Tensor& output) {
+  CHECK_EQ(output.device(), input.device())
+      << "ATB EIN_SUM output must use the input NPU";
+  CHECK_EQ(output.scalar_type(), input.scalar_type())
+      << "ATB EIN_SUM output dtype must match input";
+  CHECK_EQ(output.dim(), 3) << "ATB EIN_SUM output must be [T,H,O]";
+  CHECK_EQ(output.size(0), input.size(0)) << "ATB EIN_SUM token mismatch";
+  CHECK_EQ(output.size(1), input.size(1)) << "ATB EIN_SUM head mismatch";
+  CHECK_EQ(output.size(2), weight.size(2))
+      << "ATB EIN_SUM output dimension mismatch";
+  CHECK(output.is_contiguous()) << "ATB EIN_SUM output must be contiguous";
+  CHECK_EQ(atb::utils::get_format_for_atb(output), ACL_FORMAT_ND)
+      << "ATB EIN_SUM output must have ND format";
+}
 
-torch::Tensor atb_matmul_ein_sum(const torch::Tensor& input,
-                                 const torch::Tensor& weight) {
-  check_operands(input, weight);
-  const c10::DeviceGuard device_guard(input.device());
+void run_atb_matmul_ein_sum(const torch::Tensor& input,
+                            const torch::Tensor& weight,
+                            torch::Tensor& output) {
   torch::Tensor contiguous_input = input.contiguous();
   CHECK_EQ(atb::utils::get_format_for_atb(contiguous_input), ACL_FORMAT_ND)
       << "ATB EIN_SUM input must have ND format";
-  torch::Tensor output = torch::empty(
-      {input.size(0), input.size(1), weight.size(2)}, input.options());
-  CHECK_EQ(atb::utils::get_format_for_atb(output), ACL_FORMAT_ND)
-      << "ATB EIN_SUM output must have ND format";
 
   atb::infer::LinearParam param;
   param.transposeA = false;
@@ -70,6 +80,29 @@ torch::Tensor atb_matmul_ein_sum(const torch::Tensor& input,
   atb::ParamSetter setter;
   setter.Input(contiguous_input).Input(weight).Output(output);
   atb::run_atb_cmd(operation, setter, "LinearOperation");
+}
+
+}  // namespace
+
+torch::Tensor atb_matmul_ein_sum(const torch::Tensor& input,
+                                 const torch::Tensor& weight) {
+  check_operands(input, weight);
+  const c10::DeviceGuard device_guard(input.device());
+  torch::Tensor output = torch::empty(
+      {input.size(0), input.size(1), weight.size(2)}, input.options());
+  CHECK_EQ(atb::utils::get_format_for_atb(output), ACL_FORMAT_ND)
+      << "ATB EIN_SUM output must have ND format";
+  run_atb_matmul_ein_sum(input, weight, output);
+  return output;
+}
+
+torch::Tensor atb_matmul_ein_sum_out(const torch::Tensor& input,
+                                     const torch::Tensor& weight,
+                                     torch::Tensor& output) {
+  check_operands(input, weight);
+  check_output(input, weight, output);
+  const c10::DeviceGuard device_guard(input.device());
+  run_atb_matmul_ein_sum(input, weight, output);
   return output;
 }
 

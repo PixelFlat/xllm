@@ -618,11 +618,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if graph_mode and not owned_metadata:
                 graph_batch = int(actual_seq_kv.numel())
                 self._mla_actual_seq_q = get_execution_buffer(
-                    ("MLA_ACTUAL_SEQ_Q", graph_batch),
+                    ("MLA_ACTUAL_SEQ_Q", graph_batch, str(mla_device), actual_seq_q.dtype),
                     lambda: torch.empty_like(actual_seq_q),
                 )
                 self._mla_actual_seq_kv = get_execution_buffer(
-                    ("MLA_ACTUAL_SEQ_KV", graph_batch),
+                    ("MLA_ACTUAL_SEQ_KV", graph_batch, str(mla_device), actual_seq_kv.dtype),
                     lambda: torch.empty_like(actual_seq_kv),
                 )
                 self._mla_actual_seq_q.copy_(actual_seq_q)
@@ -1395,7 +1395,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             )
             num_blocks = (max_kv + block_size - 1) // block_size
             out = get_execution_buffer(
-                ("KPOOL_INDEX_HISTORY", num_seqs, max_kv, width),
+                (
+                    "KPOOL_INDEX_HISTORY",
+                    num_seqs,
+                    max_kv,
+                    width,
+                    str(device),
+                    index_cache.dtype,
+                ),
                 lambda: torch.empty(
                     num_seqs,
                     max_kv,
@@ -1457,7 +1464,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         if actual_seq_kv is None:
             actual_seq_kv = self._mla_actual_seq_kv
         out = get_execution_buffer(
-            ("SFA_OUTPUT", layer_id) + tuple(q_latent.shape),
+            ("SFA_OUTPUT", layer_id, str(q_latent.device), q_latent.dtype) + tuple(q_latent.shape),
             lambda: torch.empty_like(q_latent),
             shared=True,
         )
@@ -1604,7 +1611,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             )
             return output
 
-        output_key = ("MLA_DENSE_OUTPUT", layer_id) + tuple(q_latent.shape)
+        output_key = ("MLA_DENSE_OUTPUT", layer_id, str(q_latent.device), q_latent.dtype) + tuple(q_latent.shape)
         graph_state = get_forward_context().execution_state
         if graph_state is None:
             output = self._mla_graph_outputs.get(output_key)
@@ -1629,12 +1636,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         else:
             output = get_execution_buffer(output_key, lambda: torch.empty_like(q_latent), shared=True)
             softmax_lse = get_execution_buffer(
-                ("MLA_DENSE_LSE", layer_id) + tuple(q_latent.shape),
+                ("MLA_DENSE_LSE",) + output_key[1:],
                 lambda: torch.empty(0, dtype=q_latent.dtype, device=q_latent.device),
                 shared=True,
             )
             workspace = get_execution_buffer(
-                ("MLA_DENSE_WORKSPACE", layer_id) + tuple(q_latent.shape),
+                ("MLA_DENSE_WORKSPACE",) + output_key[1:],
                 lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
                     q_latent,
                     nope_flat,

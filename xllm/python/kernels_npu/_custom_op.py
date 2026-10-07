@@ -100,6 +100,14 @@ def _atb_matmul_ein_sum_fake(input: torch.Tensor, weight: torch.Tensor) -> torch
     return input.new_empty((input.shape[0], input.shape[1], weight.shape[2]))
 
 
+def _atb_matmul_ein_sum_out_fake(input: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    if out.shape != (input.shape[0], input.shape[1], weight.shape[2]):
+        raise ValueError("ATB EIN_SUM output must be [T,H,O]")
+    if out.dtype != input.dtype or out.device != input.device or not out.is_contiguous():
+        raise ValueError("ATB EIN_SUM output must be contiguous with the input dtype and device")
+    return out
+
+
 def _chunk_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1124,6 +1132,7 @@ register_fake("xllm_ops::rms_norm", _rms_norm_fake)
 register_fake("xllm_ops::rms_norm_gated", _rms_norm_gated_fake)
 register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
+register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
 register_fake("xllm_ops::mega_gdn_prefill", _mega_gdn_prefill_fake)
 register_fake("xllm_ops::mega_gdn_decode", _mega_gdn_decode_fake)

@@ -669,7 +669,11 @@ class DecodeAclGraphRunner(AclGraphRunner):
             self._stream.wait_stream(current_stream)
         with torch.npu.stream(replay_stream):
             entry.graph.replay()
-            output = self._slice_output(entry.static_output, batch_size)
+            output = self._slice_output(
+                entry.static_output,
+                batch_size,
+                detach=input_embedding is not None or mtp_topk_indices is not None,
+            )
 
         if not getattr(entry, "replay_logged", False):
             logger.info(
@@ -705,26 +709,34 @@ class DecodeAclGraphRunner(AclGraphRunner):
     def _slice_output(
         output: ModelExecutionOutput,
         batch_size: int,
+        detach: bool = True,
     ) -> ModelExecutionOutput:
-        """Slice graph outputs and detach them from the replay buffers.
+        """Slice graph outputs and detach them when replay can overlap.
 
         Graph replay writes the same persistent output allocation on every
-        step.  The MTP schedule-overlap path can retain both hidden states and
-        top-k indices until a later step, so returning views allows a replay to
-        overwrite data that an in-flight worker still consumes.  Clone every
-        tensor output while it is still ordered on the graph stream.
+        step. The MTP schedule-overlap path can retain both hidden states and
+        top-k indices until a later step, so it needs detached copies. Without
+        MTP, the caller stream is ordered after replay before the next graph
+        launch, so a view avoids an extra device copy.
         """
         if not isinstance(output, tuple):
-            return output[:batch_size].clone()
+            result = output[:batch_size]
+            return result.clone() if detach else result
         hidden, aux_hidden = output[:2]
-        hidden = hidden[:batch_size].clone()
+        hidden = hidden[:batch_size]
+        if detach:
+            hidden = hidden.clone()
         if aux_hidden is not None:
-            aux_hidden = aux_hidden[:batch_size].clone()
+            aux_hidden = aux_hidden[:batch_size]
+            if detach:
+                aux_hidden = aux_hidden.clone()
         if len(output) == 2:
             return hidden, aux_hidden
         topk = output[2]
         if topk is not None:
-            topk = topk[:batch_size].clone()
+            topk = topk[:batch_size]
+            if detach:
+                topk = topk.clone()
         return hidden, aux_hidden, topk
 
     def _capture(self, entry: AclGraphEntry, stream: torch.npu.Stream) -> None:

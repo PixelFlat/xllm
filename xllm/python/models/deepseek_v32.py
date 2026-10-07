@@ -51,7 +51,11 @@ from xllm.python.model_executor.cp_utils import (
     cp_shard_positions,
     cp_shard_rows,
 )
-from xllm.python.model_executor.forward_context import get_forward_context, record_layer_event
+from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
+    get_forward_context,
+    record_layer_event,
+)
 from xllm.python.model_loader import (
     W8A8WeightLoader,
     mla_head_split,
@@ -520,6 +524,28 @@ class W8A8AttentionLinear(nn.Module):
             torch.bfloat16,
         )
 
+    def forward_out(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Run this projection into a caller-owned graph buffer."""
+        if self._dynamic_activation:
+            x_int8, pertoken = kernels.dynamic_quant(x)
+        else:
+            x_int8 = kernels.quantize_per_tensor(x, self.input_scale, self.input_offset, torch.qint8, -1)
+            pertoken = None
+        bias = None
+        if not self._dynamic_activation and not (self.row_parallel and distributed.tp_rank(x.device) != 0):
+            bias = self.quant_bias
+        return kernels.quant_matmul_out(
+            x_int8,
+            self.weight,
+            False,
+            self.weight_scale if self._dynamic_activation else self.deq_scale,
+            None,
+            pertoken,
+            bias,
+            torch.bfloat16,
+            output,
+        )
+
     @classmethod
     def combine(cls, kv: W8A8AttentionLinear, q: W8A8AttentionLinear) -> W8A8AttentionLinear | None:
         """Choose the legal A projection once, before preparing either weight.
@@ -826,6 +852,7 @@ class DeepseekV3MLAAttention(Attention):
             "npu",
             "privateuseone",
         )
+        self._use_wuv_out = self._use_fused_mla_decode and kernels.supports_atb_matmul_ein_sum_out()
         self._use_mlapo_v2 = self._mlapo_enabled(cfg, device)
 
         self._fused_mla_ready = False
@@ -1161,9 +1188,41 @@ class DeepseekV3MLAAttention(Attention):
         return output
 
     def _project_attention_output(self, attn_out: torch.Tensor) -> torch.Tensor:
-        v_full = kernels.atb_matmul_ein_sum(attn_out, self.W_UV)
+        context = get_forward_context()
+        if context.execution_state is not None and self._use_wuv_out:
+            value_shape = (attn_out.shape[0], self.num_heads_local, self.v_head_dim)
+            v_full = get_execution_buffer(
+                (
+                    "MLA_W_UV_OUTPUT",
+                    id(self),
+                    self.layer_id,
+                    attn_out.device.type,
+                    attn_out.device.index,
+                    *value_shape,
+                    attn_out.dtype,
+                ),
+                lambda: torch.empty(value_shape, dtype=attn_out.dtype, device=attn_out.device),
+            )
+            kernels.atb_matmul_ein_sum_out(attn_out, self.W_UV, v_full)
+        else:
+            v_full = kernels.atb_matmul_ein_sum(attn_out, self.W_UV)
         v_full = v_full.reshape(attn_out.shape[0], self.num_heads_local * self.v_head_dim)
-        return self._reduce_attention_output(self.o_proj(v_full))
+        if context.execution_state is None:
+            return self._reduce_attention_output(self.o_proj(v_full))
+        output_shape = (v_full.shape[0], self.o_proj.out_features)
+        output = get_execution_buffer(
+            (
+                "MLA_O_PROJ_OUTPUT",
+                id(self),
+                self.layer_id,
+                v_full.device.type,
+                v_full.device.index,
+                *output_shape,
+                torch.bfloat16,
+            ),
+            lambda: torch.empty(output_shape, dtype=torch.bfloat16, device=v_full.device),
+        )
+        return self._reduce_attention_output(self.o_proj.forward_out(v_full, output))
 
     def _forward_with_topk(
         self,

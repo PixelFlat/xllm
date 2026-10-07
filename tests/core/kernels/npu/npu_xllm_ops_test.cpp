@@ -281,6 +281,31 @@ TEST_F(NpuXllmOpsTest, DispatcherAtbMatmulEinSumMatchesReference) {
       << "max abs diff = " << (actual - reference).abs().max().item<float>();
 }
 
+TEST_F(NpuXllmOpsTest, DispatcherAtbMatmulEinSumOutReusesStorage) {
+  py::gil_scoped_acquire gil;
+  torch::manual_seed(20261001);
+  const auto options = torch::TensorOptions()
+                           .dtype(torch::kBFloat16)
+                           .device(torch::kPrivateUse1);
+  auto input = torch::randn({4, 4, 512}, options);
+  auto weight = torch::randn({4, 512, 256}, options);
+  auto output = torch::empty({4, 4, 256}, options);
+  void* output_address = output.data_ptr();
+  const auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
+      "xllm_ops::atb_matmul_ein_sum_out", "");
+  const auto typed = op.typed<torch::Tensor(
+      const torch::Tensor&, const torch::Tensor&, torch::Tensor&)>();
+
+  for (const double scale : {1.0, -0.5}) {
+    input.mul_(scale);
+    const auto result = typed.call(input, weight, output);
+    const auto expected = kernel::npu::atb_matmul_ein_sum(input, weight);
+    EXPECT_EQ(result.data_ptr(), output_address);
+    EXPECT_EQ(output.data_ptr(), output_address);
+    EXPECT_TRUE(torch::equal(result.cpu(), expected.cpu()));
+  }
+}
+
 TEST_F(NpuXllmOpsTest, DispatcherSiluAndMulMatchesReference) {
   py::gil_scoped_acquire gil;
   auto opts =
