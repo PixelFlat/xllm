@@ -904,6 +904,52 @@ def _sparse_attn_sharedkv_metadata_fake(
     return torch.empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32, device="npu")
 
 
+def _quant_lightning_indexer_out_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    key_dequant_scale: torch.Tensor,
+    query_quant_mode: int,
+    key_quant_mode: int,
+    actual_seq_lengths_query: torch.Tensor | None,
+    actual_seq_lengths_key: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    metadata: torch.Tensor | None,
+    layout_query: str,
+    layout_key: str,
+    sparse_count: int,
+    sparse_mode: int,
+    pre_tokens: int,
+    next_tokens: int,
+    cmp_ratio: int,
+    return_value: bool,
+    sparse_indices_out: torch.Tensor,
+) -> torch.Tensor:
+    del (
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        query_quant_mode,
+        key_quant_mode,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table,
+        metadata,
+        layout_query,
+        layout_key,
+        sparse_count,
+        sparse_mode,
+        pre_tokens,
+        next_tokens,
+        cmp_ratio,
+        return_value,
+    )
+    return sparse_indices_out
+
+
 def _quant_lightning_indexer_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1101,6 +1147,51 @@ def _sparse_flash_attention_lse_fake(
     return query.new_empty(query.shape, dtype=query.dtype), softmax_max, softmax_sum
 
 
+def _sparse_flash_attention_lse_out_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    block_table: torch.Tensor | None,
+    actual_seq_lengths_query: torch.Tensor | None,
+    actual_seq_lengths_kv: torch.Tensor | None,
+    query_rope: torch.Tensor | None,
+    key_rope: torch.Tensor | None,
+    scale_value: float,
+    sparse_block_size: int,
+    layout_query: str,
+    layout_kv: str,
+    sparse_mode: int,
+    pre_tokens: int,
+    next_tokens: int,
+    attention_mode: int,
+    return_softmax_lse: bool,
+    attention_output: torch.Tensor,
+) -> torch.Tensor:
+    del (
+        key,
+        value,
+        sparse_indices,
+        block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        key_rope,
+        scale_value,
+        sparse_block_size,
+        layout_query,
+        layout_kv,
+        sparse_mode,
+        pre_tokens,
+        next_tokens,
+        attention_mode,
+        return_softmax_lse,
+    )
+    if attention_output.shape != query.shape or attention_output.dtype != query.dtype:
+        raise ValueError("attention_output must match query shape and dtype")
+    return attention_output
+
+
 def _sfa_dcp_remap_out_fake(
     topk_indices: torch.Tensor,
     physical_block_size: int,
@@ -1166,6 +1257,10 @@ register_fake(
     _quant_lightning_indexer_fake,
 )
 register_fake(
+    "xllm_ops::quant_lightning_indexer_out",
+    _quant_lightning_indexer_out_fake,
+)
+register_fake(
     "xllm_ops::quant_lightning_indexer_metadata",
     _quant_lightning_indexer_metadata_fake,
 )
@@ -1185,4 +1280,5 @@ register_fake("xllm_ops::hc_post", _hc_post_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv", _sparse_attn_sharedkv_fake)
 register_fake("xllm_ops::sparse_attn_sharedkv_metadata", _sparse_attn_sharedkv_metadata_fake)
 register_fake("xllm_ops::sparse_flash_attention_lse", _sparse_flash_attention_lse_fake)
+register_fake("xllm_ops::sparse_flash_attention_lse_out", _sparse_flash_attention_lse_out_fake)
 register_fake("xllm_ops::sfa_dcp_remap_out", _sfa_dcp_remap_out_fake)

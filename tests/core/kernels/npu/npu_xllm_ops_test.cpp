@@ -466,6 +466,8 @@ device_ops = (
     "mega_moe",
     "sparse_attn_sharedkv",
     "quant_lightning_indexer",
+    "quant_lightning_indexer_out",
+    "sparse_flash_attention_lse_out",
 )
 for op_name in device_ops:
     qualname = f"xllm_ops::{op_name}"

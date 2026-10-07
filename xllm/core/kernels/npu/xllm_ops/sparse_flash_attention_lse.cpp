@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <glog/logging.h>
 #include <torch/library.h>
 
 #include <string>
@@ -56,6 +57,20 @@ void check_sparse_flash_attention_lse_inputs(const at::Tensor& query,
               "The layout of query only support BSND and TND, but got ",
               layout_query);
   TORCH_CHECK(!layout_kv.empty(), "layout_kv should not be empty.");
+}
+
+void check_sparse_flash_attention_lse_output(const torch::Tensor& query,
+                                             const torch::Tensor& output,
+                                             const std::string& layout_query) {
+  CHECK_EQ(query.dim(), layout_query == "TND" ? 3 : 4);
+  CHECK_EQ(output.device(), query.device())
+      << "attention output must use the query device.";
+  CHECK_EQ(output.dtype(), query.dtype())
+      << "attention output dtype must match query dtype.";
+  CHECK(output.is_contiguous()) << "attention output must be contiguous.";
+  CHECK(output.sizes() == query.sizes())
+      << "attention output shape must match query shape for layout "
+      << layout_query;
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -115,6 +130,58 @@ construct_sparse_flash_attention_lse_outputs(const at::Tensor& query,
 
 }  // namespace
 
+namespace {
+
+void run_sparse_flash_attention_lse(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_indices,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
+    const c10::optional<at::Tensor>& query_rope,
+    const c10::optional<at::Tensor>& key_rope,
+    double scale_value,
+    int64_t sparse_block_size,
+    const std::string& layout_query,
+    const std::string& layout_kv,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t attention_mode,
+    bool return_softmax_lse,
+    const at::Tensor& attention_output,
+    const at::Tensor& softmax_max,
+    const at::Tensor& softmax_sum) {
+  char* query_layout_ptr = const_cast<char*>(layout_query.c_str());
+  char* kv_layout_ptr = const_cast<char*>(layout_kv.c_str());
+  EXEC_NPU_CMD(aclnnSparseFlashAttentionLse,
+               query,
+               key,
+               value,
+               sparse_indices,
+               block_table,
+               actual_seq_lengths_query,
+               actual_seq_lengths_kv,
+               query_rope,
+               key_rope,
+               scale_value,
+               sparse_block_size,
+               query_layout_ptr,
+               kv_layout_ptr,
+               sparse_mode,
+               pre_tokens,
+               next_tokens,
+               attention_mode,
+               return_softmax_lse,
+               attention_output,
+               softmax_max,
+               softmax_sum);
+}
+
+}  // namespace
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -148,31 +215,89 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
   at::Tensor attention_output = std::get<0>(outputs);
   at::Tensor softmax_max = std::get<1>(outputs);
   at::Tensor softmax_sum = std::get<2>(outputs);
-  char* query_layout_ptr = const_cast<char*>(layout_query_str.c_str());
-  char* kv_layout_ptr = const_cast<char*>(layout_kv_str.c_str());
-  EXEC_NPU_CMD(aclnnSparseFlashAttentionLse,
-               query,
-               key,
-               value,
-               sparse_indices,
-               block_table,
-               actual_seq_lengths_query,
-               actual_seq_lengths_kv,
-               query_rope,
-               key_rope,
-               scale_value,
-               sparse_block_size,
-               query_layout_ptr,
-               kv_layout_ptr,
-               sparse_mode,
-               pre_tokens,
-               next_tokens,
-               attention_mode,
-               return_softmax_lse,
-               attention_output,
-               softmax_max,
-               softmax_sum);
+  run_sparse_flash_attention_lse(query,
+                                 key,
+                                 value,
+                                 sparse_indices,
+                                 block_table,
+                                 actual_seq_lengths_query,
+                                 actual_seq_lengths_kv,
+                                 query_rope,
+                                 key_rope,
+                                 scale_value,
+                                 sparse_block_size,
+                                 layout_query_str,
+                                 layout_kv_str,
+                                 sparse_mode,
+                                 pre_tokens,
+                                 next_tokens,
+                                 attention_mode,
+                                 return_softmax_lse,
+                                 attention_output,
+                                 softmax_max,
+                                 softmax_sum);
   return {attention_output, softmax_max, softmax_sum};
+}
+
+torch::Tensor sparse_flash_attention_lse_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sparse_indices,
+    const c10::optional<torch::Tensor>& block_table,
+    const c10::optional<torch::Tensor>& actual_seq_lengths_query,
+    const c10::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const c10::optional<torch::Tensor>& query_rope,
+    const c10::optional<torch::Tensor>& key_rope,
+    double scale_value,
+    int64_t sparse_block_size,
+    c10::string_view layout_query,
+    c10::string_view layout_kv,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t attention_mode,
+    bool return_softmax_lse,
+    torch::Tensor& attention_output) {
+  CHECK(!return_softmax_lse)
+      << "sparse_flash_attention_lse_out only supports output without LSE";
+  std::string layout_query_str = std::string(layout_query);
+  std::string layout_kv_str = std::string(layout_kv);
+  check_sparse_flash_attention_lse_inputs(query,
+                                          key,
+                                          value,
+                                          sparse_indices,
+                                          sparse_block_size,
+                                          layout_query_str,
+                                          layout_kv_str);
+  check_sparse_flash_attention_lse_output(
+      query, attention_output, layout_query_str);
+  torch::Tensor empty_lse_max =
+      torch::empty({0}, query.options().dtype(torch::kFloat32));
+  torch::Tensor empty_lse_sum =
+      torch::empty({0}, query.options().dtype(torch::kFloat32));
+  run_sparse_flash_attention_lse(query,
+                                 key,
+                                 value,
+                                 sparse_indices,
+                                 block_table,
+                                 actual_seq_lengths_query,
+                                 actual_seq_lengths_kv,
+                                 query_rope,
+                                 key_rope,
+                                 scale_value,
+                                 sparse_block_size,
+                                 layout_query_str,
+                                 layout_kv_str,
+                                 sparse_mode,
+                                 pre_tokens,
+                                 next_tokens,
+                                 attention_mode,
+                                 false,
+                                 attention_output,
+                                 empty_lse_max,
+                                 empty_lse_sum);
+  return attention_output;
 }
 
 }  // namespace xllm::kernel::npu

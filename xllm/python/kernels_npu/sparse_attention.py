@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 try:
@@ -193,6 +195,12 @@ def pool_key_indexer(
     )
 
 
+@lru_cache(maxsize=1)
+def supports_sparse_flash_attention_lse_out() -> bool:
+    """Return whether the native SFA output-buffer wrapper is available."""
+    return hasattr(torch.ops.xllm_ops, "sparse_flash_attention_lse_out")
+
+
 def lightning_indexer(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -318,6 +326,50 @@ def quant_lightning_indexer(
         False,
     )
     return indices
+
+
+def supports_quant_lightning_indexer_out() -> bool:
+    """Return whether the native indexer can write indices into a caller buffer."""
+    return hasattr(torch.ops.xllm_ops, "quant_lightning_indexer_out")
+
+
+def quant_lightning_indexer_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    query_dequant_scale: torch.Tensor,
+    key_dequant_scale: torch.Tensor,
+    metadata: torch.Tensor,
+    query_seq_lengths: torch.Tensor | None,
+    key_seq_lengths: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    selected_count: int,
+    indices_out: torch.Tensor,
+    cmp_ratio: int = 1,
+) -> torch.Tensor:
+    """Run INT8 LightningIndexer and write indices into ``indices_out``."""
+    return torch.ops.xllm_ops.quant_lightning_indexer_out(
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        0,
+        0,
+        query_seq_lengths,
+        key_seq_lengths,
+        block_table,
+        metadata,
+        "TND",
+        "PA_BSND",
+        selected_count,
+        3,
+        9223372036854775807,
+        9223372036854775807,
+        cmp_ratio,
+        False,
+        indices_out,
+    )
 
 
 def quant_lightning_indexer_metadata(
@@ -457,8 +509,37 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
-    # Preserve the caller-owned graph buffer while sharing the same backend
-    # selection as the allocating entry point.
+    if (query_rope is None) != (key_rope is None):
+        raise ValueError("query_rope and key_rope must both be present or absent")
+    if (
+        query_rope is not None
+        and supports_sparse_flash_attention_lse_out()
+        and layout_query == "TND"
+        and layout_kv == "PA_BSND"
+        and sparse_mode == 3
+    ):
+        return torch.ops.xllm_ops.sparse_flash_attention_lse_out(
+            query,
+            key,
+            value,
+            sparse_indices,
+            block_table,
+            actual_seq_lengths_query,
+            actual_seq_lengths_kv,
+            query_rope,
+            key_rope,
+            scale_value,
+            sparse_block_size,
+            layout_query,
+            layout_kv,
+            sparse_mode,
+            9223372036854775807,
+            9223372036854775807,
+            2,
+            False,
+            output,
+        )
+    # Keep the allocating entry's backend selection for unsupported out layouts.
     npu_out = sparse_flash_attention(
         query,
         key,
@@ -477,6 +558,47 @@ def sparse_flash_attention_out(
     )
     output.copy_(npu_out)
     return output
+
+
+def sparse_flash_attention_lse_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    block_table: torch.Tensor | None,
+    actual_seq_lengths_query: torch.Tensor | None,
+    actual_seq_lengths_kv: torch.Tensor | None,
+    query_rope: torch.Tensor | None,
+    key_rope: torch.Tensor | None,
+    scale_value: float,
+    sparse_block_size: int,
+    layout_query: str,
+    layout_kv: str,
+    sparse_mode: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run sparse attention directly into a caller-owned output buffer."""
+    return torch.ops.xllm_ops.sparse_flash_attention_lse_out(
+        query,
+        key,
+        value,
+        sparse_indices,
+        block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        key_rope,
+        scale_value,
+        sparse_block_size,
+        layout_query,
+        layout_kv,
+        sparse_mode,
+        9223372036854775807,
+        9223372036854775807,
+        2,
+        False,
+        output,
+    )
 
 
 def sparse_flash_attention_lse(
@@ -624,4 +746,6 @@ __all__ = [
     "sparse_flash_attention",
     "sparse_flash_attention_out",
     "sparse_flash_attention_lse",
+    "sparse_flash_attention_lse_out",
+    "supports_sparse_flash_attention_lse_out",
 ]

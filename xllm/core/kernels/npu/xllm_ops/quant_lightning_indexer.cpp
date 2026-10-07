@@ -76,6 +76,61 @@ construct_quant_lightning_indexer_output_tensor(const at::Tensor& query,
                                             sparse_values_out);
 }
 
+void run_quant_lightning_indexer(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& query_dequant_scale,
+    const at::Tensor& key_dequant_scale,
+    int64_t query_quant_mode,
+    int64_t key_quant_mode,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_key,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& metadata,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t cmp_ratio,
+    bool return_value,
+    at::Tensor& sparse_indices_out,
+    at::Tensor& sparse_values_out) {
+  std::string query_layout_str = std::string(layout_query);
+  std::string key_layout_str = std::string(layout_key);
+  char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
+  char* key_layout_ptr = const_cast<char*>(key_layout_str.c_str());
+  const int64_t state_cache_stride_dim0 = key.stride(0);
+  const int64_t scale_stride_dim0 = key_dequant_scale.stride(0);
+
+  EXEC_NPU_CMD(aclnnQuantLightningIndexer,
+               query,
+               key,
+               weights,
+               query_dequant_scale,
+               key_dequant_scale,
+               actual_seq_lengths_query,
+               actual_seq_lengths_key,
+               block_table,
+               metadata,
+               query_quant_mode,
+               key_quant_mode,
+               query_layout_ptr,
+               key_layout_ptr,
+               sparse_count,
+               sparse_mode,
+               pre_tokens,
+               next_tokens,
+               cmp_ratio,
+               return_value,
+               state_cache_stride_dim0,
+               scale_stride_dim0,
+               sparse_indices_out,
+               sparse_values_out);
+}
+
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
@@ -111,39 +166,95 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
                                                       return_value);
   at::Tensor sparse_indices_out = std::get<0>(quant_lightning_indexer_output);
   at::Tensor sparse_values_out = std::get<1>(quant_lightning_indexer_output);
-  // convert str
-  char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
-  char* key_layout_ptr = const_cast<char*>(key_layout_str.c_str());
-  const int64_t state_cache_stride_dim0 = key.stride(0);
-  const int64_t scale_stride_dim0 = key_dequant_scale.stride(0);
-
-  EXEC_NPU_CMD(aclnnQuantLightningIndexer,
-               query,
-               key,
-               weights,
-               query_dequant_scale,
-               key_dequant_scale,
-               actual_seq_lengths_query,
-               actual_seq_lengths_key,
-               block_table,
-               metadata,
-               query_quant_mode,
-               key_quant_mode,
-               query_layout_ptr,
-               key_layout_ptr,
-               sparse_count,
-               sparse_mode,
-               pre_tokens,
-               next_tokens,
-               cmp_ratio,
-               return_value,
-               state_cache_stride_dim0,
-               scale_stride_dim0,
-               sparse_indices_out,
-               sparse_values_out);
+  run_quant_lightning_indexer(query,
+                              key,
+                              weights,
+                              query_dequant_scale,
+                              key_dequant_scale,
+                              query_quant_mode,
+                              key_quant_mode,
+                              actual_seq_lengths_query,
+                              actual_seq_lengths_key,
+                              block_table,
+                              metadata,
+                              query_layout_str,
+                              key_layout_str,
+                              sparse_count,
+                              sparse_mode,
+                              pre_tokens,
+                              next_tokens,
+                              cmp_ratio,
+                              return_value,
+                              sparse_indices_out,
+                              sparse_values_out);
 
   return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out,
                                             sparse_values_out);
+}
+
+torch::Tensor quant_lightning_indexer_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const torch::Tensor& query_dequant_scale,
+    const torch::Tensor& key_dequant_scale,
+    int64_t query_quant_mode,
+    int64_t key_quant_mode,
+    const c10::optional<torch::Tensor>& actual_seq_lengths_query,
+    const c10::optional<torch::Tensor>& actual_seq_lengths_key,
+    const c10::optional<torch::Tensor>& block_table,
+    const c10::optional<torch::Tensor>& metadata,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t cmp_ratio,
+    bool return_value,
+    torch::Tensor& sparse_indices_out) {
+  CHECK(!return_value) << "quant_lightning_indexer_out does not return values";
+  CHECK(layout_query == "TND" || layout_query == "BSND")
+      << "query layout must be TND or BSND";
+  CHECK_EQ(query.dim(), layout_query == "TND" ? 3 : 4);
+  CHECK_GE(key.dim(), layout_key == "TND" ? 2 : 3);
+  CHECK_GT(sparse_count, 0);
+  CHECK_EQ(sparse_indices_out.device(), query.device());
+  CHECK_EQ(sparse_indices_out.dim(), query.dim());
+  CHECK_EQ(sparse_indices_out.size(0), query.size(0));
+  if (layout_query == "BSND") {
+    CHECK_EQ(sparse_indices_out.size(1), query.size(1));
+  }
+  CHECK_EQ(sparse_indices_out.size(-2), key.size(layout_key == "TND" ? 1 : 2));
+  CHECK_EQ(sparse_indices_out.size(-1), sparse_count);
+  CHECK(sparse_indices_out.is_contiguous())
+      << "sparse_indices_out must be contiguous";
+  CHECK(sparse_indices_out.scalar_type() == torch::kInt32)
+      << "sparse_indices_out must be int32";
+  torch::Tensor sparse_values_out =
+      torch::empty({0}, query.options().dtype(torch::kFloat32));
+  run_quant_lightning_indexer(query,
+                              key,
+                              weights,
+                              query_dequant_scale,
+                              key_dequant_scale,
+                              query_quant_mode,
+                              key_quant_mode,
+                              actual_seq_lengths_query,
+                              actual_seq_lengths_key,
+                              block_table,
+                              metadata,
+                              layout_query,
+                              layout_key,
+                              sparse_count,
+                              sparse_mode,
+                              pre_tokens,
+                              next_tokens,
+                              cmp_ratio,
+                              return_value,
+                              sparse_indices_out,
+                              sparse_values_out);
+  return sparse_indices_out;
 }
 
 }  // namespace xllm::kernel::npu

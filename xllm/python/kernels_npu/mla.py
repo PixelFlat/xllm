@@ -19,9 +19,14 @@ from __future__ import annotations
 import torch
 import torch_npu
 
+from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
+    get_forward_context_or_none,
+)
+
 from .linear import atb_matmul_ein_sum
 from .normalization import rms_norm, rms_norm_dynamic_quant
-from .quantization import dynamic_quant, quant_matmul, quantize_per_tensor
+from .quantization import dynamic_quant, quant_matmul, quant_matmul_out, quantize_per_tensor
 
 _KROPE_CTKV_CACHE_MODE = 1
 _NZ_CACHE_MODE = 3
@@ -400,21 +405,74 @@ def deepseek_mla_preprocess_decode_dynamic(
     Fusion is enabled only when the indexer can consume the same INT8 Q-A as
     Q-B; otherwise it receives the normalized floating-point activation.
     """
+    forward_context = get_forward_context_or_none()
+    graph_buffers = forward_context.execution_state if forward_context is not None else None
+
+    qkv_output = None
+    q_output = None
+    if graph_buffers is not None:
+        token_count = hidden.shape[0]
+        qkv_output = get_execution_buffer(
+            (
+                "MLA_PREPROCESS_QKV_A",
+                qkv_weight.data_ptr(),
+                token_count,
+                tuple(qkv_weight.shape),
+                qkv_weight.dtype,
+                hidden.device,
+                torch.bfloat16,
+            ),
+            lambda: torch.empty(
+                (token_count, qkv_weight.shape[1]),
+                dtype=torch.bfloat16,
+                device=hidden.device,
+            ),
+        )
+        q_output = get_execution_buffer(
+            (
+                "MLA_PREPROCESS_Q_B",
+                q_b_weight.data_ptr(),
+                token_count,
+                tuple(q_b_weight.shape),
+                q_b_weight.dtype,
+                hidden.device,
+                torch.bfloat16,
+            ),
+            lambda: torch.empty(
+                (token_count, q_b_weight.shape[1]),
+                dtype=torch.bfloat16,
+                device=hidden.device,
+            ),
+        )
+
     if hidden_scale is None:
         hidden_int8, hidden_scale = dynamic_quant(hidden)
     else:
         hidden_int8 = hidden
         hidden_scale = hidden_scale.reshape(-1)
-    qkv_a = quant_matmul(
-        hidden_int8,
-        qkv_weight,
-        False,
-        qkv_weight_scale,
-        None,
-        hidden_scale,
-        None,
-        torch.bfloat16,
-    )
+    if qkv_output is None:
+        qkv_a = quant_matmul(
+            hidden_int8,
+            qkv_weight,
+            False,
+            qkv_weight_scale,
+            None,
+            hidden_scale,
+            None,
+            torch.bfloat16,
+        )
+    else:
+        qkv_a = quant_matmul_out(
+            hidden_int8,
+            qkv_weight,
+            False,
+            qkv_weight_scale,
+            None,
+            hidden_scale,
+            None,
+            torch.bfloat16,
+            qkv_output,
+        )
     kv_dim = kv_lora_rank + qk_rope_head_dim
     kv, q_a = qkv_a.split([kv_dim, q_lora_rank], dim=-1)
     if fuse_q_norm_quant:
@@ -423,16 +481,30 @@ def deepseek_mla_preprocess_decode_dynamic(
     else:
         q_c = rms_norm(q_a, q_norm_weight, q_norm_epsilon)
         q_c_int8, q_c_scale = dynamic_quant(q_c)
-    q = quant_matmul(
-        q_c_int8,
-        q_b_weight,
-        False,
-        q_b_weight_scale,
-        None,
-        q_c_scale,
-        None,
-        torch.bfloat16,
-    ).view(
+    if q_output is None:
+        q = quant_matmul(
+            q_c_int8,
+            q_b_weight,
+            False,
+            q_b_weight_scale,
+            None,
+            q_c_scale,
+            None,
+            torch.bfloat16,
+        )
+    else:
+        q = quant_matmul_out(
+            q_c_int8,
+            q_b_weight,
+            False,
+            q_b_weight_scale,
+            None,
+            q_c_scale,
+            None,
+            torch.bfloat16,
+            q_output,
+        )
+    q = q.view(
         hidden.shape[0],
         num_heads,
         qk_nope_head_dim + qk_rope_head_dim,

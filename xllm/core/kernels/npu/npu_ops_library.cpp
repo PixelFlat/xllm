@@ -719,6 +719,15 @@ TORCH_LIBRARY(xllm_ops, m) {
       "sparse_count, int sparse_mode, int pre_tokens, int next_tokens, int "
       "cmp_ratio, bool return_value) -> (Tensor, Tensor)");
   m.def(
+      "quant_lightning_indexer_out(Tensor query, Tensor key, Tensor weights, "
+      "Tensor query_dequant_scale, Tensor key_dequant_scale, int "
+      "query_quant_mode, int key_quant_mode, Tensor? "
+      "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, Tensor? "
+      "block_table, Tensor? metadata, str layout_query, str layout_key, int "
+      "sparse_count, int sparse_mode, int pre_tokens, int next_tokens, int "
+      "cmp_ratio, bool return_value, Tensor(a!) sparse_indices_out) -> "
+      "Tensor(a!)");
+  m.def(
       "quant_lightning_indexer_metadata(int num_heads_q, int num_heads_k, "
       "int head_dim, int query_quant_mode, int key_quant_mode, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, int "
@@ -750,6 +759,14 @@ TORCH_LIBRARY(xllm_ops, m) {
       "pre_tokens=9223372036854775807, int next_tokens=9223372036854775807, "
       "int attention_mode=2, bool return_softmax_lse=False) -> (Tensor, "
       "Tensor, Tensor)");
+  m.def(
+      "sparse_flash_attention_lse_out(Tensor query, Tensor key, Tensor value, "
+      "Tensor sparse_indices, Tensor? block_table, Tensor? "
+      "actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, Tensor? "
+      "query_rope, Tensor? key_rope, float scale_value, int sparse_block_size, "
+      "str layout_query, str layout_kv, int sparse_mode, int pre_tokens, int "
+      "next_tokens, int attention_mode, bool return_softmax_lse, Tensor(a!) "
+      "attention_output) -> Tensor(a!)");
   m.def(
       "build_cp_context(int[] q_seq_lens, int[] kv_seq_lens, int cp_size, "
       "int cp_rank, Device device) -> (Tensor shard_index, Tensor "
@@ -877,6 +894,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("dynamic_quant", TORCH_FN(xllm::kernel::npu::dynamic_quant));
   m.impl("quant_lightning_indexer",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer));
+  m.impl("quant_lightning_indexer_out",
+         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_out));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
   m.impl("lightning_indexer", TORCH_FN(xllm::kernel::npu::lightning_indexer));
@@ -895,6 +914,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::sparse_attn_sharedkv));
   m.impl("sparse_flash_attention_lse",
          TORCH_FN(xllm::kernel::npu::sparse_flash_attention_lse));
+  m.impl("sparse_flash_attention_lse_out",
+         TORCH_FN(xllm::kernel::npu::sparse_flash_attention_lse_out));
   m.impl("sfa_dcp_remap_out", TORCH_FN(xllm::sfa_dcp_remap_out_npu));
   m.impl("npu_all_reduce",
          TORCH_FN(xllm::kernel::npu::all_reduce_on_current_stream));
