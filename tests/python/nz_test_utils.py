@@ -68,6 +68,8 @@ def print_rank0(rank: int, msg: str) -> None:
 
 
 def init_hccl(timeout_s: int = 180) -> tuple[int, int, int]:
+    # Avoid NPU listener conflicts on shared hosts without overriding caller configuration.
+    os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
