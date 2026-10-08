@@ -1070,8 +1070,29 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 metadata_row_count=4,
             )
 
-    def test_replay_returns_detached_static_output(self) -> None:
+    @pytest.mark.parametrize("task_updates", [False, True])
+    @pytest.mark.parametrize(
+        ("num_decoding_tokens", "is_draft", "with_embedding", "with_topk"),
+        [
+            (1, False, False, False),
+            (4, False, False, False),
+            (1, True, False, False),
+            (1, False, True, False),
+            (1, False, False, True),
+        ],
+        ids=["ordinary", "verify", "draft", "repair", "shared-topk"],
+    )
+    def test_replay_output_ownership_and_stream_ordering(
+        self,
+        task_updates: bool,
+        num_decoding_tokens: int,
+        is_draft: bool,
+        with_embedding: bool,
+        with_topk: bool,
+    ) -> None:
         runner = self._runner()
+        runner.num_decoding_tokens = num_decoding_tokens
+        runner._is_spec_draft = is_draft
         prepare_replay = MagicMock()
         runner.attention_backend.prepare_graph_replay = prepare_replay
         batch_size = 3
@@ -1083,13 +1104,16 @@ class TestDecodeAclGraphSpeculativeMetadata:
             graph=graph,
             static_output=static_output,
             static_metadata=SimpleNamespace(),
-            graph_tasks=[],
+            graph_tasks=[object()] if task_updates else [],
             execution_state=SimpleNamespace(persistent_buffers={}),
         )
+        embedding = torch.zeros(batch_size, 3) if with_embedding else None
+        topk = torch.zeros(batch_size, 1, 1, dtype=torch.int32) if with_topk else None
         graph_key = runner._graph_key(
             padded_batch_size,
             is_expanded=False,
-            input_embedding=None,
+            input_embedding=embedding,
+            mtp_topk_indices=topk,
         )
         runner._graphs[graph_key] = entry
 
@@ -1110,19 +1134,36 @@ class TestDecodeAclGraphSpeculativeMetadata:
         with (
             patch.object(torch, "npu", fake_npu, create=True),
             patch.object(runner, "_fill_entry"),
+            patch.object(runner, "_initialize_task_updates") as initialize_updates,
+            patch.object(runner, "_update_after_replay") as update_after_replay,
         ):
             output = runner.execute(
                 torch.arange(batch_size, dtype=torch.int32),
                 torch.arange(batch_size, dtype=torch.int32),
                 metadata,
+                embedding,
+                topk,
             )
 
         assert output.shape == (batch_size, 3)
-        assert output.data_ptr() != static_output.data_ptr()
-        output[0, 0] = -1
-        assert static_output[0, 0].item() == 0
-        replay_stream.wait_stream.assert_called_once_with(current_stream)
-        current_stream.wait_stream.assert_called_once_with(replay_stream)
+        detached = num_decoding_tokens > 1 or is_draft or with_embedding or with_topk
+        assert (output.data_ptr() != static_output.data_ptr()) == detached
+        expected = output.clone()
+        static_output.add_(100)
+        torch.testing.assert_close(output, expected if detached else expected + 100)
+        if task_updates:
+            replay_stream.wait_stream.assert_called_once_with(current_stream)
+            current_stream.wait_stream.assert_called_once_with(replay_stream)
+            current_stream.wait_event.assert_called_once_with(runner._update_done_event)
+            initialize_updates.assert_called_once()
+            update_after_replay.assert_called_once_with(entry, replay_stream, runner._update_done_event)
+        else:
+            replay_stream.wait_stream.assert_not_called()
+            current_stream.wait_stream.assert_not_called()
+            current_stream.wait_event.assert_not_called()
+            initialize_updates.assert_not_called()
+            update_after_replay.assert_not_called()
+            assert runner._taskless_replay_stream is current_stream
         graph.replay.assert_called_once_with()
         prepare_replay.assert_called_once_with(entry.static_metadata)
 
