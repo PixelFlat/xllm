@@ -371,7 +371,8 @@ def test_dspark_graph_validation_preserves_static_inputs(
 
 
 @pytest.mark.parametrize("has_tasks", [False, True])
-def test_replay_selects_stream_without_changing_output_ownership(has_tasks: bool) -> None:
+@pytest.mark.parametrize("has_mtp_inputs", [False, True])
+def test_replay_selects_stream_and_preserves_output_ownership(has_tasks: bool, has_mtp_inputs: bool) -> None:
     runner = _runner()
     caller = Mock()
     capture = Mock()
@@ -391,11 +392,16 @@ def test_replay_selects_stream_without_changing_output_ownership(has_tasks: bool
         patch.object(torch.npu, "Stream", return_value=Mock()),
         patch.object(torch.npu, "Event", return_value=Mock()),
     ):
-        output = runner.execute(torch.zeros(1, dtype=torch.int32), torch.zeros(1), _metadata(torch.zeros(1)))
+        output = runner.execute(
+            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1),
+            _metadata(torch.zeros(1)),
+            input_embedding=torch.ones((1, 2)) if has_mtp_inputs else None,
+        )
     replay_stream = capture if has_tasks else caller
     stream_context.assert_called_once_with(replay_stream)
     entry.graph.replay.assert_called_once_with()
-    assert output.data_ptr() != entry.static_output.data_ptr()
+    assert (output.data_ptr() != entry.static_output.data_ptr()) is has_mtp_inputs
     if has_tasks:
         update.assert_called_once_with(entry, capture, runner._update_done_event)
         capture.wait_stream.assert_called_once_with(caller)

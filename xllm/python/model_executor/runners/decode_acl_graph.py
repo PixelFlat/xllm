@@ -78,8 +78,8 @@ def _same_npu_stream(lhs: object, rhs: object) -> bool:
 class DecodeAclGraphRunner(AclGraphRunner):
     """Owns static inputs and lazily captures decode graphs on a private stream.
 
-    Inputs are copied into entry-owned storage; returned outputs are detached
-    from replay buffers. Taskless graphs replay on the caller's stream.
+    Inputs are copied into entry-owned storage; MTP outputs are detached from
+    replay buffers. Taskless graphs replay on the caller's stream.
     Slot-bound execution uses PreparedAclGraphRunner.
     """
 
