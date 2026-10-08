@@ -765,7 +765,9 @@ def test_sparse_attention_preserves_output_storage_across_dispatch(available: bo
             torch.ops.xllm_ops, "sparse_flash_attention_lse", return_value=(expected, None, None), create=True
         ) as allocating,
     ):
-        result = sparse_attention.sparse_flash_attention_out(*_sparse_attention_out_args(query, output, layout, rope=rope))
+        result = sparse_attention.sparse_flash_attention_out(
+            *_sparse_attention_out_args(query, output, layout, rope=rope)
+        )
     assert result is output
     assert result.data_ptr() == address
     torch.testing.assert_close(result, expected)

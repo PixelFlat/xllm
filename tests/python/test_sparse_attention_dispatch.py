@@ -24,8 +24,9 @@ from xllm.python.kernels_npu import sparse_attention
 
 @pytest.mark.parametrize("rope", [False, True])
 @pytest.mark.parametrize("entry", ["allocate", "out", "lse"])
+@pytest.mark.parametrize("out_available", [False, True])
 def test_sparse_attention_preserves_backend_and_output_contract(
-    monkeypatch: pytest.MonkeyPatch, rope: bool, entry: str
+    monkeypatch: pytest.MonkeyPatch, rope: bool, entry: str, out_available: bool
 ) -> None:
     query = torch.zeros(2, 4, 8)
     key = torch.zeros(1, 16, 1, 8)
@@ -37,8 +38,17 @@ def test_sparse_attention_preserves_backend_and_output_contract(
     expected = (torch.ones_like(query), torch.ones(1, 2, 4), torch.full((1, 2, 4), 2.0))
     custom = MagicMock(return_value=expected)
     native = MagicMock(return_value=expected)
+
+    def write_out(*args: object) -> torch.Tensor:
+        output = args[-1]
+        output.copy_(expected[0])
+        return output
+
+    custom_out = MagicMock(side_effect=write_out)
     monkeypatch.setattr(torch.ops.xllm_ops, "sparse_flash_attention_lse", custom, raising=False)
     monkeypatch.setattr(torch.ops.npu, "npu_sparse_flash_attention", native, raising=False)
+    monkeypatch.setattr(torch.ops.xllm_ops, "sparse_flash_attention_lse_out", custom_out, raising=False)
+    monkeypatch.setattr(sparse_attention, "supports_sparse_flash_attention_lse_out", lambda: out_available)
     args = (
         query,
         key,
@@ -74,10 +84,16 @@ def test_sparse_attention_preserves_backend_and_output_contract(
         assert result is expected[0]
         tail = (9223372036854775807, 9223372036854775807, 2, False)
 
-    if rope:
+    if entry == "out" and rope and out_available:
+        custom_out.assert_called_once_with(*args, *tail, buffer)
+        custom.assert_not_called()
+        native.assert_not_called()
+    elif rope:
+        custom_out.assert_not_called()
         native.assert_not_called()
         custom.assert_called_once_with(*args, *tail)
     else:
+        custom_out.assert_not_called()
         custom.assert_not_called()
         native.assert_called_once_with(
             query,
@@ -102,31 +118,42 @@ def test_sparse_attention_preserves_backend_and_output_contract(
 
 
 @pytest.mark.parametrize("query_rope", [None, torch.zeros(1)])
+@pytest.mark.parametrize("entry", ["allocate", "out", "lse"])
 def test_partial_rope_pair_is_rejected_before_operator_execution(
-    monkeypatch: pytest.MonkeyPatch, query_rope: torch.Tensor | None
+    monkeypatch: pytest.MonkeyPatch, query_rope: torch.Tensor | None, entry: str
 ) -> None:
     custom = MagicMock()
     native = MagicMock()
+    custom_out = MagicMock()
     monkeypatch.setattr(torch.ops.xllm_ops, "sparse_flash_attention_lse", custom, raising=False)
     monkeypatch.setattr(torch.ops.npu, "npu_sparse_flash_attention", native, raising=False)
+    monkeypatch.setattr(torch.ops.xllm_ops, "sparse_flash_attention_lse_out", custom_out, raising=False)
+    monkeypatch.setattr(sparse_attention, "supports_sparse_flash_attention_lse_out", lambda: True)
     tensor = torch.zeros(1)
     key_rope = tensor if query_rope is None else None
+    args = (
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        None,
+        None,
+        None,
+        query_rope,
+        key_rope,
+        0.125,
+        1,
+        "TND",
+        "PA_BSND",
+        3,
+    )
     with pytest.raises(ValueError, match="both be present or absent"):
-        sparse_attention.sparse_flash_attention(
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            None,
-            None,
-            None,
-            query_rope,
-            key_rope,
-            0.125,
-            1,
-            "TND",
-            "PA_BSND",
-            3,
-        )
+        if entry == "out":
+            sparse_attention.sparse_flash_attention_out(*args, output=torch.empty_like(tensor))
+        elif entry == "lse":
+            sparse_attention.sparse_flash_attention_lse(*args)
+        else:
+            sparse_attention.sparse_flash_attention(*args)
     custom.assert_not_called()
     native.assert_not_called()
+    custom_out.assert_not_called()
