@@ -799,6 +799,7 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
         (1, 0, 4, 0, 2),
         (1, 0, 4, 3, 2),
         (1, 0, 8, 7, 4),
+        *[(1, 0, 4, rank, 1) for rank in range(4)],
     ],
 )
 def test_glm_weight_loader_reads_only_local_ep_experts(
@@ -807,6 +808,8 @@ def test_glm_weight_loader_reads_only_local_ep_experts(
     values = _config(ep_size=ep_size, ep_rank=ep_rank, moe_tp_size=moe_tp_size, moe_tp_rank=moe_tp_rank)
     if cp_size > 1:
         values.update(cp_size=cp_size, cp_rank=moe_tp_rank // 2, dp_size=1, world_size=2 * cp_size)
+    elif ep_size == 1:
+        values.update(tp_rank=moe_tp_rank % 2, dp_rank=moe_tp_rank // 2)
     model = Glm52ForCausalLM(values)
     moe = model.model.layers[0].mlp
     model.model.layers[0].self_attn.process_weights_after_loading = MagicMock()
@@ -822,7 +825,7 @@ def test_glm_weight_loader_reads_only_local_ep_experts(
         return weight
 
     monkeypatch.setattr(glm5_2.kernels, "format_cast_nz", _format_cast_nz, raising=False)
-    model.load_weights([], tp_rank=0, tp_size=2)
+    model.load_weights([], tp_rank=values["tp_rank"], tp_size=2)
     loader = _RecordingLoader.latest
     assert loader is not None
     expert_ids = {int(name.split(".experts.")[1].split(".")[0]) for name in loader.loaded if ".mlp.experts." in name}
@@ -837,12 +840,48 @@ def test_glm_weight_loader_reads_only_local_ep_experts(
         torch.testing.assert_close(moe.experts_w13[local_idx], expected_w13, rtol=0, atol=0)
         torch.testing.assert_close(moe.experts_w2[local_idx], expected_w2, rtol=0, atol=0)
     moe.shared_experts.process_weights_after_loading.assert_called_once_with()
-    assert (loader.tp_size, loader.tp_rank) == (2, 0)
+    assert (loader.tp_size, loader.tp_rank) == (2, values["tp_rank"])
     assert all(
         "model.layers.0.self_attn." + proj in loader.loaded for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa")
     )
     assert loader.fused_projections == []
     assert loader.shared_shards == [("model.layers.0.mlp.shared_experts.", moe_tp_size, moe_tp_rank)]
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "cp_size", "moe_tp_size", "attn_dp_sharding", "expected_group"),
+    [
+        (1, 1, 2, False, "tp"),
+        (2, 1, 4, False, "moe_tp"),
+        (2, 1, 1, False, "tp"),
+        (2, 2, 8, False, "tp"),
+        (2, 1, 4, True, "moe_tp"),
+    ],
+)
+def test_glm_expert_reduction_matches_weight_shards(
+    dp_size: int, cp_size: int, moe_tp_size: int, attn_dp_sharding: bool, expected_group: str
+) -> None:
+    cfg = Glm52Config.from_dict(
+        _config(
+            ep_size=1,
+            dp_size=dp_size,
+            cp_size=cp_size,
+            world_size=2 * dp_size * cp_size,
+            moe_tp_size=moe_tp_size,
+            enable_attn_dp_weight_sharding=attn_dp_sharding,
+        )
+    )
+    cfg.validate()
+    moe = Glm52MoE(cfg, 0, torch.float32, torch.device("cpu"))
+    routed, shared = torch.randn(3, 16), torch.randn(3, 16)
+    with patch.object(glm5_2.distributed, "all_reduce_") as reduce:
+        output = moe._combine_expert_outputs(routed, shared, False)
+    reduce.assert_called_once_with(output, expected_group)
+    torch.testing.assert_close(output, routed + shared)
+    expected_world = moe_tp_size if expected_group == "moe_tp" else cfg.tp_size
+    assert moe.inter_local == cfg.moe_intermediate_size // expected_world
+    assert moe.shared_experts.tp == expected_world
+    assert moe.shared_experts.down_proj.in_features == moe.inter_local
 
 
 @pytest.mark.parametrize("dynamic_activation", [False, True])

@@ -66,6 +66,32 @@ def _config(**overrides) -> dict:
     return config
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_glm_mtp_dp_experts_use_cross_dp_moe_tp(rank: int) -> None:
+    draft = glm5_2_mtp.Glm52MtpForCausalLM(
+        _config(
+            tp_size=2,
+            tp_rank=rank % 2,
+            dp_size=2,
+            dp_rank=rank // 2,
+            world_size=4,
+            moe_tp_size=4,
+            moe_tp_rank=rank,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            moe_intermediate_size=8,
+            mlp_layer_types=["moe"],
+            first_k_dense_replace=0,
+        )
+    )
+    moe = draft.model.layers[0].mlp
+    assert moe.num_local_experts == 8
+    assert moe.inter_local == 2
+    assert moe.shared_experts.tp == 4
+    assert moe.shared_experts.down_proj.in_features == 2
+    assert draft.cfg.attention_weight_shard() == (2, rank % 2)
+
+
 class _Embedding(nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return torch.stack((input_ids.float(), input_ids.float()), dim=-1)

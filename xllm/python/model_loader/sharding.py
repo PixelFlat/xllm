@@ -122,6 +122,12 @@ def mla_head_split(n_heads: int, tp_size: int) -> tuple[int, int]:
 
 def moe_shard(cfg: MoeParallelConfig) -> tuple[int, int]:
     """(world, rank) for sharding routed-expert / shared-expert weights."""
-    if cfg.ep_size > 1 or getattr(cfg, "enable_attn_dp_weight_sharding", False):
+    # DP rows are gathered before expert execution. Use the supplied cross-DP
+    # MoE TP group instead of duplicating expert shards in each attention TP
+    # group. Configurations that disable MoE TP, or include CP, keep their
+    # existing attention-TP expert layout.
+    dp_size = getattr(cfg, "dp_size", 1)
+    cross_dp_tp = dp_size > 1 and getattr(cfg, "cp_size", 1) == 1 and cfg.moe_tp_size == cfg.tp_size * dp_size
+    if cfg.ep_size > 1 or cross_dp_tp or getattr(cfg, "enable_attn_dp_weight_sharding", False):
         return cfg.moe_tp_size, cfg.moe_tp_rank
     return cfg.tp_size, cfg.tp_rank

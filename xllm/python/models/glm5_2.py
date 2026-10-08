@@ -942,12 +942,15 @@ class Glm52MoE(DeepseekV3MoE):
             )
         else:
             final = routed + shared
-        if self.cfg.cp_size > 1 or getattr(self.cfg, "enable_attn_dp_weight_sharding", False):
+        if self.cfg.cp_size > 1:
             if self.moe_tp_size > 1:
                 distributed.all_reduce_(final, "moe_tp")
             return final
-        if self.cfg.tp_size > 1:
-            distributed.all_reduce_(final, "tp")
+        world, _ = moe_shard(self.cfg)
+        if world > 1:
+            # Reduction must cover the same shards used by both expert loaders.
+            use_moe_tp = world != self.cfg.tp_size or self.cfg.enable_attn_dp_weight_sharding
+            distributed.all_reduce_(final, "moe_tp" if use_moe_tp else "tp")
         return final
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:

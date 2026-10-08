@@ -282,7 +282,16 @@ def test_glm_ep1_moe_reduction_matches_weight_sharding(cp_size: int, group: str)
     nn.Module.__init__(moe)
     moe.ep_size = 1
     moe.moe_tp_size = 4
-    moe.cfg = SimpleNamespace(tp_size=2, cp_size=cp_size)
+    moe.cfg = SimpleNamespace(
+        ep_size=1,
+        tp_size=2,
+        tp_rank=0,
+        moe_tp_size=4,
+        moe_tp_rank=0,
+        dp_size=1,
+        cp_size=cp_size,
+        enable_attn_dp_weight_sharding=False,
+    )
     routed = torch.tensor([[1.0], [2.0]])
     shared = torch.tensor([[10.0], [20.0]])
 
@@ -516,13 +525,29 @@ def test_glm_moe_finalize_orders_stream_dependencies(gate_overlap: bool) -> None
     assert [event[0] for event in events] == expected
 
 
-@pytest.mark.parametrize("cp_size,group", [(1, "tp"), (2, "moe_tp")])
-def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce(cp_size: int, group: str) -> None:
+@pytest.mark.parametrize(
+    ("mode", "size", "expected_group"),
+    [("cp", 1, "tp"), ("cp", 2, "moe_tp"), ("dp", 1, "tp"), ("dp", 2, "moe_tp")],
+)
+def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce(
+    mode: str, size: int, expected_group: str
+) -> None:
     moe = glm5_2.Glm52MoE.__new__(glm5_2.Glm52MoE)
     nn.Module.__init__(moe)
     moe.ep_size = 1
-    moe.moe_tp_size = cp_size
-    moe.cfg = SimpleNamespace(tp_size=2, cp_size=cp_size)
+    cp_size = size if mode == "cp" else 1
+    dp_size = size if mode == "dp" else 1
+    moe.moe_tp_size = size if mode == "cp" else 2 * size
+    moe.cfg = SimpleNamespace(
+        ep_size=1,
+        tp_size=2,
+        tp_rank=0,
+        moe_tp_size=moe.moe_tp_size,
+        moe_tp_rank=0,
+        dp_size=dp_size,
+        cp_size=1,
+        enable_attn_dp_weight_sharding=False,
+    )
     moe._enable_moe_finalize_routing = True
     permuted = torch.tensor([[1.0], [2.0], [3.0]])
     probs = torch.tensor([[0.25], [0.5], [0.75]])
@@ -559,7 +584,7 @@ def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce(cp_size
     assert reduce.call_count == 1
     reduce_args = reduce.call_args.args
     torch.testing.assert_close(reduce_args[0], finalized)
-    assert reduce_args[1] == group
+    assert reduce_args[1] == expected_group
     torch.testing.assert_close(output, finalized)
 
 
