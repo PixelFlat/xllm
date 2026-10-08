@@ -723,6 +723,9 @@ class DecodeAclGraphRunner(AclGraphRunner):
         top-k indices until a later step, so it needs detached copies. Without
         MTP, the caller stream is ordered after replay before the next graph
         launch, so a view avoids an extra device copy.
+
+        A non-detached view is borrowed until this entry executes again. The
+        caller must consume it on the ordered stream or clone it if retained.
         """
         if not isinstance(output, tuple):
             result = output[:batch_size]

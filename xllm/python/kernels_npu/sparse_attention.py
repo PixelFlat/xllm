@@ -447,6 +447,17 @@ def sparse_flash_attention(
     return output
 
 
+def _validate_sparse_attention_output(query: torch.Tensor, output: torch.Tensor) -> None:
+    if output.shape != query.shape:
+        raise ValueError("sparse attention output shape must match query shape")
+    if output.dtype != query.dtype:
+        raise ValueError("sparse attention output dtype must match query dtype")
+    if output.device != query.device:
+        raise ValueError("sparse attention output device must match query device")
+    if not output.is_contiguous():
+        raise ValueError("sparse attention output must be contiguous")
+
+
 def sparse_flash_attention_out(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -465,6 +476,7 @@ def sparse_flash_attention_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Attend to selected blocks and write the output into ``output``."""
+    _validate_sparse_attention_output(query, output)
     if (query_rope is None) != (key_rope is None):
         raise ValueError("query_rope and key_rope must both be present or absent")
     if (
@@ -534,6 +546,7 @@ def sparse_flash_attention_lse_out(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Run sparse attention directly into a caller-owned output buffer."""
+    _validate_sparse_attention_output(query, output)
     return torch.ops.xllm_ops.sparse_flash_attention_lse_out(
         query,
         key,

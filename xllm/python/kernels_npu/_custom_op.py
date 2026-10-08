@@ -1141,8 +1141,14 @@ def _sparse_flash_attention_lse_out_fake(
         attention_mode,
         return_softmax_lse,
     )
-    if attention_output.shape != query.shape or attention_output.dtype != query.dtype:
-        raise ValueError("attention_output must match query shape and dtype")
+    if attention_output.shape != query.shape:
+        raise ValueError("sparse attention output shape must match query shape")
+    if attention_output.dtype != query.dtype:
+        raise ValueError("sparse attention output dtype must match query dtype")
+    if attention_output.device != query.device:
+        raise ValueError("sparse attention output device must match query device")
+    if not attention_output.is_contiguous():
+        raise ValueError("sparse attention output must be contiguous")
     return attention_output
 
 
