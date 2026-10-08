@@ -233,6 +233,8 @@ torch::Tensor quant_lightning_indexer_out(
       << "sparse_indices_out must be int32";
   torch::Tensor sparse_values_out =
       torch::empty({0}, query.options().dtype(torch::kFloat32));
+  // Match the allocating variant for entries the kernel does not write.
+  sparse_indices_out.zero_();
   run_quant_lightning_indexer(query,
                               key,
                               weights,
