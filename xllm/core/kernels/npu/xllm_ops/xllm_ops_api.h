@@ -28,6 +28,7 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -319,20 +320,21 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     c10::string_view layout_kv,
     bool return_softmax_lse);
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    const c10::optional<at::Tensor>& block_table,
-    const c10::optional<at::Tensor>& actual_seq_lengths_query,
-    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<at::Tensor>& query_rope,
-    const c10::optional<at::Tensor>& key_rope,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_flash_attention_lse(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sparse_indices,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& actual_seq_lengths_query,
+    const std::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const std::optional<torch::Tensor>& query_rope,
+    const std::optional<torch::Tensor>& key_rope,
     double scale_value,
     int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    std::string_view layout_query,
+    std::string_view layout_kv,
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,
@@ -344,15 +346,15 @@ torch::Tensor sparse_flash_attention_lse_out(
     const torch::Tensor& key,
     const torch::Tensor& value,
     const torch::Tensor& sparse_indices,
-    const c10::optional<torch::Tensor>& block_table,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_query,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<torch::Tensor>& query_rope,
-    const c10::optional<torch::Tensor>& key_rope,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& actual_seq_lengths_query,
+    const std::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const std::optional<torch::Tensor>& query_rope,
+    const std::optional<torch::Tensor>& key_rope,
     double scale_value,
     int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    std::string_view layout_query,
+    std::string_view layout_kv,
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,

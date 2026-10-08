@@ -16,11 +16,13 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/library.h>
 
+#include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
-#include "xllm_ops_api.h"
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
 namespace {
@@ -30,24 +32,26 @@ constexpr int64_t kDim1 = 1;
 constexpr int64_t kDim2 = 2;
 constexpr int64_t kDim3 = 3;
 
-void check_sparse_flash_attention_lse_inputs(const at::Tensor& query,
-                                             const at::Tensor& key,
-                                             const at::Tensor& value,
-                                             const at::Tensor& sparse_indices,
-                                             int64_t sparse_block_size,
-                                             const std::string& layout_query,
-                                             const std::string& layout_kv) {
+void check_sparse_flash_attention_lse_inputs(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sparse_indices,
+    int64_t sparse_block_size,
+    const std::string& layout_query,
+    const std::string& layout_kv) {
   TORCH_CHECK(query.numel() > 0, "Tensor query is empty.");
   TORCH_CHECK(key.numel() > 0, "Tensor key is empty.");
   TORCH_CHECK(value.numel() > 0, "Tensor value is empty.");
   TORCH_CHECK(sparse_indices.numel() > 0, "Tensor sparse_indices is empty.");
-  TORCH_CHECK(query.dtype() == at::kHalf || query.dtype() == at::kBFloat16,
-              "query should be FLOAT16 or BFLOAT16.");
+  TORCH_CHECK(
+      query.dtype() == torch::kFloat16 || query.dtype() == torch::kBFloat16,
+      "query should be FLOAT16 or BFLOAT16.");
   TORCH_CHECK(key.dtype() == query.dtype(),
               "key's dtype should be equal to query's dtype.");
   TORCH_CHECK(value.dtype() == query.dtype(),
               "value's dtype should be equal to query's dtype.");
-  TORCH_CHECK(sparse_indices.dtype() == at::kInt,
+  TORCH_CHECK(sparse_indices.dtype() == torch::kInt32,
               "sparse_indices should be INT32.");
   TORCH_CHECK(sparse_block_size > 0,
               "sparse_block_size should be greater than 0, actual ",
@@ -73,9 +77,9 @@ void check_sparse_flash_attention_lse_output(const torch::Tensor& query,
       << layout_query;
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-construct_sparse_flash_attention_lse_outputs(const at::Tensor& query,
-                                             const at::Tensor& key,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+construct_sparse_flash_attention_lse_outputs(const torch::Tensor& query,
+                                             const torch::Tensor& key,
                                              const std::string& layout_query,
                                              const std::string& layout_kv,
                                              bool return_softmax_lse) {
@@ -97,12 +101,12 @@ construct_sparse_flash_attention_lse_outputs(const at::Tensor& query,
                    query.size(kDim3)};
   }
 
-  at::Tensor attention_output =
-      at::empty(output_size, query.options().dtype(query.dtype()));
+  torch::Tensor attention_output =
+      torch::empty(output_size, query.options().dtype(query.dtype()));
   at::SmallVector<int64_t, 8> softmax_size;
   if (return_softmax_lse) {
     if (query.dim() == 3) {
-      const auto kv_head_num =
+      const int64_t kv_head_num =
           layout_kv == "PA_BSND" ? key.size(kDim2) : key.size(kDim1);
       softmax_size = {
           kv_head_num,
@@ -121,27 +125,23 @@ construct_sparse_flash_attention_lse_outputs(const at::Tensor& query,
     softmax_size = {0};
   }
 
-  at::Tensor softmax_max =
-      at::empty(softmax_size, query.options().dtype(at::kFloat));
-  at::Tensor softmax_sum =
-      at::empty(softmax_size, query.options().dtype(at::kFloat));
+  torch::Tensor softmax_max =
+      torch::empty(softmax_size, query.options().dtype(torch::kFloat32));
+  torch::Tensor softmax_sum =
+      torch::empty(softmax_size, query.options().dtype(torch::kFloat32));
   return {attention_output, softmax_max, softmax_sum};
 }
 
-}  // namespace
-
-namespace {
-
 void run_sparse_flash_attention_lse(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    const c10::optional<at::Tensor>& block_table,
-    const c10::optional<at::Tensor>& actual_seq_lengths_query,
-    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<at::Tensor>& query_rope,
-    const c10::optional<at::Tensor>& key_rope,
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sparse_indices,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& actual_seq_lengths_query,
+    const std::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const std::optional<torch::Tensor>& query_rope,
+    const std::optional<torch::Tensor>& key_rope,
     double scale_value,
     int64_t sparse_block_size,
     const std::string& layout_query,
@@ -151,9 +151,9 @@ void run_sparse_flash_attention_lse(
     int64_t next_tokens,
     int64_t attention_mode,
     bool return_softmax_lse,
-    const at::Tensor& attention_output,
-    const at::Tensor& softmax_max,
-    const at::Tensor& softmax_sum) {
+    const torch::Tensor& attention_output,
+    const torch::Tensor& softmax_max,
+    const torch::Tensor& softmax_sum) {
   char* query_layout_ptr = const_cast<char*>(layout_query.c_str());
   char* kv_layout_ptr = const_cast<char*>(layout_kv.c_str());
   EXEC_NPU_CMD(aclnnSparseFlashAttentionLse,
@@ -182,20 +182,21 @@ void run_sparse_flash_attention_lse(
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    const c10::optional<at::Tensor>& block_table,
-    const c10::optional<at::Tensor>& actual_seq_lengths_query,
-    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<at::Tensor>& query_rope,
-    const c10::optional<at::Tensor>& key_rope,
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+sparse_flash_attention_lse(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sparse_indices,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& actual_seq_lengths_query,
+    const std::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const std::optional<torch::Tensor>& query_rope,
+    const std::optional<torch::Tensor>& key_rope,
     double scale_value,
     int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    std::string_view layout_query,
+    std::string_view layout_kv,
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,
@@ -212,9 +213,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sparse_flash_attention_lse(
                                           layout_kv_str);
   auto outputs = construct_sparse_flash_attention_lse_outputs(
       query, key, layout_query_str, layout_kv_str, return_softmax_lse);
-  at::Tensor attention_output = std::get<0>(outputs);
-  at::Tensor softmax_max = std::get<1>(outputs);
-  at::Tensor softmax_sum = std::get<2>(outputs);
+  torch::Tensor attention_output = std::get<0>(outputs);
+  torch::Tensor softmax_max = std::get<1>(outputs);
+  torch::Tensor softmax_sum = std::get<2>(outputs);
   run_sparse_flash_attention_lse(query,
                                  key,
                                  value,
@@ -244,15 +245,15 @@ torch::Tensor sparse_flash_attention_lse_out(
     const torch::Tensor& key,
     const torch::Tensor& value,
     const torch::Tensor& sparse_indices,
-    const c10::optional<torch::Tensor>& block_table,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_query,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_kv,
-    const c10::optional<torch::Tensor>& query_rope,
-    const c10::optional<torch::Tensor>& key_rope,
+    const std::optional<torch::Tensor>& block_table,
+    const std::optional<torch::Tensor>& actual_seq_lengths_query,
+    const std::optional<torch::Tensor>& actual_seq_lengths_kv,
+    const std::optional<torch::Tensor>& query_rope,
+    const std::optional<torch::Tensor>& key_rope,
     double scale_value,
     int64_t sparse_block_size,
-    c10::string_view layout_query,
-    c10::string_view layout_kv,
+    std::string_view layout_query,
+    std::string_view layout_kv,
     int64_t sparse_mode,
     int64_t pre_tokens,
     int64_t next_tokens,
