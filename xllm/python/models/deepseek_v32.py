@@ -526,6 +526,8 @@ class W8A8AttentionLinear(nn.Module):
 
     def forward_out(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         """Run this projection into a caller-owned graph buffer."""
+        if self._dynamic_activation is None:
+            raise RuntimeError("W8A8 attention quantization format must be selected before execution")
         if self._dynamic_activation:
             x_int8, pertoken = kernels.dynamic_quant(x)
         else:

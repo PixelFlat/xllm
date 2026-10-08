@@ -296,6 +296,15 @@ def test_static_attention_projection_writes_to_caller_buffer(
     torch.testing.assert_close(output, expected)
 
 
+def test_attention_projection_out_requires_quantization_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    projection = W8A8AttentionLinear(4, 6, torch.device("cpu"))
+    native_out = MagicMock()
+    monkeypatch.setattr(kernels, "quant_matmul_out", native_out)
+    with pytest.raises(RuntimeError, match="quantization format must be selected"):
+        projection.forward_out(torch.zeros(2, 4), torch.empty(2, 6, dtype=torch.bfloat16))
+    native_out.assert_not_called()
+
+
 @pytest.mark.parametrize("is_graph", (False, True))
 @pytest.mark.parametrize("native_out", (False, True))
 def test_attention_value_projection_reuses_graph_output(

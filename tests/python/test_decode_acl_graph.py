@@ -372,8 +372,11 @@ def test_dspark_graph_validation_preserves_static_inputs(
 
 @pytest.mark.parametrize("has_tasks", [False, True])
 @pytest.mark.parametrize("has_mtp_inputs", [False, True])
-def test_replay_selects_stream_and_preserves_output_ownership(has_tasks: bool, has_mtp_inputs: bool) -> None:
+@pytest.mark.parametrize("mode", ["plain", "mtp_target", "spec_draft"])
+def test_replay_selects_stream_and_preserves_output_ownership(has_tasks: bool, has_mtp_inputs: bool, mode: str) -> None:
     runner = _runner()
+    runner.num_decoding_tokens = 4 if mode == "mtp_target" else 1
+    runner._is_spec_draft = mode == "spec_draft"
     caller = Mock()
     capture = Mock()
     runner._stream = capture
@@ -401,7 +404,7 @@ def test_replay_selects_stream_and_preserves_output_ownership(has_tasks: bool, h
     replay_stream = capture if has_tasks else caller
     stream_context.assert_called_once_with(replay_stream)
     entry.graph.replay.assert_called_once_with()
-    assert (output.data_ptr() != entry.static_output.data_ptr()) is has_mtp_inputs
+    assert (output.data_ptr() != entry.static_output.data_ptr()) is (has_mtp_inputs or mode != "plain")
     if has_tasks:
         update.assert_called_once_with(entry, capture, runner._update_done_event)
         capture.wait_stream.assert_called_once_with(caller)

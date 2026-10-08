@@ -672,7 +672,12 @@ class DecodeAclGraphRunner(AclGraphRunner):
             output = self._slice_output(
                 entry.static_output,
                 batch_size,
-                detach=input_embedding is not None or mtp_topk_indices is not None,
+                detach=(
+                    self.num_decoding_tokens > 1
+                    or self._is_spec_draft
+                    or input_embedding is not None
+                    or mtp_topk_indices is not None
+                ),
             )
 
         if not getattr(entry, "replay_logged", False):
