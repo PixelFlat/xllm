@@ -26,7 +26,7 @@ import torch
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 from xllm.python.model_executor.cp_utils import CpContext, cp_shard_positions, cp_shard_rows
-from xllm.python.model_executor.forward_context import AclGraphExecutionState, ForwardContext, forward_context
+from xllm.python.model_executor.forward_context import ForwardContext, forward_context
 from xllm.python.models import glm5_2
 
 
@@ -377,109 +377,6 @@ def test_indexer_fuses_k_and_weight_projections_after_loading() -> None:
     assert indexer._wk_weights_proj_ready
     assert weights.is_contiguous()
     torch.testing.assert_close(torch.cat((key, weights), dim=-1), expected)
-
-
-def test_graph_qli_head_padding_reuses_layer_buffers() -> None:
-    indexer = _indexer()
-    indexer.layer_id = 3
-    query = torch.ones(2, 1, 2, dtype=torch.int8)
-    query_scale = torch.ones(2, 1, dtype=torch.float16)
-    weights = torch.ones(2, 1, dtype=torch.float32)
-    state = AclGraphExecutionState({})
-    context = ForwardContext(None, torch.device("cpu"), None, [], execution_state=state)
-
-    with forward_context(context):
-        first = indexer._pad_q_heads_to_kernel_gsize(
-            query,
-            query_scale,
-            weights,
-            required_q_heads=2,
-            use_graph_buffers=True,
-        )
-        query.fill_(2)
-        query_scale.fill_(3)
-        weights.fill_(4)
-        second = indexer._pad_q_heads_to_kernel_gsize(
-            query,
-            query_scale,
-            weights,
-            required_q_heads=2,
-            use_graph_buffers=True,
-        )
-
-    assert [tensor.data_ptr() for tensor in first] == [tensor.data_ptr() for tensor in second]
-    torch.testing.assert_close(second[0][:, 0], query[:, 0])
-    torch.testing.assert_close(second[1][:, 0], query_scale[:, 0])
-    torch.testing.assert_close(second[2][:, 0], weights[:, 0].to(second[2].dtype))
-    assert second[2].dtype == weights.dtype
-    assert torch.count_nonzero(second[0][:, 1:]) == 0
-    assert torch.count_nonzero(second[1][:, 1:]) == 0
-    assert torch.count_nonzero(second[2][:, 1:]) == 0
-
-
-def test_indexer_quantized_graph_projection_keeps_weights_view_until_padding() -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=3,
-        q_lora_rank=2,
-        index_n_heads=2,
-        index_head_dim=2,
-        qk_rope_head_dim=1,
-        index_topk=1,
-        indexer_rope_interleave=True,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
-    indexer.wq_b._set_dynamic_activation(False)
-    with torch.no_grad():
-        indexer.wk.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
-        indexer.weights_proj.weight.copy_(torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]))
-    with patch.object(glm5_2.kernels, "prepare_quant_weight", side_effect=lambda weight: weight, create=True):
-        indexer.process_weights_after_loading()
-
-    hidden = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
-    key, weights = indexer._project_index_inputs(hidden, hidden, contiguous_weights=False)
-    assert not weights.is_contiguous()
-    assert key.untyped_storage().data_ptr() == weights.untyped_storage().data_ptr()
-    torch.testing.assert_close(weights, hidden @ indexer.weights_proj.weight.T)
-
-    context = ForwardContext(None, torch.device("cpu"), None, [], execution_state=AclGraphExecutionState({}))
-    with forward_context(context):
-        _, _, padded_weights = indexer._pad_q_heads_to_kernel_gsize(
-            torch.ones(2, 2, 2, dtype=torch.int8),
-            torch.ones(2, 2, dtype=torch.float16),
-            weights,
-            required_q_heads=4,
-            use_graph_buffers=True,
-        )
-    assert padded_weights.is_contiguous()
-    assert padded_weights.dtype == weights.dtype
-    torch.testing.assert_close(padded_weights[:, :2], weights)
-    assert torch.count_nonzero(padded_weights[:, 2:]) == 0
-
-
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16, torch.float32))
-@pytest.mark.parametrize("required_q_heads", (1, 2))
-def test_graph_qli_weights_preserve_scaling_rounding_and_input(dtype: torch.dtype, required_q_heads: int) -> None:
-    indexer = _indexer()
-    indexer.layer_id = 3
-    weights = torch.linspace(-2, 2, 65, dtype=dtype).view(-1, 1)
-    original = weights.clone()
-    query = torch.ones(65, 1, 2, dtype=torch.int8)
-    query_scale = torch.ones(65, 1, dtype=torch.float16)
-    context = ForwardContext(None, torch.device("cpu"), None, [], execution_state=AclGraphExecutionState({}))
-    output_address = None
-    with forward_context(context):
-        for scale in (0.011048543456039806, 0.015625):
-            _, _, padded_weights = indexer._pad_q_heads_to_kernel_gsize(
-                query, query_scale, weights, required_q_heads, use_graph_buffers=True
-            )
-            actual = indexer._scale_quant_indexer_weights(padded_weights, scale, use_graph_buffers=True)
-            expected = (original * scale).to(torch.float16)
-            torch.testing.assert_close(actual[:, :1], expected, rtol=0, atol=0)
-            torch.testing.assert_close(weights, original, rtol=0, atol=0)
-            assert torch.count_nonzero(actual[:, 1:]) == 0
-            if output_address is not None:
-                assert actual.data_ptr() == output_address
-            output_address = actual.data_ptr()
 
 
 def test_indexer_keeps_separate_projections_for_distinct_cache_rows() -> None:

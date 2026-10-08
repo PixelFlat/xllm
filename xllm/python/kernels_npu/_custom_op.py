@@ -904,52 +904,6 @@ def _sparse_attn_sharedkv_metadata_fake(
     return torch.empty((_DSA_METADATA_BUFFER_ELEMENTS,), dtype=torch.int32, device="npu")
 
 
-def _quant_lightning_indexer_out_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
-    query_dequant_scale: torch.Tensor,
-    key_dequant_scale: torch.Tensor,
-    query_quant_mode: int,
-    key_quant_mode: int,
-    actual_seq_lengths_query: torch.Tensor | None,
-    actual_seq_lengths_key: torch.Tensor | None,
-    block_table: torch.Tensor | None,
-    metadata: torch.Tensor | None,
-    layout_query: str,
-    layout_key: str,
-    sparse_count: int,
-    sparse_mode: int,
-    pre_tokens: int,
-    next_tokens: int,
-    cmp_ratio: int,
-    return_value: bool,
-    sparse_indices_out: torch.Tensor,
-) -> torch.Tensor:
-    del (
-        query,
-        key,
-        weights,
-        query_dequant_scale,
-        key_dequant_scale,
-        query_quant_mode,
-        key_quant_mode,
-        actual_seq_lengths_query,
-        actual_seq_lengths_key,
-        block_table,
-        metadata,
-        layout_query,
-        layout_key,
-        sparse_count,
-        sparse_mode,
-        pre_tokens,
-        next_tokens,
-        cmp_ratio,
-        return_value,
-    )
-    return sparse_indices_out
-
-
 def _quant_lightning_indexer_fake(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1255,10 +1209,6 @@ register_fake(
 register_fake(
     "xllm_ops::quant_lightning_indexer",
     _quant_lightning_indexer_fake,
-)
-register_fake(
-    "xllm_ops::quant_lightning_indexer_out",
-    _quant_lightning_indexer_out_fake,
 )
 register_fake(
     "xllm_ops::quant_lightning_indexer_metadata",

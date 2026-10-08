@@ -863,18 +863,10 @@ class Glm52Indexer(DeepseekV3Indexer):
         )
         self._wk_weights_proj_ready = False
 
-    def _project_k_and_weights(
-        self,
-        hidden: torch.Tensor,
-        *,
-        contiguous_weights: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(self, "_wk_weights_proj_ready", False):
             projected = F.linear(hidden, self._wk_weights_proj_weight)
-            weights = projected[..., self.head_dim :]
-            if contiguous_weights:
-                weights = weights.contiguous()
-            return projected[..., : self.head_dim], weights
+            return projected[..., : self.head_dim], projected[..., self.head_dim :].contiguous()
         return self.wk(hidden), self.weights_proj(hidden)
 
     def _project_key(self, hidden: torch.Tensor) -> torch.Tensor:

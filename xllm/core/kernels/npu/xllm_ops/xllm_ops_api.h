@@ -219,28 +219,6 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t cmp_ratio,
     bool return_value);
 
-torch::Tensor quant_lightning_indexer_out(
-    const torch::Tensor& query,
-    const torch::Tensor& key,
-    const torch::Tensor& weights,
-    const torch::Tensor& query_dequant_scale,
-    const torch::Tensor& key_dequant_scale,
-    int64_t query_quant_mode,
-    int64_t key_quant_mode,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_query,
-    const c10::optional<torch::Tensor>& actual_seq_lengths_key,
-    const c10::optional<torch::Tensor>& block_table,
-    const c10::optional<torch::Tensor>& metadata,
-    c10::string_view layout_query,
-    c10::string_view layout_key,
-    int64_t sparse_count,
-    int64_t sparse_mode,
-    int64_t pre_tokens,
-    int64_t next_tokens,
-    int64_t cmp_ratio,
-    bool return_value,
-    torch::Tensor& sparse_indices_out);
-
 torch::Tensor lightning_indexer(
     const torch::Tensor& query,
     const torch::Tensor& key,

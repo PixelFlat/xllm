@@ -328,50 +328,6 @@ def quant_lightning_indexer(
     return indices
 
 
-def supports_quant_lightning_indexer_out() -> bool:
-    """Return whether the native indexer can write indices into a caller buffer."""
-    return hasattr(torch.ops.xllm_ops, "quant_lightning_indexer_out")
-
-
-def quant_lightning_indexer_out(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
-    query_dequant_scale: torch.Tensor,
-    key_dequant_scale: torch.Tensor,
-    metadata: torch.Tensor,
-    query_seq_lengths: torch.Tensor | None,
-    key_seq_lengths: torch.Tensor | None,
-    block_table: torch.Tensor | None,
-    selected_count: int,
-    indices_out: torch.Tensor,
-    cmp_ratio: int = 1,
-) -> torch.Tensor:
-    """Run INT8 LightningIndexer and write indices into ``indices_out``."""
-    return torch.ops.xllm_ops.quant_lightning_indexer_out(
-        query,
-        key,
-        weights,
-        query_dequant_scale,
-        key_dequant_scale,
-        0,
-        0,
-        query_seq_lengths,
-        key_seq_lengths,
-        block_table,
-        metadata,
-        "TND",
-        "PA_BSND",
-        selected_count,
-        3,
-        9223372036854775807,
-        9223372036854775807,
-        cmp_ratio,
-        False,
-        indices_out,
-    )
-
-
 def quant_lightning_indexer_metadata(
     num_heads_q: int,
     num_heads_k: int,

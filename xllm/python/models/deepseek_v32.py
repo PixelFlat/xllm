@@ -1321,9 +1321,6 @@ class DeepseekV3Indexer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.indexer_rope_interleave = self._uses_interleaved_rope(cfg)
-        self._use_quant_indexer_out = (
-            device.type in ("npu", "privateuseone") and kernels.supports_quant_lightning_indexer_out()
-        )
         self._init_streams(cfg, device)
         self.n_head = cfg.index_n_heads
         self.head_dim = cfg.index_head_dim
@@ -1354,12 +1351,7 @@ class DeepseekV3Indexer(nn.Module):
             device=device,
         )
 
-    def _project_k_and_weights(
-        self,
-        hidden: torch.Tensor,
-        *,
-        contiguous_weights: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.wk_weights_proj(hidden).split([self.head_dim, self.n_head], dim=-1)
 
     def _project_key(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -1372,11 +1364,9 @@ class DeepseekV3Indexer(nn.Module):
         self,
         hidden: torch.Tensor,
         cache_hidden: torch.Tensor,
-        *,
-        contiguous_weights: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cache_hidden is hidden:
-            return self._project_k_and_weights(hidden, contiguous_weights=contiguous_weights)
+            return self._project_k_and_weights(hidden)
         return self._project_key(cache_hidden), self._project_weights(hidden)
 
     def _pad_q_heads_to_kernel_gsize(
@@ -1385,7 +1375,6 @@ class DeepseekV3Indexer(nn.Module):
         q_scale: torch.Tensor,
         weights: torch.Tensor,
         required_q_heads: int,
-        use_graph_buffers: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # aclnnQuantLightningIndexer tiling hard-requires n_heads_q/n_heads_k == 64
         # (G_SIZE_LIMIT in quant_lightning_indexer_tiling.h; xllm_ops kernel hard-codes
@@ -1396,67 +1385,9 @@ class DeepseekV3Indexer(nn.Module):
         # zero terms cannot contribute even if the kernel processed them differently.
         pad_heads = required_q_heads - self.n_head
         if pad_heads == 0:
-            if not use_graph_buffers:
-                return q, q_scale, weights
-            weights_shape = (weights.size(0), required_q_heads)
-            weights_padded = get_execution_buffer(
-                (
-                    "QLI_WEIGHTS",
-                    id(self),
-                    self.layer_id,
-                    weights.dtype,
-                    weights.device,
-                    *weights_shape,
-                ),
-                lambda: weights.new_empty(weights_shape),
-            )
-            weights_padded.copy_(weights)
-            return q, q_scale, weights_padded
+            return q, q_scale, weights
         if pad_heads < 0:
             raise RuntimeError(f"Indexer expected index_n_heads<={required_q_heads}, got {self.n_head}")
-        if use_graph_buffers:
-            q_shape = (q.size(0), required_q_heads, q.size(2))
-            q_padded = get_execution_buffer(
-                (
-                    "QLI_QUERY",
-                    id(self),
-                    self.layer_id,
-                    q.dtype,
-                    q.device,
-                    *q_shape,
-                ),
-                lambda: q.new_zeros(q_shape),
-            )
-            q_padded.narrow(1, 0, self.n_head).copy_(q)
-
-            q_scale_shape = (q_scale.size(0), required_q_heads)
-            q_scale_padded = get_execution_buffer(
-                (
-                    "QLI_QUERY_SCALE",
-                    id(self),
-                    self.layer_id,
-                    q_scale.dtype,
-                    q_scale.device,
-                    *q_scale_shape,
-                ),
-                lambda: q_scale.new_zeros(q_scale_shape),
-            )
-            q_scale_padded.narrow(1, 0, self.n_head).copy_(q_scale)
-
-            weights_shape = (weights.size(0), required_q_heads)
-            weights_padded = get_execution_buffer(
-                (
-                    "QLI_WEIGHTS",
-                    id(self),
-                    self.layer_id,
-                    weights.dtype,
-                    weights.device,
-                    *weights_shape,
-                ),
-                lambda: weights.new_zeros(weights_shape),
-            )
-            weights_padded.narrow(1, 0, self.n_head).copy_(weights)
-            return q_padded, q_scale_padded, weights_padded
         q = torch.cat(
             [q, torch.zeros((q.size(0), pad_heads, q.size(2)), dtype=q.dtype, device=q.device)],
             dim=1,
@@ -1470,25 +1401,6 @@ class DeepseekV3Indexer(nn.Module):
             dim=1,
         )
         return q, q_scale, weights
-
-    def _scale_quant_indexer_weights(
-        self,
-        weights: torch.Tensor,
-        weight_scale: float,
-        *,
-        use_graph_buffers: bool,
-    ) -> torch.Tensor:
-        if not use_graph_buffers:
-            return (weights * weight_scale).to(torch.float16)
-        # Scale the owned padding buffer in the projection dtype before casting,
-        # preserving the eager path's rounding order.
-        weights.mul_(weight_scale)
-        kernel_weights = get_execution_buffer(
-            ("QLI_KERNEL_WEIGHTS", id(self), self.layer_id, weights.device, torch.float16, *weights.shape),
-            lambda: torch.empty_like(weights, dtype=torch.float16),
-        )
-        kernel_weights.copy_(weights)
-        return kernel_weights
 
     def _apply_interleaved_rope(
         self,
@@ -1576,16 +1488,7 @@ class DeepseekV3Indexer(nn.Module):
             if self._weights_stream is not None:
                 self._weights_stream.wait_for_current()
             with self._weights_stream.activate() if self._weights_stream is not None else nullcontext():
-                k, weights = self._project_index_inputs(
-                    hidden,
-                    cache_hidden,
-                    contiguous_weights=not (
-                        get_forward_context().execution_state is not None
-                        and self.indexer_rope_interleave
-                        and ctx.index_cache.dtype == torch.int8
-                        and ctx.index_cache_scale is not None
-                    ),
-                )
+                k, weights = self._project_index_inputs(hidden, cache_hidden)
             if self._q_stream is not None:
                 self._q_stream.wait_for_current()
                 with self._q_stream.activate():
@@ -1609,7 +1512,6 @@ class DeepseekV3Indexer(nn.Module):
         index_cache = ctx.index_cache
         index_cache_scale = ctx.index_cache_scale
         use_quant_indexer = index_cache.dtype == torch.int8 and index_cache_scale is not None
-        graph_state = get_forward_context().execution_state
         index_cache, index_cache_scale, block_table = ctx.materialize_index_cache()
         if ctx.cp_context is not None and ctx.cp_context.query_index.numel() == 0:
             # Other ranks still need this rank's keys/cache materialization.
@@ -1620,8 +1522,6 @@ class DeepseekV3Indexer(nn.Module):
                 dtype=torch.int32,
                 device=hidden.device,
             )
-        if not use_quant_indexer and not weights.is_contiguous():
-            weights = weights.contiguous()
 
         if self._q_stream is not None:
             self._q_stream.join()
@@ -1640,86 +1540,28 @@ class DeepseekV3Indexer(nn.Module):
             cmp_ratio = 1
 
             required_q_heads = index_cache.size(2) * 64
-            use_graph_buffers = graph_state is not None and q.device.type in ("npu", "privateuseone")
-            q, q_scale, weights_padded = self._pad_q_heads_to_kernel_gsize(
-                q,
-                q_scale,
-                weights,
-                required_q_heads,
-                use_graph_buffers=use_graph_buffers,
-            )
-            kernel_weights = self._scale_quant_indexer_weights(
-                weights_padded, weight_scale, use_graph_buffers=use_graph_buffers
-            )
+            q, q_scale, weights_padded = self._pad_q_heads_to_kernel_gsize(q, q_scale, weights, required_q_heads)
 
             qli_metadata = ctx.get_quant_indexer_metadata(required_q_heads, self.head_dim, self.topk, cmp_ratio)
-            quant_topk_buffer = None
-            if (
-                graph_state is not None
-                and ctx.cp_context is None
-                and q.device.type in ("npu", "privateuseone")
-                and isinstance(actual_seq_q, torch.Tensor)
-                and isinstance(actual_seq_kv, torch.Tensor)
-                and self._use_quant_indexer_out
-            ):
-                quant_topk_shape = (q.shape[0], index_cache.size(2), self.topk)
-                quant_topk_buffer = get_execution_buffer(
-                    (
-                        "QLI_TOPK",
-                        id(self),
-                        self.layer_id,
-                        torch.int32,
-                        q.device,
-                        *quant_topk_shape,
-                    ),
-                    lambda: torch.empty(quant_topk_shape, dtype=torch.int32, device=q.device),
-                )
-                topk = kernels.quant_lightning_indexer_out(
-                    q,
-                    index_cache,
-                    kernel_weights,
-                    q_scale,
-                    index_cache_scale,
-                    qli_metadata,
-                    actual_seq_q,
-                    actual_seq_kv,
-                    block_table,
-                    self.topk,
-                    quant_topk_buffer,
-                    cmp_ratio,
-                )
-            else:
-                topk = kernels.quant_lightning_indexer(
-                    q,
-                    index_cache,
-                    kernel_weights,
-                    q_scale,
-                    index_cache_scale,
-                    qli_metadata,
-                    actual_seq_q,
-                    actual_seq_kv,
-                    block_table,
-                    self.topk,
-                    cmp_ratio,
-                )
+            topk = kernels.quant_lightning_indexer(
+                q,
+                index_cache,
+                (weights_padded * weight_scale).to(torch.float16),
+                q_scale,
+                index_cache_scale,
+                qli_metadata,
+                actual_seq_q,
+                actual_seq_kv,
+                block_table,
+                self.topk,
+                cmp_ratio,
+            )
         else:
             topk = self._select_unquantized(q, index_cache, weights, ctx, block_table)
         if ctx.cp_context is not None:
             local_topk = topk.new_full((ctx.cp_context.total_local, *topk.shape[1:]), -1)
             local_topk.index_copy_(0, ctx.cp_context.query_index, topk)
             topk = local_topk
-        if graph_state is not None and (use_quant_indexer or ctx.cp_context is not None):
-            # The QLI result feeds every later MLA layer but is not part of the
-            # model return value for the target graph. Keep one stable result
-            # per graph entry so a concurrent capture/replay cannot recycle a
-            # temporary custom-op allocation used by another entry.
-            topk_buffer = get_execution_buffer(
-                ("QLI_TOPK", id(self), self.layer_id, topk.dtype, topk.device) + tuple(topk.shape),
-                lambda: torch.empty_like(topk),
-            )
-            if topk.data_ptr() != topk_buffer.data_ptr():
-                topk_buffer.copy_(topk)
-            topk = topk_buffer
         return topk
 
     def _select_unquantized(

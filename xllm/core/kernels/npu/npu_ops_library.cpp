@@ -719,15 +719,6 @@ TORCH_LIBRARY(xllm_ops, m) {
       "sparse_count, int sparse_mode, int pre_tokens, int next_tokens, int "
       "cmp_ratio, bool return_value) -> (Tensor, Tensor)");
   m.def(
-      "quant_lightning_indexer_out(Tensor query, Tensor key, Tensor weights, "
-      "Tensor query_dequant_scale, Tensor key_dequant_scale, int "
-      "query_quant_mode, int key_quant_mode, Tensor? "
-      "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, Tensor? "
-      "block_table, Tensor? metadata, str layout_query, str layout_key, int "
-      "sparse_count, int sparse_mode, int pre_tokens, int next_tokens, int "
-      "cmp_ratio, bool return_value, Tensor(a!) sparse_indices_out) -> "
-      "Tensor(a!)");
-  m.def(
       "quant_lightning_indexer_metadata(int num_heads_q, int num_heads_k, "
       "int head_dim, int query_quant_mode, int key_quant_mode, Tensor? "
       "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, int "
@@ -894,8 +885,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("dynamic_quant", TORCH_FN(xllm::kernel::npu::dynamic_quant));
   m.impl("quant_lightning_indexer",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer));
-  m.impl("quant_lightning_indexer_out",
-         TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_out));
   m.impl("quant_lightning_indexer_metadata",
          TORCH_FN(xllm::kernel::npu::quant_lightning_indexer_metadata));
   m.impl("lightning_indexer", TORCH_FN(xllm::kernel::npu::lightning_indexer));
