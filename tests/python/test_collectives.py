@@ -139,7 +139,16 @@ def _run_glm_ep1_tp_collective(global_rank: int, rendezvous_path: str) -> None:
         moe = SimpleNamespace(
             ep_size=1,
             moe_tp_size=world_size,
-            cfg=SimpleNamespace(tp_size=2),
+            cfg=SimpleNamespace(
+                ep_size=1,
+                tp_size=2,
+                tp_rank=tp_rank,
+                moe_tp_size=world_size,
+                moe_tp_rank=global_rank,
+                dp_size=1,
+                cp_size=2,
+                enable_attn_dp_weight_sharding=False,
+            ),
         )
 
         # This numerical fixture deliberately uses CPU/Gloo even on an NPU
