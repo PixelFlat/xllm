@@ -431,7 +431,12 @@ def test_glm_moe_finalize_orders_stream_dependencies(gate_overlap: bool) -> None
     moe.ep_size = 1
     moe.moe_tp_size = 1
     moe.cfg = SimpleNamespace(
+        ep_size=1,
         tp_size=1,
+        tp_rank=0,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        dp_size=1,
         cp_size=1,
         enable_attn_dp_weight_sharding=False,
         norm_topk_prob=True,
@@ -545,7 +550,7 @@ def test_glm_ep1_moe_finalize_combines_permuted_routing_before_tp_reduce(
         moe_tp_size=moe.moe_tp_size,
         moe_tp_rank=0,
         dp_size=dp_size,
-        cp_size=1,
+        cp_size=cp_size,
         enable_attn_dp_weight_sharding=False,
     )
     moe._enable_moe_finalize_routing = True

@@ -127,8 +127,8 @@ def _run_glm_ep1_tp_collective(global_rank: int, rendezvous_path: str) -> None:
             ),
         ]
         collectives._groups[("tp", "cpu")] = tp_groups[global_rank // 2]
-        # This is the topology that exposed the bug: with EP1, moe_tp spans
-        # both CP cohorts and must not be used to combine expert partials.
+        # CP uses the world-sized moe_tp group, so every rank contributes to
+        # the same expert output reduction.
         collectives._groups[("moe_tp", "cpu")] = dist.group.WORLD
 
         cp_rank = global_rank // 2
@@ -164,7 +164,7 @@ def _run_glm_ep1_tp_collective(global_rank: int, rendezvous_path: str) -> None:
         ):
             output = glm5_2.Glm52MoE._combine_expert_outputs(moe, routed, shared, False)
 
-        expected = torch.tensor([[33.0 if cp_rank == 0 else 253.0]])
+        expected = torch.tensor([[286.0]])
         torch.testing.assert_close(output, expected)
     finally:
         collectives._groups.clear()

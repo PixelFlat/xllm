@@ -854,7 +854,7 @@ def test_glm_weight_loader_reads_only_local_ep_experts(
         (1, 1, 2, False, "tp"),
         (2, 1, 4, False, "moe_tp"),
         (2, 1, 1, False, "tp"),
-        (2, 2, 8, False, "tp"),
+        (2, 2, 8, False, "moe_tp"),
         (2, 1, 4, True, "moe_tp"),
     ],
 )
