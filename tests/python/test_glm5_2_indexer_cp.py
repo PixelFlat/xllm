@@ -378,6 +378,10 @@ def test_indexer_fuses_k_and_weight_projections_after_loading() -> None:
     assert weights.is_contiguous()
     torch.testing.assert_close(torch.cat((key, weights), dim=-1), expected)
 
+    key_view, weights_view = indexer._project_index_inputs(hidden, hidden, contiguous_weights=False)
+    assert not weights_view.is_contiguous()
+    torch.testing.assert_close(torch.cat((key_view, weights_view), dim=-1), expected)
+
 
 def test_indexer_keeps_separate_projections_for_distinct_cache_rows() -> None:
     cfg = glm5_2.Glm52Config(
