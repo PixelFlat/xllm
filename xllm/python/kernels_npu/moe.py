@@ -124,13 +124,22 @@ def _graph_gmm2_output(
     weight: torch.Tensor,
 ) -> torch.Tensor | None:
     """Allocate the routed down projection output for this forward."""
-    from xllm.python.model_executor.forward_context import get_forward_context
+    from xllm.python.model_executor.forward_context import get_execution_buffer, get_forward_context
 
     if get_forward_context().execution_state is None:
         return None
 
     output_shape = (act_i8.shape[0], weight.shape[-1])
-    return torch.empty(output_shape, dtype=torch.bfloat16, device=act_i8.device)
+    return get_execution_buffer(
+        (
+            "MOE_GMM2_OUTPUT",
+            id(weight),
+            str(act_i8.device),
+            torch.bfloat16,
+            *output_shape,
+        ),
+        lambda: torch.empty(output_shape, dtype=torch.bfloat16, device=act_i8.device),
+    )
 
 
 def _grouped_matmul_gmm2(

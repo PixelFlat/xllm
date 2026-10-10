@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from xllm.python import distributed, kernels
+from xllm.python.kernels_npu.moe import _graph_gmm2_output
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     AclGraphExecutionState,
     ForwardContext,
@@ -351,3 +352,50 @@ def test_attention_value_projection_reuses_graph_output(
         assert len([key for key in state.persistent_buffers if key[0] == "MLA_W_UV_OUTPUT"]) == 2
     elif state is not None:
         assert not [key for key in state.persistent_buffers if key[0] == "MLA_W_UV_OUTPUT"]
+
+
+def test_shared_expert_reuses_graph_output() -> None:
+    moe = DeepseekV3MoE(_config(), 2, torch.bfloat16, torch.device("cpu"))
+    moe._fuse_shared_expert = True
+    observed: list[torch.Tensor | None] = []
+
+    def shared_expert(hidden: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
+        observed.append(output)
+        assert output is not None
+        output.zero_()
+        return output
+
+    moe.shared_experts.forward_dequant_swiglu_quant = shared_expert
+    state = AclGraphExecutionState(persistent_buffers={})
+    context = ForwardContext(MagicMock(), torch.device("cpu"), MagicMock(), [], execution_state=state)
+
+    with forward_context(context):
+        first = moe._run_shared_experts(torch.zeros(2, moe.hidden))
+        second = moe._run_shared_experts(torch.zeros(2, moe.hidden))
+        third = moe._run_shared_experts(torch.zeros(4, moe.hidden))
+
+    assert observed[0] is not None
+    assert observed[1] is not None
+    assert observed[2] is not None
+    assert first.data_ptr() == observed[0].data_ptr()
+    assert second.data_ptr() == observed[1].data_ptr() == first.data_ptr()
+    assert third.data_ptr() == observed[2].data_ptr()
+    assert third.data_ptr() != first.data_ptr()
+
+
+def test_gmm2_reuses_graph_output() -> None:
+    state = AclGraphExecutionState(persistent_buffers={})
+    context = ForwardContext(MagicMock(), torch.device("cpu"), MagicMock(), [], execution_state=state)
+    act_i8 = torch.empty(2, 8, dtype=torch.int8)
+    weight = torch.empty(16, 8, dtype=torch.int8)
+
+    with forward_context(context):
+        first = _graph_gmm2_output(act_i8, weight)
+        second = _graph_gmm2_output(act_i8, weight)
+        resized = _graph_gmm2_output(torch.empty(4, 8, dtype=torch.int8), weight)
+
+    assert first is not None
+    assert second is not None
+    assert resized is not None
+    assert second.data_ptr() == first.data_ptr()
+    assert resized.data_ptr() != first.data_ptr()
