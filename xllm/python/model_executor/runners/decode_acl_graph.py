@@ -1046,7 +1046,16 @@ class DecodeAclGraphRunner(AclGraphRunner):
             kv_seq_lens,
             None if is_expanded else metadata.kv_cu_seq_lens,
         )
-        graph_positions = positions.to(torch.int32).contiguous()
+        # ``update_decode_graph_metadata`` writes into the persistent int32
+        # destination.  Keep a same-device source view here so every replay
+        # does not launch a separate cast/contiguous conversion before the
+        # metadata update.  A device transfer is still required for callers
+        # that provide host-side positions.
+        graph_positions = (
+            positions
+            if positions.device == entry.static_positions.device
+            else positions.to(device=entry.static_positions.device)
+        )
         kernels.update_decode_graph_metadata(
             input_ids,
             graph_positions,
