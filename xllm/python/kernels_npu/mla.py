@@ -24,7 +24,11 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context_or_none,
 )
 
-from .linear import atb_matmul_ein_sum
+from .linear import (
+    atb_matmul_ein_sum,
+    atb_matmul_ein_sum_out,
+    supports_atb_matmul_ein_sum_out,
+)
 from .normalization import rms_norm, rms_norm_dynamic_quant
 from .quantization import dynamic_quant, quant_matmul, quant_matmul_out, quantize_per_tensor
 
@@ -39,6 +43,31 @@ _KV_RMSNORM_ROPE_CACHE = getattr(
     "npu_kv_rmsnorm_rope_cache",
     None,
 )
+
+
+def _get_graph_q_latent_output(
+    w_uk: torch.Tensor,
+    num_tokens: int,
+    num_heads: int,
+) -> torch.Tensor | None:
+    """Return the graph-owned Q latent output when the native out op exists."""
+    if not supports_atb_matmul_ein_sum_out():
+        return None
+    context = get_forward_context_or_none()
+    if context is None or context.execution_state is None:
+        return None
+    output_shape = (num_tokens, num_heads, w_uk.shape[-1])
+    return get_execution_buffer(
+        (
+            "MLA_Q_LATENT_OUTPUT",
+            w_uk.data_ptr(),
+            tuple(w_uk.shape),
+            w_uk.dtype,
+            str(w_uk.device),
+            output_shape,
+        ),
+        lambda: torch.empty(output_shape, dtype=w_uk.dtype, device=w_uk.device),
+    )
 
 
 def has_mla_preprocess_v2() -> bool:
@@ -349,8 +378,13 @@ def deepseek_mla_preprocess_decode(
         qk_nope_head_dim + qk_rope_head_dim,
     )
     q_nope, q_rope = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-    q_latent = atb_matmul_ein_sum(q_nope, w_uk)
     num_tokens = hidden.shape[0]
+    q_latent_output = _get_graph_q_latent_output(w_uk, num_tokens, num_heads)
+    q_latent = (
+        atb_matmul_ein_sum_out(q_nope, w_uk, q_latent_output)
+        if q_latent_output is not None
+        else atb_matmul_ein_sum(q_nope, w_uk)
+    )
     q_pe = torch_npu.npu_interleave_rope(
         q_rope.view(num_tokens, num_heads, 1, qk_rope_head_dim),
         rope_cos,
@@ -510,7 +544,12 @@ def deepseek_mla_preprocess_decode_dynamic(
         qk_nope_head_dim + qk_rope_head_dim,
     )
     q_nope, q_rope = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-    q_latent = atb_matmul_ein_sum(q_nope, w_uk)
+    q_latent_output = _get_graph_q_latent_output(w_uk, hidden.shape[0], num_heads)
+    q_latent = (
+        atb_matmul_ein_sum_out(q_nope, w_uk, q_latent_output)
+        if q_latent_output is not None
+        else atb_matmul_ein_sum(q_nope, w_uk)
+    )
     num_tokens = hidden.shape[0]
     q_pe = torch_npu.npu_interleave_rope(
         q_rope.view(num_tokens, num_heads, 1, qk_rope_head_dim),
