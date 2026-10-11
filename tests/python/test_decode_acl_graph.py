@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
@@ -247,22 +248,27 @@ def test_dspark_failed_graph_preparation_is_not_cached(failure_stage: str) -> No
     assert graph_key not in runner._graphs
 
 
-def test_dspark_graph_replay_refreshes_prepared_lengths() -> None:
+def test_dspark_graph_replay_preserves_host_capacity_and_updates_device_lengths() -> None:
     runner = _block_draft_runner()
     input_ids = torch.arange(2, dtype=torch.int32)
     positions = input_ids.clone()
     first_metadata = _block_draft_metadata(torch.tensor([[10, 11, 12]], dtype=torch.int32))
     entry = runner._allocate_entry(input_ids, positions, first_metadata)
-
-    second_metadata = _block_draft_metadata(torch.tensor([[20]], dtype=torch.int32))
-    second_metadata.kv_seq_lens.fill_(4)
-    second_metadata.kv_seq_lens_host_values = [4]
-    runner._fill_entry(entry, input_ids, positions, second_metadata)
-
     prepared = entry.static_metadata.prepared_attention_state
-    assert prepared.actual_seq_q == [2]
-    assert prepared.actual_seq_kv == [4]
-    assert prepared.query_ends == [2]
+    host_bounds = prepared.actual_seq_kv
+    device_lengths = entry.static_metadata.kv_seq_lens
+    assert host_bounds == [16]
+
+    for block_cols in (1, 4, 2):
+        metadata = _block_draft_metadata(torch.full((1, block_cols), 20, dtype=torch.int32))
+        runner._fill_entry(entry, input_ids, positions, metadata)
+        assert prepared.actual_seq_q == [2]
+        assert prepared.actual_seq_kv is host_bounds
+        assert host_bounds == [16]
+        assert entry.static_metadata.kv_seq_lens is device_lengths
+        assert device_lengths.tolist() == [block_cols * 4]
+        assert entry.static_metadata.kv_seq_lens_host_values == [block_cols * 4]
+        assert prepared.query_ends == [2]
 
 
 def test_dspark_graph_rejects_missing_host_kv_lengths() -> None:
@@ -978,3 +984,53 @@ def test_decode_rejects_mismatched_linear_state_indices_without_cache_probe() ->
 
     with patch.object(runner, "_has_compatible_index_history", side_effect=AssertionError):
         assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
+
+
+@pytest.mark.parametrize("speculative_tokens", [3, 7], ids=["mtp", "dspark"])
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_mla_speculative_decode_ignores_unused_linear_state_rows(speculative_tokens: int, dp_size: int) -> None:
+    rows = speculative_tokens + 1
+    backend = SimpleNamespace(page_size=4, is_mla=True, graph_index_history_max_kv=32)
+    runner = DecodeAclGraphRunner(
+        nn.Identity(),
+        backend,
+        torch.device("cpu"),
+        max_batch=dp_size * rows,
+        max_model_len=32,
+        dp_size=dp_size,
+        num_decoding_tokens=rows,
+        decode_batch_size_limit=1,
+    )
+    runner.bind_layer_caches([LayerCache(torch.zeros(1), torch.zeros(1), index=torch.zeros(1))])
+    metadata = _metadata(torch.arange(rows, dtype=torch.int32))
+    metadata.linear_state_indices = torch.tensor([-1], dtype=torch.int32)
+    metadata.has_initial_state = torch.zeros(1, dtype=torch.bool)
+    metadata.dp_global_sequence_nums = (1,) * dp_size
+    metadata.dp_execution_token_counts = (rows,) * dp_size
+    metadata.dp_global_kv_max_seq_lens = (rows,) * dp_size
+    metadata.dp_is_decode = (1,) * dp_size
+
+    assert runner.can_execute(torch.arange(rows, dtype=torch.int32), metadata)
+
+
+@pytest.mark.parametrize("cache_slot", ["conv", "ssm"])
+@pytest.mark.parametrize("invalid_field", ["has_initial_state", "linear_state_indices"])
+def test_hybrid_mla_rejects_mismatched_recurrent_metadata(cache_slot: str, invalid_field: str) -> None:
+    runner = _runner()
+    runner.attention_backend.is_mla = True
+    runner.bind_layer_caches([LayerCache(torch.zeros(1), torch.zeros(1), **{cache_slot: torch.zeros(1)})])
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    setattr(metadata, invalid_field, torch.zeros(1, dtype=torch.int32))
+
+    assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
+
+
+def test_mla_admission_retains_index_history_capacity_check() -> None:
+    runner = _runner()
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.graph_index_history_max_kv = 4
+    runner.bind_layer_caches([LayerCache(torch.zeros(1), torch.zeros(1), index=torch.zeros(1))])
+    metadata = _metadata(torch.arange(4, dtype=torch.int32))
+    metadata.linear_state_indices = torch.tensor([-1], dtype=torch.int32)
+
+    assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)

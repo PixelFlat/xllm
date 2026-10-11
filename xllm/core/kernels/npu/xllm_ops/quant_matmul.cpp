@@ -64,16 +64,26 @@ void run_quant_matmul(const torch::Tensor& x1,
                       const torch::Tensor& pertoken_scale,
                       const torch::Tensor& bias,
                       torch::Tensor& output) {
-  const bool nz_decode_available =
+  // Match the vendor kernel's tiling contract before selecting its fixed
+  // Qwen projection specializations. Other NZ projections use QuantMatmulV4.
+  const bool supported_projection =
+      x1.dim() == 2 && x2.dim() == 2 && x1.size(1) == x2.size(0) &&
+      ((x1.size(1) == 5120 && (x2.size(1) == 6400 || x2.size(1) == 1280)) ||
+       (x1.size(1) == 3200 && x2.size(1) == 5120));
+  const bool use_nz_decode =
+      supported_projection && !transpose2 && x1.size(0) > 0 &&
+      x1.size(0) <= 16 && x1.scalar_type() == torch::kInt8 &&
+      x2.scalar_type() == torch::kInt8 && !offset.defined() &&
+      !pertoken_scale.defined() && scale.defined() && scale.dim() == 1 &&
+      scale.size(0) == x2.size(1) && scale.scalar_type() == torch::kFloat32 &&
+      bias.defined() && bias.dim() == 1 && bias.size(0) == x2.size(1) &&
+      bias.scalar_type() == torch::kInt32 &&
+      output.scalar_type() == torch::kBFloat16 &&
+      get_tensor_npu_format(x2) == ACL_FORMAT_FRACTAL_NZ &&
       aclnn::detail::get_op_api_func_addr(
           "aclnnQuantMatmulNzDecodeGetWorkspaceSize") != nullptr &&
       aclnn::detail::get_op_api_func_addr("aclnnQuantMatmulNzDecode") !=
           nullptr;
-  const bool use_nz_decode =
-      nz_decode_available && !transpose2 && x1.dim() == 2 && x1.size(0) > 0 &&
-      x1.size(0) <= 16 && x2.dim() == 2 && bias.defined() &&
-      output.scalar_type() == torch::kBFloat16 &&
-      get_tensor_npu_format(x2) == ACL_FORMAT_FRACTAL_NZ;
   if (use_nz_decode) {
     EXEC_NPU_CMD(aclnnQuantMatmulNzDecode, x1, x2, scale, bias, output);
     return;

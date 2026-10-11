@@ -558,6 +558,80 @@ def test_block_attention_reads_accepted_device_lengths(width: int, window: int |
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("window", [None, 64])
+@torch.inference_mode()
+def test_block_graph_replay_matches_eager_after_kv_length_changes(window: int | None) -> None:
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    from xllm.python.model_executor.runners.block_draft_acl_graph import BlockDraftAclGraphRunner
+
+    device = torch.device("npu:0")
+    width, heads, head_dim = 7, 4, 192
+    page_size, capacity = 128, 4096
+    backend = NpuPagedAttentionBackend(heads, heads, head_dim, head_dim**-0.5, 0, False, device, torch.bfloat16)
+    cache = torch.zeros(33, page_size, heads, head_dim, device=device, dtype=torch.bfloat16)
+    token_values = torch.arange(33 * page_size, device=device, dtype=torch.float32) / 2048
+    values = token_values.view(33, page_size, 1, 1).expand_as(cache).contiguous().to(cache.dtype)
+    backend.bind_kv_caches([LayerCache(key=cache, value=values)])
+    query = torch.zeros(width, heads, head_dim, device=device, dtype=cache.dtype)
+    tokens = torch.zeros(width, device=device, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        q_seq_lens=torch.tensor([width], device=device, dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([0, width], device=device, dtype=torch.int32),
+        q_cu_seq_lens_host_values=[width],
+        block_table=torch.arange(1, 33, device=device, dtype=torch.int32).view(1, -1),
+        slot_mapping=torch.arange(width, device=device, dtype=torch.int32),
+        kv_seq_lens=torch.tensor([23], device=device, dtype=torch.int32),
+        kv_seq_lens_host_values=[23],
+        kv_cu_seq_lens=None,
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        is_prefill=False,
+        is_chunked_prefill=True,
+        is_spec_verify=False,
+    )
+    layer = SimpleNamespace(
+        causal=False,
+        fia_use_attention_mask=window is not None,
+        fia_sparse_mode=4 if window is not None else None,
+        fia_pre_tokens=window - 1 if window is not None else 2147483647,
+        fia_next_tokens=width - 1,
+    )
+    runner = BlockDraftAclGraphRunner(torch.nn.Identity(), backend, device, 1, capacity)
+    entry = runner._allocate_entry(tokens, tokens, metadata)
+    runner._fill_entry(entry, tokens, tokens, metadata)
+    static = entry.static_metadata
+
+    def _attend(current: SimpleNamespace) -> torch.Tensor:
+        backend.prepare(current)
+        return backend._prefill(query, query, query, cache, values, current, width, layer)
+
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            _attend(static)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=stream):
+        captured = _attend(static)
+    torch.npu.synchronize()
+
+    # Grow far beyond the short capture length, then shrink and grow again.
+    for length in (1875, 130, 1987):
+        metadata.kv_seq_lens.fill_(length)
+        metadata.kv_seq_lens_host_values[:] = [length]
+        runner._fill_entry(entry, tokens, tokens, metadata)
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            graph.replay()
+        torch.npu.synchronize()
+        metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+        expected = _attend(metadata)
+        torch.testing.assert_close(captured, expected, rtol=1e-2, atol=2e-3)
+
+
 def test_block_attention_shares_masks_per_forward_and_refreshes_device_lengths(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = _ordinary_backend()
     metadata = _ordinary_metadata(paged=True)

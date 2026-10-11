@@ -23,6 +23,7 @@ import torch
 
 from xllm.python.attention.backend import AttentionBackend
 from xllm.python.model_executor.executor import ModelExecutor
+from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
 from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
@@ -97,14 +98,12 @@ def test_capture_shares_one_lazy_pool_across_runners_and_shapes(monkeypatch: pyt
     for graph_runner in runners:
         graph_runner._forward_static = Mock(return_value=torch.ones(1))
         for rows in (4, 2):
-            entry = SimpleNamespace(
-                batch_size=rows,
-                static_input_ids=torch.arange(rows, dtype=torch.int32),
-                static_mtp_topk_indices=None,
-                static_metadata=_metadata(rows),
-                eplb=None,
-                execution_state=None,
-            )
+            entry = AclGraphEntry()
+            entry.batch_size = rows
+            entry.static_input_ids = torch.arange(rows, dtype=torch.int32)
+            entry.static_mtp_topk_indices = None
+            entry.static_metadata = _metadata(rows)
+            entry.execution_state = None
             graph_runner._capture(entry, stream)
             assert entry.static_output is graph_runner._forward_static.return_value
             assert entry.graph_tasks == []
@@ -158,10 +157,14 @@ def test_capture_and_replay_bind_each_slot_without_input_copies(runner: Prepared
     assert runner._capture.call_count == 4
 
 
-@pytest.mark.parametrize("prepared", [True, False], ids=["pipeline", "legacy"])
+@pytest.mark.parametrize(
+    ("prepared", "num_decoding_tokens"),
+    [(True, 1), (False, 1), (False, 4)],
+    ids=["pipeline", "legacy-plain", "legacy-speculative"],
+)
 @torch.inference_mode()
 def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
-    monkeypatch: pytest.MonkeyPatch, prepared: bool
+    monkeypatch: pytest.MonkeyPatch, prepared: bool, num_decoding_tokens: int
 ) -> None:
     pytest.importorskip("torch_npu")
     from xllm.python import kernels
@@ -219,7 +222,9 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
     runner = (
         PreparedAclGraphRunner(PagedModel(), backend, torch.device("cpu"), 4)
         if prepared
-        else DecodeAclGraphRunner(PagedModel(), backend, torch.device("cpu"), 4, 128)
+        else DecodeAclGraphRunner(
+            PagedModel(), backend, torch.device("cpu"), 4, 128, num_decoding_tokens=num_decoding_tokens
+        )
     )
     inputs = []
     # Same-size independent slots plus a different bucket; legacy uses one
@@ -270,7 +275,10 @@ def test_real_paged_backend_refreshes_captured_lengths_and_isolates_entries(
         if prepared:
             assert output is entry.static_output
         else:
-            assert output.data_ptr() == entry.static_output.data_ptr()
+            # Ordinary decode borrows the replay buffer; speculative decode
+            # queues a clone before task update on a real device. CPU mocks
+            # verify ownership without emulating that stream queue.
+            assert (output.data_ptr() != entry.static_output.data_ptr()) is (num_decoding_tokens > 1)
         assert captured_lengths[index].kv == lengths
         # Preparing another entry must not alter this captured task's state.
         other = (index + 1) % len(inputs)

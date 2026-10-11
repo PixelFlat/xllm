@@ -109,6 +109,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         self.num_decoding_tokens = max(1, int(num_decoding_tokens))
         self._is_spec_draft = is_spec_draft
         self._has_index_cache = False
+        self._has_linear_cache = False
         self._batch_limit_warning_logged = False
         self._graphs: dict[_GraphKey, AclGraphEntry] = {}
         self._dp_graph_variants: dict[_GraphKey, int] = {}
@@ -123,6 +124,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
     def bind_layer_caches(self, layer_caches: list[LayerCache]) -> None:
         super().bind_layer_caches(layer_caches)
         self._has_index_cache = any(cache.index is not None for cache in layer_caches)
+        self._has_linear_cache = any(cache.conv is not None or cache.ssm is not None for cache in layer_caches)
 
     def can_execute(
         self,
@@ -494,17 +496,26 @@ class DecodeAclGraphRunner(AclGraphRunner):
                 batch_size + 1,
             ):
                 return False
-        has_initial_state = getattr(metadata, "has_initial_state", None)
-        if has_initial_state is not None:
-            state_count = has_initial_state.numel()
-            if state_count != batch_size and not (is_expanded and state_count > 0 and batch_size % state_count == 0):
+        # Pure MLA does not read recurrent-state metadata. The scheduler keeps
+        # one placeholder per request even when speculative verify expands the
+        # attention inputs to N+1 rows. Preserve these checks for hybrid models
+        # that actually bind a recurrent cache and for non-MLA backends.
+        if self._has_linear_cache or not self.attention_backend.is_mla:
+            has_initial_state = getattr(metadata, "has_initial_state", None)
+            if has_initial_state is not None:
+                state_count = has_initial_state.numel()
+                if state_count != batch_size and not (
+                    is_expanded and state_count > 0 and batch_size % state_count == 0
+                ):
+                    return False
+            linear_idx = getattr(metadata, "linear_state_indices", None)
+            if (
+                linear_idx is not None
+                and linear_idx.numel() != batch_size
+                and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
+            ):
                 return False
-        linear_idx = getattr(metadata, "linear_state_indices", None)
-        return not (
-            linear_idx is not None
-            and linear_idx.numel() != batch_size
-            and not (is_expanded and linear_idx.numel() > 0 and batch_size % linear_idx.numel() == 0)
-        ) and self._has_compatible_index_history(metadata, block_table)
+        return self._has_compatible_index_history(metadata, block_table)
 
     @staticmethod
     def _cumulative_lengths(

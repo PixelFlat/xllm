@@ -392,7 +392,9 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         static.kv_seq_lens_host_values[:] = kv_host
 
         prepared.actual_seq_q[:] = list(static.q_cu_seq_lens_host_values)
-        prepared.actual_seq_kv[:] = list(static.kv_seq_lens_host_values)
+        # BNSD FIA captures Host KV lengths by value, not by list address.
+        # Keep the allocation-time capacity bound even during first capture;
+        # the captured Device-length mask controls the live prefix on replay.
         if prepared.query_ends is not None:
             prepared.query_ends[:] = list(static.q_cu_seq_lens_host_values)
 

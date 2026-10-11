@@ -92,3 +92,65 @@ def test_quant_matmul_out_nz_graph_replay_updates_output() -> None:
         expected = _reference(x1, weight, scale, pertoken)
         assert output.data_ptr() == output_ptr
         torch.testing.assert_close(output.cpu(), expected, rtol=0.01, atol=0.015)
+
+
+def _static_inputs(token_count: int, in_features: int, out_features: int) -> tuple[torch.Tensor, ...]:
+    from xllm.python.kernels_npu.linear import prepare_quant_weight
+
+    generator = torch.Generator().manual_seed(31)
+    x1 = torch.randint(-2, 3, (token_count, in_features), dtype=torch.int8, generator=generator).npu()
+    weight = torch.randint(-2, 3, (out_features, in_features), dtype=torch.int8, generator=generator)
+    x2 = prepare_quant_weight(weight.npu())
+    scale = torch.linspace(0.01, 0.05, out_features).npu()
+    bias = torch.arange(out_features, dtype=torch.int32).remainder(17).npu()
+    output = torch.empty(token_count, out_features, dtype=torch.bfloat16, device=x1.device)
+    return x1, x2, scale, bias, output, weight
+
+
+def _static_reference(x1: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    accumulated = x1.cpu().to(torch.int32) @ weight.t().to(torch.int32)
+    return ((accumulated + bias.cpu()).float() * scale.cpu()).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("token_count", [1, 8, 17])
+@pytest.mark.parametrize("projection", [(64, 96), (6144, 2624), (5120, 1280)], ids=["small", "glm", "qwen"])
+@pytest.mark.parametrize("use_out", [False, True], ids=["allocating", "out"])
+def test_static_quant_matmul_respects_nz_projection_contract(
+    token_count: int, projection: tuple[int, int], use_out: bool
+) -> None:
+    out_op = _require_quant_matmul_out()
+    x1, x2, scale, bias, output, weight = _static_inputs(token_count, *projection)
+    expected = _static_reference(x1, weight, scale, bias)
+
+    if use_out:
+        result = out_op(x1, x2, False, scale, None, None, bias, torch.bfloat16, output)
+        assert result.data_ptr() == output.data_ptr()
+    else:
+        result = torch.ops.xllm_ops.quant_matmul(x1, x2, False, scale, None, None, bias, torch.bfloat16)
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(result.cpu(), expected, rtol=0.01, atol=0.015)
+
+
+@pytest.mark.parametrize("projection", [(6144, 2624), (5120, 1280)], ids=["glm", "qwen"])
+def test_static_quant_matmul_nz_graph_replays_live_inputs(projection: tuple[int, int]) -> None:
+    op = _require_quant_matmul_out()
+    x1, x2, scale, bias, output, weight = _static_inputs(8, *projection)
+    output_ptr = output.data_ptr()
+    stream = torch.npu.Stream(device=x1.device)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        op(x1, x2, False, scale, None, None, bias, torch.bfloat16, output)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=stream):
+        op(x1, x2, False, scale, None, None, bias, torch.bfloat16, output)
+
+    for value in (-1, 2):
+        x1.fill_(value)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = _static_reference(x1, weight, scale, bias)
+        assert output.data_ptr() == output_ptr
+        torch.testing.assert_close(output.cpu(), expected, rtol=0.01, atol=0.015)
