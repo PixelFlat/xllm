@@ -20,6 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/mtp_topk_state.h"
+#include "core/util/tensor_helper.h"
 #include "framework/model/model_input_params.h"
 #include "models/llm/mlu/mtp_topk_state.h"
 #include "runtime/forward_params.h"
@@ -108,6 +109,51 @@ TEST(SpecDecodeInputBuilderTest, DraftInputsSingleRowPerSeq) {
   expect_position_ids(buf, {5, 9});
   EXPECT_EQ(buf.out_new_cache_slots, std::vector<int32_t>({5, 21}));
   EXPECT_EQ(buf.out_kv_seq_lens, to_layout_seq_lens({6, 10}));
+}
+
+TEST(SpecDecodeInputBuilderTest, EmptyBlockDraftMaterializesWholeQuery) {
+  LlmForwardInput input;
+  input.input_params.parallel.dp_global_token_nums = {0, 21};
+  input.input_params.parallel.raw_dp_global_token_nums = {0, 21};
+  input.input_params.parallel.dp_global_sequence_nums = {0, 3};
+  input.runtime.input_host_buffer_has_layout = true;
+  materialize_empty_block_draft_rows(input, 7, 42);
+
+  const auto& params = input.input_params;
+  EXPECT_EQ(params.meta.num_sequences, 1);
+  EXPECT_EQ(params.meta.actual_num_sequences, 0);
+  EXPECT_EQ(params.meta.q_max_seq_len, 7);
+  EXPECT_EQ(params.meta.kv_max_seq_len, 1);
+  EXPECT_EQ(tensor_to_vector<int32_t>(input.token_ids_host),
+            std::vector<int32_t>(7, 42));
+  EXPECT_EQ(tensor_to_vector<int32_t>(input.positions_host),
+            std::vector<int32_t>({0, 1, 2, 3, 4, 5, 6}));
+  EXPECT_EQ(params.attention.host.q_seq_lens, to_layout_seq_lens({7}));
+  EXPECT_EQ(params.attention.host.q_cu_seq_lens, std::vector<int32_t>({0, 7}));
+  EXPECT_EQ(params.attention.host.kv_seq_lens, to_layout_seq_lens({1}));
+  EXPECT_EQ(params.attention.host.new_cache_slots, std::vector<int32_t>(7, -1));
+  EXPECT_EQ(params.parallel.dp_global_token_nums,
+            std::vector<int32_t>({7, 21}));
+  EXPECT_EQ(params.parallel.raw_dp_global_token_nums,
+            std::vector<int32_t>({0, 21}));
+  EXPECT_EQ(params.parallel.dp_global_sequence_nums,
+            std::vector<int32_t>({0, 3}));
+  EXPECT_FALSE(input.runtime.device_tensors_ready);
+  EXPECT_FALSE(input.runtime.input_host_buffer_has_layout);
+}
+
+TEST(SpecDecodeInputBuilderTest, ActiveBlockDraftOnlyFillsIdlePeerCount) {
+  LlmForwardInput input;
+  input.input_params.meta.num_sequences = 3;
+  input.input_params.parallel.dp_global_token_nums = {21, 0};
+  input.token_ids = torch::tensor({11, 12}, torch::kInt32);
+  materialize_empty_block_draft_rows(input, 7, 42);
+
+  EXPECT_EQ(input.input_params.meta.num_sequences, 3);
+  EXPECT_EQ(input.input_params.parallel.dp_global_token_nums,
+            std::vector<int32_t>({21, 7}));
+  EXPECT_EQ(tensor_to_vector<int32_t>(input.token_ids),
+            std::vector<int32_t>({11, 12}));
 }
 
 TEST(SpecDecodeInputBuilderTest, VlmVerifyRowsPreserveVisionState) {

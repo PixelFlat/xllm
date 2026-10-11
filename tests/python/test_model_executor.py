@@ -52,6 +52,9 @@ from xllm.python.model_executor.forward_context import (  # noqa: E402
     get_forward_context,
     record_layer_event,
 )
+from xllm.python.model_executor.runners.block_draft_acl_graph import (  # noqa: E402
+    BlockDraftAclGraphRunner,
+)
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     DecodeAclGraphRunner,
 )
@@ -2320,6 +2323,26 @@ def test_executor_selects_acl_graph_input_owner(model_type: str, dp_size: int, p
     executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
     runner = executor.prepared_graph_runner if pipeline else executor.decode_graph_runner
     assert len(runner.layer_caches) == 2
+
+
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+def test_executor_selects_dspark_acl_graph_with_dp(dp_size: int) -> None:
+    config = {
+        "model_type": "DSparkDraftModel",
+        "dp_size": dp_size,
+        "dp_rank": dp_size - 1,
+        "python_graph_backend": "aclgraph",
+        "max_position_embeddings": 128,
+    }
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=5, acl_graph_decode_batch_size_limit=2)
+    runner = executor.decode_graph_runner
+    assert isinstance(runner, BlockDraftAclGraphRunner)
+    assert runner.dp_size == dp_size
+    assert runner.dp_rank == dp_size - 1
+    assert runner.max_batch == min((5 + dp_size - 1) // dp_size, 2)
 
 
 def test_eager_runner_skips_cp_for_empty_rank() -> None:

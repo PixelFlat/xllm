@@ -180,6 +180,13 @@ void update_input_params(Params& input_params,
 // Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
 
+// Empty DP ranks participate in block-draft execution with a complete query
+// block. Fill their execution counts on every rank and materialize an idle
+// rank's host input without writing any real cache slots.
+void materialize_empty_block_draft_rows(LlmForwardInput& input,
+                                        int32_t query_width,
+                                        int32_t mask_token_id);
+
 // Stages token_ids/positions into both the host and device tensors of `input`
 // with async H2D copies, toggling device_tensors_ready around the write.
 template <typename Input>

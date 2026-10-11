@@ -489,6 +489,44 @@ void update_input_params(Params& input_params,
 torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
   return make_pinned_cpu_tensor(values);
 }
+
+void materialize_empty_block_draft_rows(LlmForwardInput& input,
+                                        int32_t query_width,
+                                        int32_t mask_token_id) {
+  CHECK_GT(query_width, 0);
+  auto& params = input.input_params;
+  for (int32_t& count : params.parallel.dp_global_token_nums) {
+    if (count == 0) {
+      count = query_width;
+    }
+  }
+  if (params.meta.num_sequences != 0) {
+    return;
+  }
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+  input.token_ids_host = torch::full({query_width}, mask_token_id, options);
+  input.positions_host = torch::arange(query_width, options);
+  input.token_ids = input.token_ids_host;
+  input.positions = input.positions_host;
+  input.runtime.device_tensors_ready = false;
+  input.runtime.input_host_buffer_has_layout = false;
+  params.meta.num_sequences = 1;
+  params.meta.actual_num_sequences = 0;
+  params.meta.q_max_seq_len = query_width;
+  params.meta.kv_max_seq_len = 1;
+  params.attention.host.q_seq_lens.clear();
+  append_seq_len_by_layout(params.attention.host.q_seq_lens, query_width);
+  params.attention.host.q_cu_seq_lens = {0, query_width};
+  params.attention.host.kv_seq_lens.clear();
+  append_seq_len_by_layout(params.attention.host.kv_seq_lens, 1);
+  params.attention.host.new_cache_slots.assign(query_width, -1);
+  params.attention.host.block_tables = torch::zeros({1, 1}, options);
+  params.attention.device.paged_kv_indptr = torch::tensor({0, 1}, options);
+  params.attention.device.paged_kv_indices = torch::tensor({0}, options);
+  params.attention.device.paged_kv_last_page_len = torch::tensor({1}, options);
+}
+
 template <typename Input>
 void set_token_position_tensors(Input& input,
                                 const std::vector<int32_t>& token_ids,

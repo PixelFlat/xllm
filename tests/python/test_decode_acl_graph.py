@@ -83,14 +83,15 @@ class _FakeBlockDraftAttentionBackend:
         )
 
 
-def _block_draft_runner() -> BlockDraftAclGraphRunner:
+def _block_draft_runner(max_batch: int = 1, **kwargs: object) -> BlockDraftAclGraphRunner:
     attention_backend = _FakeBlockDraftAttentionBackend()
     return BlockDraftAclGraphRunner(
         nn.Identity(),
         attention_backend,
         torch.device("cpu"),
-        max_batch=1,
+        max_batch=max_batch,
         max_model_len=8,
+        **kwargs,
     )
 
 
@@ -98,23 +99,164 @@ def _block_draft_metadata(block_table: torch.Tensor) -> SimpleNamespace:
     sequence_count, block_cols = block_table.shape
     query_width = 2
     token_count = sequence_count * query_width
+    query_ends = [query_width * (index + 1) for index in range(sequence_count)]
     return SimpleNamespace(
         is_prefill=False,
         is_chunked_prefill=True,
         is_spec_verify=False,
         q_seq_lens=torch.full((sequence_count,), query_width, dtype=torch.int32),
-        q_cu_seq_lens=torch.tensor([0, token_count], dtype=torch.int32),
-        q_cu_seq_lens_host_values=[token_count],
+        q_cu_seq_lens=torch.tensor([0, *query_ends], dtype=torch.int32),
+        q_cu_seq_lens_host_values=query_ends,
         q_seq_lens_host=None,
         block_table=block_table,
         slot_mapping=torch.arange(token_count, dtype=torch.int32),
         kv_seq_lens=torch.full((sequence_count,), block_cols * 4, dtype=torch.int32),
         kv_cu_seq_lens=None,
-        kv_seq_lens_host_values=[block_cols * 4],
-        paged_kv_indptr=torch.tensor([0, block_cols], dtype=torch.int32),
-        paged_kv_indices=torch.arange(block_cols, dtype=torch.int32),
-        paged_kv_last_page_len=torch.tensor([4], dtype=torch.int32),
+        kv_seq_lens_host_values=[block_cols * 4] * sequence_count,
+        paged_kv_indptr=torch.arange(sequence_count + 1, dtype=torch.int32) * block_cols,
+        paged_kv_indices=torch.arange(sequence_count * block_cols, dtype=torch.int32),
+        paged_kv_last_page_len=torch.full((sequence_count,), 4, dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize("dp_rank,sequence_count", [(0, 1), (1, 3)])
+def test_dspark_dp_graph_uses_group_wide_complete_blocks(dp_rank: int, sequence_count: int) -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2, dp_rank=dp_rank)
+    metadata = _block_draft_metadata(torch.zeros(sequence_count, 3, dtype=torch.int32))
+    metadata.dp_execution_token_counts = (2, 6)
+    metadata.dp_is_decode = (1, 1)
+    input_ids = torch.arange(sequence_count * 2, dtype=torch.int32)
+
+    assert runner.can_execute(input_ids, metadata)
+    assert runner._padded_sequence_count(metadata, sequence_count, 2) == 4
+    entry = runner._allocate_entry(input_ids, input_ids, metadata, sequence_count=4)
+    runner._fill_entry(entry, input_ids, input_ids, metadata)
+    static = entry.static_metadata
+    assert entry.static_input_ids.numel() == 8
+    assert static.q_cu_seq_lens.tolist() == [0, 2, 4, 6, 8]
+    assert static.q_seq_lens.tolist() == [2] * 4
+    assert static.dp_execution_token_counts == (8, 8)
+    assert static.dp_is_decode == (1, 1)
+    assert static.slot_mapping[sequence_count * 2 :].tolist() == [-1] * (8 - sequence_count * 2)
+    assert static.kv_seq_lens.tolist() == [12] * sequence_count + [1] * (4 - sequence_count)
+    assert static.prepared_attention_state.actual_seq_q == [2, 4, 6, 8]
+    assert static.prepared_attention_state.actual_seq_kv == [16] * 4
+
+
+def test_dspark_dp_graph_admits_an_idle_rank_full_block() -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2, dp_rank=0)
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.dp_execution_token_counts = (2, 6)
+    metadata.dp_global_sequence_nums = (0, 3)
+    metadata.dp_is_decode = (1, 1)
+    metadata.slot_mapping.fill_(-1)
+    metadata.kv_seq_lens.fill_(1)
+    metadata.kv_seq_lens_host_values = [1]
+    metadata.paged_kv_last_page_len.fill_(1)
+    input_ids = torch.zeros(2, dtype=torch.int32)
+
+    assert runner.can_execute(input_ids, metadata)
+    entry = runner._allocate_entry(input_ids, input_ids, metadata, sequence_count=4)
+    runner._fill_entry(entry, input_ids, input_ids, metadata)
+    assert entry.static_metadata.slot_mapping.tolist() == [-1] * 8
+    assert entry.static_metadata.kv_seq_lens.tolist() == [1] * 4
+
+
+@pytest.mark.parametrize(
+    "counts,phases,error",
+    [
+        ((2,), (1, 1), "every DP rank"),
+        ((2, 3), (1, 1), "complete query blocks"),
+        ((4, 6), (1, 1), "local execution count"),
+        ((2, 0), (1, 1), "complete query blocks"),
+    ],
+)
+def test_dspark_dp_graph_rejects_invalid_counts(counts: tuple[int, ...], phases: tuple[int, ...], error: str) -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2)
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.dp_execution_token_counts = counts
+    metadata.dp_is_decode = phases
+    with pytest.raises(ValueError, match=error):
+        runner.can_execute(torch.zeros(2, dtype=torch.int32), metadata)
+
+
+@pytest.mark.parametrize("counts,phases", [((2, 10), (1, 1)), ((2, 6), (1, 0))])
+def test_dspark_dp_graph_falls_back_group_wide(counts: tuple[int, ...], phases: tuple[int, ...]) -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2)
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.dp_execution_token_counts = counts
+    metadata.dp_is_decode = phases
+    assert not runner.can_execute(torch.zeros(2, dtype=torch.int32), metadata)
+
+
+def test_dspark_dp_replay_clears_rows_from_a_larger_local_batch() -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2)
+    metadata = _block_draft_metadata(torch.full((3, 2), 10, dtype=torch.int32))
+    input_ids = torch.arange(6, dtype=torch.int32) + 10
+    metadata.kv_cu_seq_lens = torch.tensor([0, 8, 16, 24], dtype=torch.int32)
+    entry = runner._allocate_entry(input_ids, input_ids, metadata, sequence_count=4)
+    runner._fill_entry(entry, input_ids, input_ids, metadata)
+    smaller = _block_draft_metadata(torch.tensor([[20]], dtype=torch.int32))
+    runner._fill_entry(entry, input_ids[:2], input_ids[:2], smaller)
+
+    assert entry.static_input_ids.tolist() == [10, 11, 0, 0, 0, 0, 0, 0]
+    assert entry.static_positions.tolist() == [10, 11, 0, 0, 0, 0, 0, 0]
+    static = entry.static_metadata
+    assert static.slot_mapping.tolist() == [0, 1, -1, -1, -1, -1, -1, -1]
+    assert static.kv_seq_lens.tolist() == [4, 1, 1, 1]
+    assert static.kv_cu_seq_lens.tolist() == [0, 4, 5, 6, 7]
+    assert static.paged_kv_indptr.tolist() == [0, 1, 1, 1, 1]
+    assert static.paged_kv_last_page_len.tolist() == [4, 1, 1, 1]
+    assert static.block_table[1:].count_nonzero().item() == 0
+
+
+def test_dspark_dp_graph_key_tracks_peer_page_capacity() -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2)
+    input_ids = torch.arange(2, dtype=torch.int32)
+    local_key = runner._graph_key(input_ids, _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32)), 4, 2)
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch(
+            "xllm.python.distributed.all_gather",
+            side_effect=[torch.tensor([1, 1]), torch.tensor([1, 2]), torch.tensor([1, 1])],
+        ),
+    ):
+        first = runner._synchronize_dp_graph_key(local_key, input_ids)
+        changed_peer = runner._synchronize_dp_graph_key(local_key, input_ids)
+        restored = runner._synchronize_dp_graph_key(local_key, input_ids)
+    assert first[:-1] == local_key[:-1]
+    assert first != changed_peer
+    assert first == restored
+
+
+def test_dspark_dp_warmup_recaptures_when_any_rank_is_missing() -> None:
+    runner = _block_draft_runner(max_batch=8, dp_size=2)
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.dp_execution_token_counts = (2, 6)
+    metadata.dp_is_decode = (1, 1)
+    input_ids = torch.arange(2, dtype=torch.int32)
+    local_key = runner._graph_key(input_ids, metadata, 4, 2)
+    graph_key = (*local_key[:-1], (1, 1))
+    runner._graphs[graph_key] = object()
+    expected_eplb = Mock()
+
+    def presence(count: torch.Tensor, *, group_name: str) -> None:
+        assert group_name == "dp"
+        count.fill_(1)
+
+    def prepare(*args: object, graph_key: tuple[object, ...], eplb: object | None = None) -> None:
+        assert eplb is expected_eplb
+        assert graph_key not in runner._graphs
+        runner._graphs[graph_key] = object()
+
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_gather", return_value=torch.tensor([1, 1])),
+        patch("xllm.python.distributed.all_reduce_", side_effect=presence),
+        patch.object(runner, "_prepare_graph_entry", side_effect=prepare) as capture,
+    ):
+        assert runner.warmup(input_ids, input_ids, metadata, eplb=expected_eplb) == graph_key
+    capture.assert_called_once()
 
 
 def test_dspark_graph_key_buckets_live_page_table_width() -> None:

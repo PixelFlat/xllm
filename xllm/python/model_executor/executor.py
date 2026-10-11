@@ -415,14 +415,14 @@ class ModelExecutor:
                 )
             else:
                 if config.get("model_type") == "DSparkDraftModel":
-                    if dp_size != 1:
-                        raise NotImplementedError("DSpark ACL graphs currently require dp_size == 1")
                     self.decode_graph_runner = BlockDraftAclGraphRunner(
                         execution_model,
                         self.attention_backend,
                         device,
-                        local_graph_sequence_capacity,
+                        local_graph_sequence_capacity * dp_size,
                         int(config["max_position_embeddings"]),
+                        dp_size,
+                        dp_rank,
                     )
                 else:
                     self.decode_graph_runner = DecodeAclGraphRunner(

@@ -28,6 +28,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/adaptive_pruning_helpers.h"
@@ -593,6 +594,13 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   }
   scale_speculative_parallel_token_counts(query_input.input_params,
                                           draft_width);
+  if (sample_from_anchor() && !use_block_parallel_rows &&
+      ModelConfig::is_python_model_impl(context_.get_model_impl())) {
+    c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
+    specBuilder::materialize_empty_block_draft_rows(
+        query_input, draft_width, mask_token_id_);
+    query_input.input_params.attention.rebuild_device_buffer(device_.unwrap());
+  }
   // Warmup only: prime the draft; its output is unused. Keep it alive until the
   // sync below so the no-sync draft input is not freed while the target forward
   // launched next can reuse the buffer.
@@ -1259,6 +1267,11 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
                                    /*update_block_tables=*/
                                    use_block_parallel_rows);
   scale_speculative_parallel_token_counts(input_params, query_width);
+  if (sample_from_anchor() && !use_block_parallel_rows &&
+      ModelConfig::is_python_model_impl(context_.get_model_impl())) {
+    specBuilder::materialize_empty_block_draft_rows(
+        query_input, query_width, mask_token_id_);
+  }
   input_params.attention.rebuild_device_buffer(device_);
 
   query_input.sampling_params.selected_token_idxes =
