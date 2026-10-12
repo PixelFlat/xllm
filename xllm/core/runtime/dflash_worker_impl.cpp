@@ -100,7 +100,8 @@ runtime::Options draft_options(const runtime::Options& options) {
       .num_decoding_tokens(1)
       .num_speculative_tokens(draft_num_speculative_tokens)
       .enable_graph_aux_hidden_states(false);
-  if (options.enable_task_pipeline()) {
+  if (options.enable_task_pipeline() &&
+      options.speculative_algorithm() != "DSpark") {
     opts.enable_graph(false);
   }
   return opts;
@@ -392,10 +393,12 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                           "Block task model hidden/vocabulary or captured "
                           "context geometry mismatch.");
   }
-  capacity.kind =
-      SpeculativeConfig::is_dflash2_algorithm(options_.speculative_algorithm())
-          ? SpeculativeTaskKind::DFLASH2
-          : SpeculativeTaskKind::DFLASH;
+  capacity.kind = options_.speculative_algorithm() == "DSpark"
+                      ? SpeculativeTaskKind::DSPARK
+                  : SpeculativeConfig::is_dflash2_algorithm(
+                        options_.speculative_algorithm())
+                      ? SpeculativeTaskKind::DFLASH2
+                      : SpeculativeTaskKind::DFLASH;
   capacity.num_speculative_tokens = options_.num_speculative_tokens();
   capacity.context_hidden_size =
       static_cast<uint32_t>(expected_context_hidden_size_);

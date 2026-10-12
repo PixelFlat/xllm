@@ -160,6 +160,36 @@ TEST_F(MtpDecodeInputTest, BlockDraftKeepsNonCausalBlocksAndDeviceLengths) {
       torch::tensor({23, 24, 25, 26, 63, 64, 65, 66}, torch::kInt32)));
 }
 
+TEST_F(MtpDecodeInputTest, DSparkSamplesAnchorWithoutAnExtraQueryRow) {
+  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.enable_mla = false;
+  spec_.mask_token_id = 99;
+  spec_.sample_from_anchor = true;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding);
+  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*binding).rows_per_sequence_,
+            3U);
+  EXPECT_TRUE(
+      torch::equal(binding->tokens().cpu(),
+                   torch::tensor({42, 99, 99, 52, 99, 99}, torch::kInt32)));
+  EXPECT_TRUE(
+      torch::equal(binding->positions().cpu(),
+                   torch::tensor({7, 8, 9, 15, 16, 17}, torch::kInt32)));
+  EXPECT_TRUE(
+      torch::equal(binding->model_params().attention.device.kv_seq_lens.cpu(),
+                   torch::tensor({10, 18}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      binding->model_params().attention.device.new_cache_slots.cpu(),
+      torch::tensor({23, 24, 25, 63, 64, 65}, torch::kInt32)));
+  spec_.kind = MtpInvocationKind::VALIDATE;
+  EXPECT_FALSE(TaskPipelineTestPeer::create_mtp_input(
+                   spec_, torch::kBFloat16, device_, binding)
+                   .ok());
+}
+
 TEST_F(MtpDecodeInputTest, FirstDraftRepairsOnlyFullAcceptance) {
   std::unique_ptr<SlotBuffer> binding;
   ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(

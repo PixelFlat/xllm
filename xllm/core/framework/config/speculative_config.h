@@ -59,6 +59,13 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
+  // Algorithm-level admission only. The worker validates fixed-width model
+  // geometry and parallel capacity before creating its task pipeline.
+  static bool supports_task_pipeline(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || algorithm == "DFlash" ||
+           is_dflash2_algorithm(algorithm) || algorithm == "DSpark";
+  }
+
   // True for the block-diffusion draft algorithms (DFlash, DSpark) that record
   // validate metrics inline per-seq and drive the adaptive per-seq varlen
   // prune. Case-insensitive so it matches however the flag was cased. MTP is

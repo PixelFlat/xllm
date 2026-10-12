@@ -80,7 +80,7 @@ struct TaskModel {
 
 class ProcessGroup;
 class WorkerImpl;
-enum class SpeculativeTaskKind : uint8_t { MTP, DFLASH, DFLASH2 };
+enum class SpeculativeTaskKind : uint8_t { MTP, DFLASH, DFLASH2, DSPARK };
 
 struct SpeculativeTaskCapacity {
   LlmTaskCapacity common;

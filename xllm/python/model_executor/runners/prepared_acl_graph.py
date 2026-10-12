@@ -44,11 +44,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
         dp_size: int = 1,
         dp_rank: int = 0,
         enable_mega_moe_token_mask: bool = False,
+        block_draft: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
         self.dp_rank = dp_rank
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
+        self._block_draft = block_draft
         self.max_batch = (max_batch + dp_size - 1) // dp_size
         self._prepared_graphs: dict[tuple[object, ...], AclGraphEntry] = {}
         self.prepared_replays = 0
@@ -113,15 +115,32 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if not 0 < batch_size <= self.max_batch:
             raise ValueError("prepared ACL graph batch size exceeds capacity or is empty")
         self._validate_prepared_dp(input_ids, metadata)
-        if metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_spec_verify:
+        if self._block_draft:
+            if metadata.is_prefill or not metadata.is_chunked_prefill or metadata.is_spec_verify:
+                raise ValueError("prepared block graph requires non-causal chunked-prefill queries")
+            if self.dp_size != 1 or input_embedding is not None or mtp_topk_indices is not None:
+                raise ValueError("prepared block graph requires DP=1 and ordinary token inputs")
+        elif metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_spec_verify:
             raise ValueError("prepared ACL graph requires ordinary decode")
         if getattr(metadata, "prepared_attention_state", None) is None:
             raise ValueError("prepared ACL graph requires prepared metadata")
         block_table = metadata.block_table
         if block_table is None or block_table.dim() != 2:
             raise ValueError("prepared ACL graph requires a block table per metadata row")
-        self._validate_decode_token_layout(input_ids, positions, metadata.slot_mapping, block_table.shape[0])
-        if metadata.q_seq_lens.numel() != batch_size or metadata.kv_seq_lens.numel() != batch_size:
+        if self._block_draft:
+            if (
+                input_ids.dim() != 1
+                or positions.shape != input_ids.shape
+                or metadata.slot_mapping.shape != input_ids.shape
+                or block_table.shape[0] != 1
+                or not block_table.is_contiguous()
+                or metadata.q_cu_seq_lens_host_values != [batch_size]
+            ):
+                raise ValueError("prepared block graph requires a single fixed-width request")
+        else:
+            self._validate_decode_token_layout(input_ids, positions, metadata.slot_mapping, block_table.shape[0])
+        expected_rows = block_table.shape[0] if self._block_draft else batch_size
+        if metadata.q_seq_lens.numel() != expected_rows or metadata.kv_seq_lens.numel() != expected_rows:
             raise ValueError("prepared ACL graph requires query and KV lengths per metadata row")
         for name, tensor in (("hidden state", input_embedding), ("MTP top-k", mtp_topk_indices)):
             if tensor is not None and (
@@ -180,9 +199,25 @@ class PreparedAclGraphRunner(AclGraphRunner):
             dp_is_decode=tuple(getattr(metadata, "dp_is_decode", ())),
             mega_moe_token_mask=mega_moe_token_mask,
             prepared_attention_state=(
-                metadata.prepared_attention_state if getattr(self.attention_backend, "is_mla", False) else None
+                metadata.prepared_attention_state
+                if getattr(self.attention_backend, "is_mla", False) or self._block_draft
+                else None
             ),
         )
+        if self._block_draft:
+            # Like the legacy DSpark runner, capture at least the startup
+            # 16-page context plus the query. Keep the FIA bound constant;
+            # live device lengths, not captured Host lists, mask the prefix.
+            page_size = self.attention_backend.page_size
+            required_pages = (max(metadata.kv_seq_lens_host_values) + page_size - 1) // page_size
+            minimum_pages = 16 + (entry.batch_size + page_size - 1) // page_size
+            pages = min(1 << (max(required_pages, minimum_pages) - 1).bit_length(), metadata.block_table.shape[1])
+            static = entry.static_metadata
+            static.block_table = metadata.block_table[:, :pages]
+            static.q_cu_seq_lens_host_values = list(metadata.q_cu_seq_lens_host_values)
+            static.kv_seq_lens_host_values = [pages * page_size]
+            static.is_chunked_prefill = True
+            static.prepared_attention_state = self.attention_backend.prepare_metadata(static, device_kv_lengths=True)
         if mega_moe_token_mask is not None:
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)
         self._prepare_graph_eplb_state(entry, eplb, metadata, first_capture=True)
@@ -217,7 +252,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
             # Counts precede native Slot padding; execution counts are physical.
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)
         self._prepare_graph_eplb_state(entry, eplb, metadata, first_capture=False)
-        self._prepare_attention(entry, metadata, replay=True)
+        self._prepare_attention(entry, entry.static_metadata if self._block_draft else metadata, replay=True)
         stream = torch.npu.current_stream(self.device)
         entry.graph.replay()
         self._update_after_replay(entry, stream)
@@ -235,3 +270,11 @@ class PreparedAclGraphRunner(AclGraphRunner):
             )
             entry.replay_logged = True
         return entry.static_output
+
+    def can_execute_block(self, input_ids: torch.Tensor, positions: torch.Tensor, metadata: AttentionMetadata) -> bool:
+        """Only declared out-of-capacity queries use eager; missing bindings fail."""
+        self._validate_prepared_input(input_ids, positions, metadata)
+        entry = self._prepared_graphs.get(self._prepared_binding(input_ids, positions, metadata))
+        if entry is None:
+            raise RuntimeError("prepared ACL replay requires a warmed Slot binding")
+        return max(metadata.kv_seq_lens_host_values) <= entry.static_metadata.kv_seq_lens_host_values[0]

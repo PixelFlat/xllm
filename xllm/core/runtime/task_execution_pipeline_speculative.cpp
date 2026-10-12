@@ -184,6 +184,12 @@ Status TaskExecutionPipeline::create(
       static_cast<uint64_t>(capacity.num_speculative_tokens) + 1;
   const uint64_t rows =
       static_cast<uint64_t>(common.model.max_sequences) * width;
+  if (capacity.kind == SpeculativeTaskKind::DSPARK &&
+      (common.dp_size != 1 || common.model.max_sequences != 1)) {
+    return invalid(
+        "DSpark task pipeline currently requires DP=1 and single-request "
+        "capacity.");
+  }
   if (common.enable_kv_push && (capacity.kind != SpeculativeTaskKind::MTP ||
                                 !target.push_kv || !draft.push_kv)) {
     return invalid(
@@ -315,10 +321,13 @@ Status TaskExecutionPipeline::initialize_speculative() {
     const auto indices = options.dtype(torch::kInt32);
     slot->draft_sample_indices = torch::arange(draft_samples, indices);
     if (block_draft()) {
-      slot->draft_block_indices = torch::arange(expanded, indices)
-                                      .view({count, width})
-                                      .narrow(1, 1, width - 1)
-                                      .reshape({-1});
+      slot->draft_block_indices =
+          speculative_capacity_->kind == SpeculativeTaskKind::DSPARK
+              ? torch::arange(draft_samples, indices)
+              : torch::arange(expanded, indices)
+                    .view({count, width})
+                    .narrow(1, 1, width - 1)
+                    .reshape({-1});
     } else {
       slot->draft_first_indices = torch::arange(count, indices).mul(2).add(1);
     }
@@ -368,6 +377,8 @@ Status TaskExecutionPipeline::initialize_speculative() {
       spec.enable_mla = !block_draft();
       spec.mask_token_id =
           block_draft() ? speculative_capacity_->mask_token_id : 0;
+      spec.sample_from_anchor =
+          speculative_capacity_->kind == SpeculativeTaskKind::DSPARK;
       status = SlotBuffer::create_mtp_input(
           spec, hidden_dtype_, device_.unwrap(), invocation->input);
       if (!status.ok()) {
@@ -566,10 +577,14 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   slot.validate_input->model_params().parallel =
       expanded_parallel(base_parallel, slot.decode ? width : 1, false);
   for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
-    const uint32_t scale = !slot.decode    ? 1
-                           : block_draft() ? width
-                           : step == 0     ? 2
-                                           : 1;
+    const uint32_t scale = !slot.decode ? 1
+                           : block_draft()
+                               ? width - (speculative_capacity_->kind ==
+                                                  SpeculativeTaskKind::DSPARK
+                                              ? 1U
+                                              : 0U)
+                           : step == 0 ? 2
+                                       : 1;
     slot.drafts[step]->input->model_params().parallel =
         expanded_parallel(base_parallel, scale, slot.decode && block_draft());
   }
@@ -872,6 +887,53 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   // different draft buckets. Always visit the draft bindings independently.
   if (!block_draft()) {
     warmup_draft_graphs(input);
+  } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+             padded_batch_size != 0) {
+    // Prefill and idle warmup do not plan the expanded decode bindings.
+    // DSpark owns an N-wide chunked-prefill binding, not the target's padded
+    // (N+1)-wide decode shape. Capture the final Slot views independently.
+    for (auto& task_slot : slots_) {
+      auto& slot = *task_slot->speculative;
+      auto& binding = *slot.drafts.front()->input;
+      auto conservative = host;
+      conservative.positions = slot.upper_positions;
+      conservative.kv_seq_lens = slot.upper_kv_lengths;
+      const Status status = SlotBuffer::prepare_planned_mtp_decode(
+          binding, conservative, batch, prepare_stream_);
+      CHECK(status.ok()) << status.message();
+      CHECK_EQ(prepare_stream_.synchronize(), 0);
+      draft_->executor.prepare_attention_metadata(draft_->kv_caches,
+                                                  binding.model_params());
+      draft_->executor.warmup_prepared_graph(binding.tokens(),
+                                             binding.positions(),
+                                             draft_->kv_caches,
+                                             binding.model_params());
+      // Warm every Slot's context binding, even if synthetic Tasks only
+      // retire through the first Slot. No live or reserved KV row is written.
+      auto& target_input = *slot.validate_input;
+      slot.target_output = executor_.forward(target_input.tokens(),
+                                             target_input.positions(),
+                                             kv_caches_,
+                                             target_input.model_params());
+      const int64_t context_rows =
+          slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
+      auto context_slots = prefix(slot.context_slots_storage, context_rows);
+      context_slots.fill_(-1);
+      // Slot inputs clear the output-only warmup marker. Context capture
+      // explicitly needs it to admit this final borrowed binding.
+      auto& context_params = target_input.model_params();
+      const bool was_warmup = context_params.meta.is_graph_warmup;
+      context_params.meta.is_graph_warmup = true;
+      auto context_output = draft_->model.write_context_kv(
+          slot.target_output.aux_hidden_states.narrow(0, 0, context_rows),
+          target_input.positions().narrow(0, 0, context_rows),
+          context_slots,
+          draft_->kv_caches,
+          context_params);
+      context_params.meta.is_graph_warmup = was_warmup;
+      CHECK(context_output.hidden_states.defined());
+    }
+    CHECK_EQ(task_stream_.synchronize(), 0);
   }
   return Status();
 }
@@ -1117,6 +1179,10 @@ Status TaskExecutionPipeline::prepare_speculative(
       auto& binding = *invocation.input;
       if (block_draft()) {
         binding.model_params().embedding.input_embedding = torch::Tensor();
+        if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
+          binding.model_params().enable_graph =
+              capacity_.max_graph_batch_size != 0;
+        }
       } else {
         prepare_draft_state(slot, step, /*warmup=*/false);
       }
@@ -1126,9 +1192,11 @@ Status TaskExecutionPipeline::prepare_speculative(
       const uint32_t draft_rows = slot.rows * (block_draft() ? width - 1 : 1);
       if (block_draft()) {
         auto stream_guard = prepare_stream_.set_stream_guard();
-        for (const auto member : kRepeatedRows) {
-          if ((base.*member).defined()) {
-            params.*member = (base.*member).repeat_interleave(width - 1, 0);
+        if (speculative_capacity_->kind != SpeculativeTaskKind::DSPARK) {
+          for (const auto member : kRepeatedRows) {
+            if ((base.*member).defined()) {
+              params.*member = (base.*member).repeat_interleave(width - 1, 0);
+            }
           }
         }
         params.selected_token_idxes =
@@ -1522,6 +1590,44 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
                                 !selector_sampling.all_greedy_sample);
     slot.proposal.copy_(sampled.token_ids);
     invocation.sampled.probs = std::move(sampled.dense_probs);
+  } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
+    // DSpark's proposals form a Markov chain: row zero predicts from the
+    // anchor, and each later row consumes the preceding sampled proposal.
+    selector_sampling.logprobs = false;
+    selector_sampling.max_top_logprobs = 0;
+    selector_sampling.use_beam_search = false;
+    selector_sampling.selected_token_idxes =
+        prefix(slot.draft_sample_indices, /*rows=*/0);
+    selector_sampling.sample_idxes = selector_sampling.selected_token_idxes;
+    selector_sampling.return_probs =
+        speculative_capacity_->draft_sampling_mode ==
+            DraftSamplingMode::PROBABILISTIC &&
+        !selector_sampling.all_greedy_sample;
+    const auto base_logits = invocation.logits.view(
+        {slot.rows, steps, speculative_capacity_->common.vocab_size});
+    auto previous_tokens = slot.state->tokens_;
+    std::vector<torch::Tensor> probabilities;
+    if (selector_sampling.return_probs) {
+      probabilities.reserve(steps);
+    }
+    for (int64_t step = 0; step < steps; ++step) {
+      const auto bias = draft_->model.dspark_markov_bias(previous_tokens);
+      CHECK(bias.sizes() == base_logits.select(1, step).sizes());
+      auto step_logits = base_logits.select(1, step) + bias;
+      auto sampled = sampler_.forward(step_logits, selector_sampling);
+      // Reuse the existing consensus policy. Greedy TP logits are already
+      // replicated; random/CP proposals must agree before the next lookup.
+      synchronize_tokens(sampled.next_tokens,
+                         selector_sampling.all_greedy_sample);
+      slot.proposal.select(1, step).copy_(sampled.next_tokens);
+      previous_tokens = sampled.next_tokens;
+      if (selector_sampling.return_probs) {
+        probabilities.emplace_back(std::move(sampled.probs));
+      }
+    }
+    invocation.sampled.probs = selector_sampling.return_probs
+                                   ? torch::stack(probabilities, /*dim=*/1)
+                                   : torch::Tensor();
   } else {
     invocation.sampled = sample(*invocation.sampling, invocation.logits);
     slot.proposal.copy_(

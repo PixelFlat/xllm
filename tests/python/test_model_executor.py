@@ -2172,6 +2172,37 @@ def test_executor_accepts_prepared_data_parallel(model_type: str) -> None:
     assert executor.supports_prepared_metadata
 
 
+def test_prepared_dspark_graph_keeps_block_width_and_explicit_capacity_admission() -> None:
+    config = {
+        "model_type": "DSparkDraftModel",
+        "enable_task_pipeline": True,
+        "python_graph_backend": "aclgraph",
+        "num_speculative_tokens": 3,
+    }
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=1)
+    assert executor.supports_prepared_metadata
+    assert executor.decode_graph_runner is None
+    assert executor.prepared_graph_runner.max_batch == 3
+    assert executor.prepared_graph_runner._block_draft
+    executor._kv_bound = True
+    executor.prepared_graph_runner = MagicMock()
+    executor.context_kv_graph_runner = MagicMock()
+    executor.eager_runner = MagicMock()
+    metadata = SimpleNamespace(prepared_attention_state=object(), is_prefill=False, is_chunked_prefill=True)
+    tokens = torch.arange(3, dtype=torch.int32)
+    positions = torch.arange(3, dtype=torch.int32)
+    executor.execute(tokens, positions, metadata, enable_graph=True, is_graph_warmup=True)
+    executor.prepared_graph_runner.execute.assert_called_once()
+    executor.context_kv_graph_runner.warmup.assert_not_called()
+    executor.prepared_graph_runner.can_execute_block.return_value = False
+    output = executor.execute(tokens, positions, metadata, enable_graph=True)
+    assert output is executor.eager_runner.execute.return_value
+    assert executor.prepared_graph_runner.execute.call_count == 1
+
+
 @pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (2, 1), (1, 2), (1, 4)])
 def test_prepared_mtp_preserves_hidden_and_topk(dp_size: int, cp_size: int) -> None:
     backend = _PreparedStubAttentionBackend()
@@ -2206,7 +2237,7 @@ def test_prepared_mtp_preserves_hidden_and_topk(dp_size: int, cp_size: int) -> N
         executor.execute(tokens, positions, metadata, hidden, mtp_topk_indices=topk, enable_graph=True)
 
 
-@pytest.mark.parametrize("model_type", ["DFlashDraftModel", "DFlash2DraftModel"])
+@pytest.mark.parametrize("model_type", ["DFlashDraftModel", "DFlash2DraftModel", "DSparkDraftModel"])
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_prepared_block_draft_uses_device_lengths(model_type: str, dp_size: int) -> None:
     backend = _PreparedStubAttentionBackend()
@@ -2329,6 +2360,7 @@ def test_executor_selects_acl_graph_input_owner(model_type: str, dp_size: int, p
 def test_executor_selects_dspark_acl_graph_with_dp(dp_size: int) -> None:
     config = {
         "model_type": "DSparkDraftModel",
+        "num_speculative_tokens": 7,
         "dp_size": dp_size,
         "dp_rank": dp_size - 1,
         "python_graph_backend": "aclgraph",
@@ -2343,6 +2375,32 @@ def test_executor_selects_dspark_acl_graph_with_dp(dp_size: int) -> None:
     assert runner.dp_size == dp_size
     assert runner.dp_rank == dp_size - 1
     assert runner.max_batch == min((5 + dp_size - 1) // dp_size, 2)
+    assert executor.context_kv_graph_runner is not None
+
+
+def test_executor_warms_context_prefix_buckets_only_during_startup() -> None:
+    config = {
+        "model_type": "DSparkDraftModel",
+        "num_speculative_tokens": 7,
+        "python_graph_backend": "aclgraph",
+        "max_position_embeddings": 128,
+    }
+    with patch(
+        "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4)
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    executor.context_kv_graph_runner.warmup = MagicMock()
+    executor.decode_graph_runner.can_execute = MagicMock(return_value=False)
+    executor.eager_runner.execute = MagicMock(return_value=torch.zeros(14, 4))
+    tokens = torch.zeros(14, dtype=torch.int32)
+    positions = torch.zeros_like(tokens)
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=True, prepared_attention_state=None)
+    executor.execute(tokens, positions, metadata, is_graph_warmup=True)
+    executor.context_kv_graph_runner.warmup.assert_called_once_with(16)
+    executor.execute(tokens, positions, metadata)
+    executor.context_kv_graph_runner.warmup.assert_called_once_with(16)
 
 
 def test_eager_runner_skips_cp_for_empty_rank() -> None:

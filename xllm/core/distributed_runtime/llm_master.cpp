@@ -119,14 +119,12 @@ LLMMaster::LLMMaster(const Options& options)
   if (options_.enable_task_pipeline()) {
     const std::string& algorithm = options_.speculative_algorithm();
     const bool supported_speculation =
-        SpeculativeConfig::is_mtp_algorithm(algorithm) ||
-        algorithm == "DFlash" ||
-        SpeculativeConfig::is_dflash2_algorithm(algorithm);
+        SpeculativeConfig::supports_task_pipeline(algorithm);
     CHECK((engine_type == EngineType::LLM ||
            (engine_type == EngineType::SSM && supported_speculation)) &&
           options_.task_type() == "generate" &&
           !options_.enable_offline_inference())
-        << "Task pipeline requires online LLM, MTP, DFlash or DFlash2 "
+        << "Task pipeline requires online LLM, MTP, DFlash, DFlash2 or DSpark "
            "generation.";
     CHECK(master_status_ == MasterStatus::WAKEUP)
         << "Task pipeline must start with loaded weights.";

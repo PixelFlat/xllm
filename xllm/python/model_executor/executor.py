@@ -321,6 +321,7 @@ class ModelExecutor:
             raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
         self.decode_graph_runner = None
         self.prepared_graph_runner = None
+        self.context_kv_graph_runner = None
         self.inductor_runner = None
 
         if self.layerwise_split_size > 1 and graph_backend not in ("", "off", "none", "0"):
@@ -331,7 +332,11 @@ class ModelExecutor:
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
         self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
-        self._prepared_block_draft = config.get("model_type") in ("DFlashDraftModel", "DFlash2DraftModel")
+        self._prepared_dspark = config.get("model_type") == "DSparkDraftModel"
+        self._prepared_block_draft = self._prepared_dspark or config.get("model_type") in (
+            "DFlashDraftModel",
+            "DFlash2DraftModel",
+        )
         prepared_kv_split = int(config.get("kv_split_size", 0)) or cp_size
         dcp_group = distributed.dcp_group(device) if current_platform.is_npu() else None
         dcp_size = dcp_group.size() if dcp_group is not None else 1
@@ -349,6 +354,7 @@ class ModelExecutor:
             and (
                 config.get("model_type") in ("qwen3", "glm_moe_dsa", "glm_moe_dsa_mtp")
                 or (self._prepared_block_draft and graph_backend in ("", "off", "none", "0"))
+                or (self._prepared_dspark and config.get("enable_task_pipeline", False) and graph_backend == "aclgraph")
             )
             and prepared_kv
             and graph_backend in ("", "off", "none", "0", "aclgraph")
@@ -381,6 +387,13 @@ class ModelExecutor:
                 dp_rank,
             )
         elif graph_backend == "aclgraph":
+            if config.get("model_type") == "DSparkDraftModel":
+                from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAclGraphRunner
+
+                self.context_kv_graph_runner = ContextKvAclGraphRunner(model, device)
+                self._context_kv_draft_width = int(config.get("num_speculative_tokens", num_decoding_tokens))
+                if self._context_kv_draft_width <= 0:
+                    raise ValueError("DSpark context graphs require a positive speculative block width")
             from xllm.python.model_executor.runners.block_draft_acl_graph import (
                 BlockDraftAclGraphRunner,
             )
@@ -405,16 +418,19 @@ class ModelExecutor:
             if config.get("enable_task_pipeline", False):
                 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
-                if not self._supports_prepared_metadata or self._prepared_block_draft:
+                if not self._supports_prepared_metadata or (self._prepared_block_draft and not self._prepared_dspark):
                     raise ValueError("prepared ACL graphs require a supported target or MTP model")
                 self.prepared_graph_runner = PreparedAclGraphRunner(
                     execution_model,
                     self.attention_backend,
                     device,
-                    max_graph_tokens,
+                    local_graph_sequence_capacity * self._context_kv_draft_width * dp_size
+                    if self._prepared_dspark
+                    else max_graph_tokens,
                     dp_size,
                     dp_rank,
                     enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
+                    block_draft=self._prepared_dspark,
                 )
             else:
                 if config.get("model_type") == "DSparkDraftModel":
@@ -755,6 +771,8 @@ class ModelExecutor:
             self.prepared_graph_runner.bind_layer_caches(layer_caches)
         if self.inductor_runner is not None:
             self.inductor_runner.bind_layer_caches(layer_caches)
+        if self.context_kv_graph_runner is not None:
+            self.context_kv_graph_runner.bind_kv_caches(layer_caches)
         self._kv_bound = True
 
     @torch.inference_mode()
@@ -773,6 +791,13 @@ class ModelExecutor:
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+        if self.context_kv_graph_runner is not None and is_graph_warmup and self.prepared_graph_runner is None:
+            # Startup draft inputs have N physical query rows per request.
+            # Capture every accepted-row bucket up to the N+1 verify capacity,
+            # including prefixes not encountered in the synthetic warmup.
+            width = self._context_kv_draft_width
+            sequences = (input_ids.numel() + width - 1) // width
+            self.context_kv_graph_runner.warmup(sequences * (width + 1))
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
@@ -789,6 +814,12 @@ class ModelExecutor:
             if enable_graph and layer_synchronizer is None:
                 if self.prepared_graph_runner is None:
                     raise RuntimeError("prepared ACL graph runner is not enabled")
+                if self._prepared_dspark and not self.prepared_graph_runner.can_execute_block(
+                    input_ids, positions, metadata
+                ):
+                    # Explicit capacity admission, never exception fallback or
+                    # a new graph capture during a serving request.
+                    return self.eager_runner.execute(input_ids, positions, metadata, eplb=eplb)
                 return self.prepared_graph_runner.execute(
                     input_ids, positions, metadata, input_embedding, layer_synchronizer, mtp_topk_indices, eplb=eplb
                 )

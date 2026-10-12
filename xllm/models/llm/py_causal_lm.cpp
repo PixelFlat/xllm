@@ -330,6 +330,7 @@ PyCausalLM::PyCausalLM(const ModelContext& context)
 }
 
 PyCausalLM::~PyCausalLM() {
+  clear_python_object(context_kv_graph_runner_);
   clear_python_object(python_kv_caches_);
   clear_python_object(py_model_);
   clear_python_object(config_dict_);
@@ -476,6 +477,23 @@ ModelOutput PyCausalLM::write_context_kv(
   }
 #endif
   const py::object& python_kv_caches = get_or_build_python_kv_caches(kv_caches);
+  set_active_instance(this);
+  if (context_kv_graph_runner_ && !context_kv_graph_runner_.is_none() &&
+      input_params.meta.batch_forward_type.is_decode() &&
+      layer_synchronizer.is_none() &&
+      (!input_params.python_attention_metadata || input_params.enable_graph)) {
+    if (input_params.python_attention_metadata && input_params.enable_graph) {
+      py::object output = context_kv_graph_runner_.attr("execute_borrowed")(
+          target_hidden,
+          positions,
+          device_cache_slots,
+          py::arg("warmup") = input_params.meta.is_graph_warmup);
+      return ModelOutput(output.cast<torch::Tensor>());
+    }
+    py::object output = context_kv_graph_runner_.attr("execute")(
+        target_hidden, positions, device_cache_slots);
+    return ModelOutput(output.cast<torch::Tensor>());
+  }
   py::object output = py_model_.attr("write_context_kv")(target_hidden,
                                                          positions,
                                                          device_cache_slots,

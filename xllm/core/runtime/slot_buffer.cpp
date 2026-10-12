@@ -1370,6 +1370,8 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
   if (spec.model.max_tokens == 0 || spec.model.max_sequences == 0 ||
       spec.model.max_blocks_per_sequence == 0 ||
       (spec.context_only && !prefill) ||
+      (spec.sample_from_anchor &&
+       spec.kind != MtpInvocationKind::BLOCK_DRAFT) ||
       (prefill &&
        (spec.hidden_size == 0 ||
         spec.hidden_size > std::numeric_limits<int32_t>::max() ||
@@ -1395,9 +1397,10 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
   view.spec_ = spec;
   ModelInputCapacity capacity = spec.model;
   if (!prefill) {
-    view.rows_per_sequence_ = spec.kind != MtpInvocationKind::DRAFT
-                                  ? spec.num_speculative_tokens + 1
-                                  : (spec.draft_step == 0 ? 2U : 1U);
+    view.rows_per_sequence_ =
+        spec.kind != MtpInvocationKind::DRAFT
+            ? spec.num_speculative_tokens + (spec.sample_from_anchor ? 0U : 1U)
+            : (spec.draft_step == 0 ? 2U : 1U);
     view.first_offset_ =
         spec.kind != MtpInvocationKind::DRAFT
             ? 0

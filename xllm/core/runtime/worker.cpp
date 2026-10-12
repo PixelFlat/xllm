@@ -110,11 +110,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
     }
     CHECK(worker_type == WorkerType::LLM && options.task_type() == "generate" &&
           (!options.enable_speculative_decode() ||
-           ((SpeculativeConfig::is_mtp_algorithm(
-                 options.speculative_algorithm()) ||
-             options.speculative_algorithm() == "DFlash" ||
-             SpeculativeConfig::is_dflash2_algorithm(
-                 options.speculative_algorithm())) &&
+           (SpeculativeConfig::supports_task_pipeline(
+                options.speculative_algorithm()) &&
             !options.enable_adaptive_speculative_decode())) &&
           !options.enable_prefill_piecewise_graph() &&
           options.host_blocks_factor() <= 1.0 &&
@@ -124,7 +121,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !KVCacheConfig::get_instance().enable_xtensor() &&
           !LoadConfig::get_instance().enable_rolling_load() &&
           parallel_args.layerwise_split_size() == 1)
-        << "Task pipeline requires Python LLM or fixed MTP/DFlash/DFlash2 with "
+        << "Task pipeline requires Python LLM or fixed "
+           "MTP/DFlash/DFlash2/DSpark with "
            "a layerwise split of one, without offload.";
   }
   if (options.enable_speculative_decode()) {

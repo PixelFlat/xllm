@@ -72,6 +72,8 @@ struct MtpInputSpec {
   bool enable_mla = true;
   int32_t mask_token_id = 0;
   bool context_only = false;
+  // DSpark predicts the first proposal from the anchor, without a bonus row.
+  bool sample_from_anchor = false;
 };
 
 struct SlotBufferCapacity {

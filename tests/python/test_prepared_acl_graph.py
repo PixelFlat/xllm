@@ -28,6 +28,81 @@ from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRu
 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
 
+@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
+@torch.inference_mode()
+def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths() -> None:
+    from xllm.python.attention.backend import LayerCache
+    from xllm.python.layers.embedding import HiddenParallelEmbedding
+    from xllm.python.model_executor.runners.acl_graph import StaticGraphAttentionMetadata
+    from xllm.python.models.qwen3_dspark import Qwen3DSparkForCausalLM
+
+    config = {
+        "model_type": "DSparkDraftModel",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "intermediate_size": 128,
+        "max_position_embeddings": 32,
+        "vocab_size": 8,
+        "markov_rank": 2,
+        "dtype": "bfloat16",
+        "device": "npu:0",
+        "num_speculative_tokens": 3,
+        "python_graph_backend": "aclgraph",
+        "enable_task_pipeline": True,
+    }
+    torch.manual_seed(31)
+    model = Qwen3DSparkForCausalLM(config)
+    model.model.embed_tokens = HiddenParallelEmbedding(8, 64, 1, dtype=model.dtype, device=model.device)
+    model.model.fc.load_weight(torch.randn(64, 128), tp_rank=0)
+    for parameter in model.parameters():
+        parameter.normal_(std=0.1)
+    model.model._build_context_kv_buffers()
+    caches = [
+        (
+            torch.randn(1, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
+            torch.randn(1, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
+        )
+        for _ in range(2)
+    ]
+    executor = ModelExecutor(model, config, max_seqs_per_batch=1)
+    executor.bind_kv_caches([LayerCache(*pair) for pair in caches])
+    tokens = torch.tensor([1, 0, 0], dtype=torch.int32, device="npu:0")
+    positions = torch.arange(3, dtype=torch.int32, device="npu:0")
+    metadata = StaticGraphAttentionMetadata(
+        slot_mapping=positions.clone(),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        block_table=torch.zeros(1, 1, dtype=torch.int32, device="npu:0"),
+        q_seq_lens=torch.tensor([3], dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([3], dtype=torch.int32, device="npu:0"),
+        q_cu_seq_lens_host_values=[3],
+        kv_seq_lens=torch.tensor([8], dtype=torch.int32, device="npu:0"),
+        kv_seq_lens_host_values=[16],
+        is_chunked_prefill=True,
+    )
+    stream = torch.npu.Stream(device="npu:0")
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        executor.prepare_metadata(metadata)
+        executor.warmup_prepared_graph(tokens, positions, metadata)
+        entries = len(executor.prepared_graph_runner._prepared_graphs)
+        for length in (8, 13, 6, 16):
+            positions.copy_(torch.arange(length - 3, length, dtype=torch.int32, device="npu:0"))
+            metadata.slot_mapping.copy_(positions)
+            metadata.kv_seq_lens.fill_(length)
+            executor.prepare_metadata(metadata)
+            reference = executor.execute(tokens, positions, metadata).clone()
+            actual = executor.execute(tokens, positions, metadata, enable_graph=True)
+            torch.npu.synchronize()
+            torch.testing.assert_close(actual, reference)
+        assert len(executor.prepared_graph_runner._prepared_graphs) == entries
+        assert executor.prepared_graph_runner.prepared_replays == 4
+
+
 def _metadata(rows: int) -> SimpleNamespace:
     return SimpleNamespace(
         slot_mapping=torch.arange(rows, dtype=torch.int32),
@@ -69,6 +144,50 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> PreparedAclGraphRunner:
     result._allocate_entry = Mock(side_effect=AssertionError("owned input allocation"))
     result._fill_entry = Mock(side_effect=AssertionError("whole input copy"))
     return result
+
+
+def test_block_graph_borrows_views_and_keeps_fia_capacity_constant(runner: PreparedAclGraphRunner) -> None:
+    runner._block_draft = True
+    runner.attention_backend.page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(
+        side_effect=lambda metadata, **_: SimpleNamespace(
+            device_kv_lengths=metadata.kv_seq_lens,
+            kv_capacity=metadata.kv_seq_lens_host_values[0],
+        )
+    )
+    tokens = torch.arange(3, dtype=torch.int32)
+    positions = torch.arange(3, dtype=torch.int32)
+    metadata = _metadata(1)
+    metadata.slot_mapping = torch.arange(3, dtype=torch.int32)
+    metadata.block_table = torch.zeros(1, 64, dtype=torch.int32)
+    metadata.q_seq_lens = torch.tensor([3], dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = [3]
+    metadata.q_cu_seq_lens = torch.tensor([3], dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [2048]
+    metadata.is_chunked_prefill = True
+    runner.warmup_prepared(tokens, positions, metadata)
+    entry = runner._prepared_graphs[runner._prepared_binding(tokens, positions, metadata)]
+    assert entry.static_input_ids is tokens
+    assert entry.static_positions is positions
+    assert entry.static_metadata.kv_seq_lens is metadata.kv_seq_lens
+    assert entry.static_metadata.block_table.data_ptr() == metadata.block_table.data_ptr()
+    assert entry.static_metadata.block_table.shape == (1, 32)
+    assert entry.static_metadata.prepared_attention_state.device_kv_lengths is metadata.kv_seq_lens
+    assert entry.static_metadata.kv_seq_lens_host_values == [4096]
+    for length in (2080, 2200, 4096):
+        metadata.kv_seq_lens_host_values[:] = [length]
+        metadata.kv_seq_lens.fill_(length)
+        assert runner.can_execute_block(tokens, positions, metadata)
+        runner.execute(tokens, positions, metadata)
+        assert runner.attention_backend.prepare_graph_replay.call_args.args[0] is entry.static_metadata
+        assert entry.static_metadata.kv_seq_lens_host_values == [4096]
+    metadata.kv_seq_lens_host_values[:] = [4097]
+    assert not runner.can_execute_block(tokens, positions, metadata)
+    with pytest.raises(RuntimeError, match="warmed Slot binding"):
+        runner.can_execute_block(tokens.clone(), positions, metadata)
+    runner._allocate_entry.assert_not_called()
+    runner._fill_entry.assert_not_called()
+    assert runner._capture.call_count == 1
 
 
 def test_capture_shares_one_lazy_pool_across_runners_and_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -336,8 +455,10 @@ def test_prepared_executor_obeys_admission_and_propagates_replay_failure(runner:
     executor = object.__new__(ModelExecutor)
     executor._kv_bound = True
     executor._prepared_mtp = False
+    executor._prepared_dspark = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
+    executor.context_kv_graph_runner = None
     executor.prepared_graph_runner = runner
     executor.eager_runner = SimpleNamespace(execute=Mock(return_value="eager"))
     tokens = torch.arange(2, dtype=torch.int32)

@@ -77,10 +77,11 @@ class CountingModel final : public CausalLM {
                                const torch::Tensor& positions,
                                const torch::Tensor& device_cache_slots,
                                std::vector<KVCache>& /*kv_caches*/,
-                               const ModelInputParams& /*params*/) override {
+                               const ModelInputParams& params) override {
     context_hidden.emplace_back(target_hidden.clone());
     context_positions.emplace_back(positions.clone());
     context_slots.emplace_back(device_cache_slots.clone());
+    context_warmup.emplace_back(params.meta.is_graph_warmup);
     return ModelOutput(target_hidden);
   }
 
@@ -95,6 +96,14 @@ class CountingModel final : public CausalLM {
     return output;
   }
 
+  torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_tokens) override {
+    markov_inputs.emplace_back(previous_tokens.clone());
+    auto bias = torch::full({previous_tokens.numel(), 32}, -100.0, options_);
+    bias.scatter_(1, (previous_tokens + markov_increment).view({-1, 1}), 100.0);
+    return bias;
+  }
+
   void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
   torch::Device device() const override { return options_.device(); }
   const torch::TensorOptions& options() const override { return options_; }
@@ -105,6 +114,8 @@ class CountingModel final : public CausalLM {
 
   std::atomic<int32_t> logits_calls{0};
   bool block_draft = false;
+  int64_t markov_increment = 1;
+  std::vector<torch::Tensor> markov_inputs;
   std::vector<torch::Tensor> forward_inputs;
   std::vector<torch::Tensor> forward_positions;
   std::vector<torch::Tensor> forward_slots;
@@ -115,6 +126,7 @@ class CountingModel final : public CausalLM {
   std::vector<torch::Tensor> context_hidden;
   std::vector<torch::Tensor> context_positions;
   std::vector<torch::Tensor> context_slots;
+  std::vector<bool> context_warmup;
 
  private:
   torch::TensorOptions options_;
@@ -126,6 +138,15 @@ class PreparedTestExecutor final : public ExecutorImpl {
   bool supports_prepared_attention_metadata() const override { return true; }
   void prepare_attention_metadata(std::vector<KVCache>& /*kv_caches*/,
                                   ModelInputParams& /*params*/) override {}
+  // The model double stays eager; validate final Slot views during warmup.
+  void warmup_prepared_graph(const torch::Tensor& tokens,
+                             const torch::Tensor& positions,
+                             std::vector<KVCache>& /*kv_caches*/,
+                             const ModelInputParams& params) override {
+    EXPECT_GT(tokens.numel(), 0);
+    EXPECT_EQ(tokens.numel(), positions.numel());
+    EXPECT_EQ(tokens.numel(), params.attention.device.new_cache_slots.numel());
+  }
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
@@ -1030,6 +1051,142 @@ TEST_F(SpeculativePipelineTest,
                            torch::tensor({5, 6, 7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(decoded.sample_output.next_tokens,
                            torch::tensor({{4, 5, 6}}, torch::kInt64)));
+}
+
+TEST_F(SpeculativePipelineTest,
+       DSparkGraphWarmupPlansDraftBindingsOnlyForDecode) {
+  capacity_.kind = SpeculativeTaskKind::DSPARK;
+  capacity_.common.model.max_sequences = 1;
+  capacity_.common.slot_count = 2;
+  capacity_.common.max_graph_batch_size = 8;
+  capacity_.num_speculative_tokens = 7;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  draft_->block_draft = true;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+
+  for (const BatchForwardType::Value phase :
+       {BatchForwardType::PREFILL, BatchForwardType::CHUNKED_PREFILL}) {
+    auto warmup = input(false);
+    warmup.input_params.meta.batch_forward_type = phase;
+    warmup.input_params.meta.is_graph_warmup = true;
+    const auto output = execute(warmup);
+    EXPECT_TRUE(output.is_graph_warmup);
+    EXPECT_TRUE(torch::equal(output.sample_output.next_tokens,
+                             torch::tensor({3}, torch::kInt64)));
+    EXPECT_TRUE(draft_->forward_inputs.empty());
+  }
+  ASSERT_EQ(draft_->context_slots.size(), 2U);
+
+  auto decode_warmup = input(true);
+  decode_warmup.input_params.meta.is_graph_warmup = true;
+  const auto output = execute(decode_warmup);
+  EXPECT_TRUE(output.is_graph_warmup);
+  EXPECT_TRUE(
+      torch::equal(output.sample_output.next_tokens,
+                   torch::tensor({{4, 5, 6, 7, 8, 9, 10, 11}}, torch::kInt64)));
+  // Both Slots warm their final eight-row context binding without KV writes.
+  ASSERT_EQ(draft_->context_slots.size(), 5U);
+  for (uint32_t slot = 2; slot < 4; ++slot) {
+    EXPECT_TRUE(draft_->context_warmup[slot]);
+    EXPECT_TRUE(torch::equal(draft_->context_slots[slot].cpu(),
+                             torch::full({8}, -1, torch::kInt32)));
+  }
+  ASSERT_EQ(draft_->forward_inputs.size(), 1U);
+  EXPECT_EQ(draft_->forward_inputs.front().numel(), 7);
+
+  const auto next = execute(input(true, /*token=*/-1, /*position=*/3));
+  EXPECT_FALSE(next.is_graph_warmup);
+  EXPECT_TRUE(torch::equal(
+      next.sample_output.next_tokens,
+      torch::tensor({{12, 13, 14, 15, 16, 17, 18, 19}}, torch::kInt64)));
+  ASSERT_EQ(draft_->context_slots.size(), 6U);
+  EXPECT_FALSE(draft_->context_warmup.back());
+}
+
+TEST_F(SpeculativePipelineTest,
+       DSparkMarkovChainPublishesAcceptedContextAcrossBothSlots) {
+  capacity_.kind = SpeculativeTaskKind::DSPARK;
+  capacity_.common.model.max_sequences = 1;
+  capacity_.common.slot_count = 2;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  draft_->block_draft = true;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  execute(input(false));
+  auto first = pipeline_->submit(input(true));
+  ASSERT_TRUE(first.status.ok()) << first.status.message();
+  // The second Task reads the first Task's device state, not this stale
+  // scheduler placeholder. Both Slots remain live until their results retire.
+  auto second = pipeline_->submit(input(true, /*token=*/-1, /*position=*/3));
+  ASSERT_TRUE(second.status.ok()) << second.status.message();
+  auto first_result = pipeline_->take_result_async(first.task_id).get();
+  auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(first_result.status.ok()) << first_result.status.message();
+  ASSERT_TRUE(second_result.status.ok()) << second_result.status.message();
+  EXPECT_TRUE(torch::equal(first_result.output.sample_output.next_tokens,
+                           torch::tensor({{4, 5, 6}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(second_result.output.sample_output.next_tokens,
+                           torch::tensor({{7, 8, 9}}, torch::kInt64)));
+  ASSERT_EQ(draft_->forward_inputs.size(), 2U);
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs.front().cpu(),
+                           torch::tensor({3, 0}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(draft_->forward_positions.back().cpu(),
+                           torch::tensor({5, 6}, torch::kInt32)));
+  ASSERT_EQ(draft_->markov_inputs.size(), 4U);
+  for (uint32_t step = 0; step < 4; ++step) {
+    EXPECT_EQ(draft_->markov_inputs[step].cpu().item<int64_t>(),
+              step < 2 ? 3 + step : 4 + step);
+  }
+  EXPECT_TRUE(torch::equal(draft_->context_slots.back().cpu(),
+                           torch::tensor({5, 6, 7}, torch::kInt32)));
+}
+
+TEST_F(SpeculativePipelineTest,
+       DSparkRejectsWrongMarkovProposalsWithoutPublishingRejectedKv) {
+  capacity_.kind = SpeculativeTaskKind::DSPARK;
+  capacity_.common.model.max_sequences = 1;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  draft_->block_draft = true;
+  draft_->markov_increment = 2;
+  create();
+  execute(input(false));
+  const auto rejected = execute(input(true));
+  EXPECT_TRUE(torch::equal(rejected.sample_output.next_tokens,
+                           torch::tensor({{4, -1, -1}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(draft_->context_slots.back().cpu(),
+                           torch::tensor({2, -1, -1}, torch::kInt32)));
+  const auto next = execute(input(true, /*token=*/-1, /*position=*/3));
+  EXPECT_TRUE(torch::equal(next.sample_output.next_tokens,
+                           torch::tensor({{5, -1, -1}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(draft_->forward_inputs.back().cpu(),
+                           torch::tensor({4, 0}, torch::kInt32)));
+}
+
+TEST_F(SpeculativePipelineTest, DSparkRejectsUnsupportedTopologyBeforeLaunch) {
+  capacity_.kind = SpeculativeTaskKind::DSPARK;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  EXPECT_FALSE(TaskExecutionPipeline::create(
+                   state_thread_,
+                   {*target_, *target_executor_, target_cache_},
+                   {*draft_, *draft_executor_, draft_cache_},
+                   capacity_,
+                   pipeline_)
+                   .ok());
+  capacity_.common.model.max_sequences = 1;
+  capacity_.common.dp_size = 2;
+  EXPECT_FALSE(TaskExecutionPipeline::create(
+                   state_thread_,
+                   {*target_, *target_executor_, target_cache_},
+                   {*draft_, *draft_executor_, draft_cache_},
+                   capacity_,
+                   pipeline_)
+                   .ok());
+  EXPECT_EQ(pipeline_, nullptr);
 }
 
 TEST_F(SpeculativePipelineTest,

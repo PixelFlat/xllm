@@ -1549,6 +1549,19 @@ TEST(SpeculativeConfigTest, HostKVCacheSupportsModelBasedAlgorithms) {
   EXPECT_FALSE(SpeculativeConfig::supports_host_kv_cache("unknown"));
 }
 
+TEST(SpeculativeConfigTest, TaskPipelineAdmitsMtpAndBlockDraftAlgorithms) {
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("MTP"));
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("mtp"));
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("DFlash"));
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("DFlash2"));
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("dflash2"));
+  EXPECT_TRUE(SpeculativeConfig::supports_task_pipeline("DSpark"));
+
+  EXPECT_FALSE(SpeculativeConfig::supports_task_pipeline("Eagle3"));
+  EXPECT_FALSE(SpeculativeConfig::supports_task_pipeline("Suffix"));
+  EXPECT_FALSE(SpeculativeConfig::supports_task_pipeline("unknown"));
+}
+
 TEST(AuxHiddenCaptureTest, PreservesConfiguredLayerOrderAndResidual) {
   ModelArgs args;
   args.hidden_size(2).layers_to_capture({0, 2});
