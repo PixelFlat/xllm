@@ -20,9 +20,11 @@ limitations under the License.
 
 #include "core/framework/block/composite_block_manager.h"
 #include "core/framework/block/virtual_memory_kv_cache_block_manager.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/block/concurrent_block_manager_impl.h"
 #include "core/kv_cache/block/linear_state_block_manager.h"
+#include "core/kv_cache/prefix/kv_cache_event_publisher.h"
 #include "framework/model/model_input_params.h"
 
 namespace xllm {
@@ -33,6 +35,25 @@ BlockManagerPool::BlockManagerPool(const Options& options,
     : page_allocator_(page_allocator), options_(options) {
   CHECK(dp_size > 0) << "dp_size must be greater than 0";
   block_managers_.reserve(dp_size);
+  const std::string event_config =
+      KVCacheConfig::get_instance().kv_events_config();
+  if (!event_config.empty() || options_.event_journal()) {
+    CHECK(options_.enable_prefix_cache() && !options_.enable_virtual_memory() &&
+          !options_.enable_linear_state() && options_.manager_types().empty() &&
+          options_.hasher_type() == BlockHasherType::TEXT &&
+          !options_.enable_disagg_pd() && !options_.enable_kvcache_store())
+        << "KV events currently support text, flat KV prefix caches with local "
+           "Host offload; composite/MM/XTensor/PD/external stores need logical "
+           "residency observers";
+    if (!event_config.empty()) {
+      options_.event_journal(KvCacheEventJournal::get_instance());
+      event_publisher_ = std::make_unique<KvCacheEventPublisher>(
+          options_.event_journal(),
+          nlohmann::json::parse(event_config),
+          options_.model_id(),
+          dp_size);
+    }
+  }
 
   BlockManager::Options block_options;
   block_options.num_blocks(options_.num_blocks())
@@ -59,6 +80,10 @@ BlockManagerPool::BlockManagerPool(const Options& options,
       .instance_is_decode(options_.instance_is_decode());
 
   for (int32_t i = 0; i < dp_size; ++i) {
+    if (options_.event_journal()) {
+      block_options.event_journal(options_.event_journal())
+          .event_scope(KvCacheEventScope{options_.model_id(), i, "gpu"});
+    }
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
     // BlockManagerImpl, or a VirtualMemoryKVCacheBlockManager when
     // enable_virtual_memory (the builder picks); SWA / C4 / C128 come from
