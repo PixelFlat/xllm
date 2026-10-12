@@ -20,7 +20,6 @@ limitations under the License.
 
 #include "core/framework/block/composite_block_manager.h"
 #include "core/framework/block/virtual_memory_kv_cache_block_manager.h"
-#include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/block/concurrent_block_manager_impl.h"
 #include "core/kv_cache/block/linear_state_block_manager.h"
@@ -35,8 +34,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
     : page_allocator_(page_allocator), options_(options) {
   CHECK(dp_size > 0) << "dp_size must be greater than 0";
   block_managers_.reserve(dp_size);
-  const std::string event_config =
-      KVCacheConfig::get_instance().kv_events_config();
+  const std::string& event_config = options_.kv_events_config();
   if (!event_config.empty() || options_.event_journal()) {
     CHECK(options_.enable_prefix_cache() && !options_.enable_virtual_memory() &&
           !options_.enable_linear_state() && options_.manager_types().empty() &&

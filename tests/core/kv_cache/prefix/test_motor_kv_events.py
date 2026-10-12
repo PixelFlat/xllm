@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run the production prefix-cache fixture against an unmodified KVConductor.
+"""Run the production prefix-cache fixture against the supplied KVConductor.
 
 Usage: python tests/core/kv_cache/prefix/test_motor_kv_events.py
     --fixture /path/to/kv_cache_event_fixture --conductor /path/to/kv-conductor
@@ -17,6 +17,7 @@ Requires pyzmq and msgpack. Does not allocate NPU tensors or load a model.
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import json
 import select
@@ -24,6 +25,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -188,6 +190,152 @@ def _verify_lifecycle(fixture_binary: str, context: zmq.Context, ports: set[int]
             _terminate(fixture)
 
 
+def _verify_non_caching_draft(fixture_binary: str, ports: set[int], log: TextIO) -> None:
+    port = _free_ports(2, ports)
+    fixture = subprocess.Popen(
+        [fixture_binary, json.dumps({"endpoint": f"tcp://127.0.0.1:{port}"}), "--pool"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=log,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert _read_line(fixture) == "ready"
+        draft = json.loads(_command(fixture, op="create_draft", prefix_cache=False))
+        assert not draft["draft_journal_attached"] and not draft["draft_publisher_healthy"]
+        assert _command(fixture, op="store", rank=0, tokens=[800, 801]) == "ok"
+        state = json.loads(_command(fixture, op="state"))
+        assert len(state["events"]) == 1 and state["events"][0]["model_id"] == "fixture"
+        status = json.loads(_command(fixture, op="status"))
+        assert status["publisher_healthy"] and status["journal_enabled"]
+    finally:
+        _terminate(fixture)
+
+
+def _flood_subscriptions(
+    context: zmq.Context, endpoints: list[str], ready: threading.Event, stopped: threading.Event
+) -> list[int]:
+    # Each socket belongs to this worker. XSUB sends commands directly, avoiding
+    # SUB's local option deduplication. Both engine and pool receive sustained input.
+    with contextlib.ExitStack() as stack:
+        senders = [stack.enter_context(context.socket(zmq.XSUB)) for _ in endpoints]
+        counts = [0] * len(senders)
+        for sender, endpoint in zip(senders, endpoints):
+            sender.setsockopt(zmq.LINGER, 0)
+            sender.setsockopt(zmq.SNDHWM, 1000)
+            sender.connect(endpoint)
+        deadline = time.monotonic() + 20
+        while not stopped.is_set() and time.monotonic() < deadline:
+            for index, sender in enumerate(senders):
+                # Irrelevant topics avoid receiving the published KV data here.
+                command = bytes([1 if counts[index] % 2 == 0 else 0]) + b"noise"
+                try:
+                    sender.send(command, zmq.DONTWAIT)
+                    counts[index] += 1
+                except zmq.Again:
+                    stopped.wait(0.001)
+            if min(counts) >= 512:
+                ready.set()
+        return counts
+
+
+def _verify_subscription_load(
+    fixture_binary: str, context: zmq.Context, ports: set[int], log: TextIO
+) -> dict[str, Any]:
+    engine_port = _free_ports(2, ports)
+    pool_port = _free_ports(2, ports)
+    engine = f"tcp://127.0.0.1:{engine_port}"
+    pool = f"tcp://127.0.0.1:{pool_port}"
+    fixture = subprocess.Popen(
+        [fixture_binary, json.dumps({"endpoint": engine, "motor_pool_endpoint": pool}), "--pool"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=log,
+        text=True,
+        bufsize=1,
+    )
+    stopped = threading.Event()
+    ready = threading.Event()
+    try:
+        assert _read_line(fixture) == "ready"
+        for rank in range(2):
+            tokens = [950 + rank, 960 + rank]
+            assert _command(fixture, op="store", rank=rank, tokens=tokens) == "ok"
+            assert _command(fixture, op="copy", rank=rank, tokens=tokens) == "ok"
+        with contextlib.ExitStack() as stack:
+            subscribers = []
+            for rank in range(2):
+                for port, source in ((engine_port, "engine"), (pool_port, "pool")):
+                    subscriber = stack.enter_context(context.socket(zmq.SUB))
+                    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+                    subscriber.setsockopt(zmq.LINGER, 0)
+                    subscriber.connect(f"tcp://127.0.0.1:{port + rank}")
+                    subscribers.append((subscriber, source, rank))
+            # Establish all four subscriptions before starting the command load.
+            for subscriber, _, _ in subscribers:
+                assert subscriber.poll(3000), "subscription did not receive initial reset"
+                subscriber.recv_multipart()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                flood = executor.submit(_flood_subscriptions, context, [engine, pool], ready, stopped)
+                try:
+                    assert ready.wait(3), "subscription load did not start"
+                    tokens = [900, 901]
+                    assert _command(fixture, op="store", rank=0, tokens=tokens) == "ok"
+                    assert _command(fixture, op="copy", rank=0, tokens=tokens) == "ok"
+                    media: set[str] = set()
+                    pool_hashes: set[int] = set()
+                    host_hash: int | None = None
+                    deadline = time.monotonic() + 3
+                    engine_subscriber = subscribers[0][0]
+                    pool_subscriber = subscribers[1][0]
+                    while time.monotonic() < deadline:
+                        if engine_subscriber.poll(50):
+                            events = msgpack.unpackb(engine_subscriber.recv_multipart()[2], raw=False)[1]
+                            for event in events:
+                                if event["type"] == "BlockStored" and event["token_ids"] == tokens:
+                                    media.add(event["medium"])
+                                    if event["medium"] == "cpu":
+                                        host_hash = event["block_hashes"][0]
+                        if pool_subscriber.poll(50):
+                            events = msgpack.unpackb(pool_subscriber.recv_multipart()[2], raw=False)["events"]
+                            for event in events:
+                                if event["event_type"] == "stored":
+                                    pool_hashes.update(event["seq_hashes"])
+                        if media == {"gpu", "cpu"} and host_hash in pool_hashes:
+                            break
+                    assert media == {"gpu", "cpu"}, "subscription load starved residency publication"
+                    assert host_hash in pool_hashes, "subscription load starved Host pool publication"
+                    assert not flood.done(), "subscription load ended before shutdown"
+                    status = json.loads(_command(fixture, op="status"))
+                    assert status["publisher_healthy"] and status["journal_enabled"]
+                    started = time.monotonic()
+                    assert _command(fixture, op="stop") == "stopped"
+                    shutdown_seconds = time.monotonic() - started
+                    assert shutdown_seconds < 2, "subscription load blocked publisher shutdown"
+                finally:
+                    stopped.set()
+                commands = flood.result(timeout=3)
+            for subscriber, source, _ in subscribers:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if not subscriber.poll(100):
+                        continue
+                    payload = msgpack.unpackb(subscriber.recv_multipart()[2], raw=False)
+                    events = payload[1] if source == "engine" else payload["events"]
+                    key = "type" if source == "engine" else "event_type"
+                    cleared = "AllBlocksCleared" if source == "engine" else "cleared"
+                    if len(events) == 1 and events[0][key] == cleared:
+                        break
+                else:
+                    raise AssertionError(f"subscription load: missing final {source} clear")
+            assert fixture.wait(timeout=10) == 0
+            return {"commands_sent": commands, "shutdown_seconds": shutdown_seconds, "result": "passed"}
+    finally:
+        stopped.set()
+        _terminate(fixture)
+
+
 def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
     ports: set[int] = set()
     motor_port = _free_ports(1, ports)
@@ -231,7 +379,7 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                     "snapshot_interval_seconds": 60,
                 }
                 fixture = subprocess.Popen(
-                    [fixture_binary, json.dumps(config)],
+                    [fixture_binary, json.dumps(config), "--pool"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=fixture_log,
@@ -242,6 +390,10 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 # Populate caches before subscription to exercise snapshot recovery.
                 assert _command(fixture, op="store", rank=0, tokens=tokens) == "ok"
                 assert _command(fixture, op="store", rank=1, tokens=other) == "ok"
+                draft = json.loads(_command(fixture, op="create_draft", prefix_cache=True))
+                assert not draft["draft_journal_attached"] and not draft["draft_publisher_healthy"]
+                state = json.loads(_command(fixture, op="state"))
+                assert all(event["model_id"] == "fixture" for event in state["events"])
                 register(registration)
 
                 def _expect(name: str, query_tokens: list[int], rank: int, npu: int, cpu: int) -> None:
@@ -352,6 +504,10 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 _verify_lifecycle(fixture_binary, context, ports, fixture_log)
                 observed["disabled_directory_all_streams"] = "passed"
                 observed["shutdown_clear_all_streams"] = "passed"
+                observed["external_draft_target_reporting"] = "passed"
+                _verify_non_caching_draft(fixture_binary, ports, fixture_log)
+                observed["non_caching_draft_isolation"] = "passed"
+                observed["subscription_load"] = _verify_subscription_load(fixture_binary, context, ports, fixture_log)
                 report_path.write_text(json.dumps(observed, indent=2) + "\n")
                 logger.info("Motor integration passed; report: %s", report_path)
             except Exception:

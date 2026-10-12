@@ -169,6 +169,7 @@ class ZmqMessage final {
 };
 
 constexpr int32_t kMaxReplayFrames = 16;
+constexpr int32_t kMaxSubscriptionCommands = 64;
 constexpr int64_t kMaxReplayRequestBytes = 4096;
 constexpr int32_t kShutdownLingerMilliseconds = 200;
 
@@ -241,15 +242,16 @@ class EventSocket final {
 
   bool has_subscription(bool& subscribed) {
     std::array<uint8_t, 256> buffer{};
-    int32_t size = 0;
-    while ((size = zmq_recv(
-                socket_.get(), buffer.data(), buffer.size(), ZMQ_DONTWAIT)) >=
-           0) {
+    for (int32_t count = 0; count < kMaxSubscriptionCommands; ++count) {
+      const int32_t size =
+          zmq_recv(socket_.get(), buffer.data(), buffer.size(), ZMQ_DONTWAIT);
+      if (size < 0) {
+        return zmq_errno() == EAGAIN ||
+               check_zmq(-1, "KV event subscription receive");
+      }
       subscribed = subscribed || (size > 0 && buffer[0] == 1);
     }
-    if (zmq_errno() != EAGAIN) {
-      return check_zmq(-1, "KV event subscription receive");
-    }
+    // Yield even while commands remain, so publication and shutdown progress.
     return true;
   }
 
@@ -479,6 +481,9 @@ bool KvCacheEventPublisher::run_impl(
             (pools[rank] && !pools[rank]->has_subscription(subscription))) {
           return false;
         }
+      }
+      if (stopped_.load()) {
+        break;
       }
       const auto now = std::chrono::steady_clock::now();
       const bool snapshot = subscription || now >= next_snapshot;

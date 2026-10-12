@@ -251,6 +251,9 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(options_.is_draft_engine()
+                            ? std::string()
+                            : KVCacheConfig::get_instance().kv_events_config())
       .host_num_blocks(0)  // no host cache for vlm engine currently.
       .block_size(block_size)
       .enable_linear_state(enable_state_cache)

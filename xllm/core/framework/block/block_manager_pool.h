@@ -18,6 +18,7 @@ limitations under the License.
 #include <atomic>
 #include <map>
 #include <queue>
+#include <string>
 #include <vector>
 
 #include "core/kv_cache/block/block_manager.h"
@@ -34,6 +35,8 @@ class BlockManagerPool : public KVCacheManager {
   using HostBlockCounts = std::map<BlockType, uint32_t>;
 
   struct Options {
+    // Empty for caches that must not publish, including external draft caches.
+    PROPERTY(std::string, kv_events_config);
     PROPERTY(std::shared_ptr<KvCacheEventJournal>, event_journal);
     PROPERTY(uint32_t, num_blocks) = 0;
     PROPERTY(uint32_t, host_num_blocks) = 0;

@@ -22,15 +22,54 @@ limitations under the License.
 #include <memory>
 #include <string>
 
+#include "core/framework/block/block_manager_pool.h"
+#include "core/framework/block/composite_block_manager.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/prefix/kv_cache_event_publisher.h"
 
+namespace {
+
+class FixtureBlockManagerPool final : public xllm::BlockManagerPool {
+ public:
+  explicit FixtureBlockManagerPool(const Options& options)
+      : BlockManagerPool(options, /*dp_size=*/2) {}
+
+  xllm::BlockManager* device(int32_t rank) {
+    auto* composite =
+        static_cast<xllm::CompositeBlockManager*>(block_managers_[rank].get());
+    return composite->leaf_entries().at(xllm::BlockType::KV).leaf.get();
+  }
+
+  bool publisher_healthy() const {
+    return event_publisher_ && event_publisher_->healthy();
+  }
+
+  void stop_publisher() { event_publisher_.reset(); }
+};
+
+}  // namespace
+
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
-  CHECK_EQ(argc, 2) << "Expected publisher configuration JSON";
+  CHECK(argc == 2 || (argc == 3 && std::string(argv[2]) == "--pool"))
+      << "Expected publisher configuration JSON and optional --pool";
   auto journal = std::make_shared<xllm::KvCacheEventJournal>();
-  auto publisher = std::make_unique<xllm::KvCacheEventPublisher>(
-      journal, nlohmann::json::parse(argv[1]), "fixture", /*dp_size=*/2);
+  std::unique_ptr<xllm::KvCacheEventPublisher> publisher;
+  std::unique_ptr<FixtureBlockManagerPool> target_pool;
+  std::unique_ptr<FixtureBlockManagerPool> draft_pool;
+  if (argc == 3) {
+    // Keep global reporting enabled while the draft receives no event config.
+    xllm::KVCacheConfig::get_instance().kv_events_config(argv[1]);
+    xllm::BlockManagerPool::Options options;
+    options.num_blocks(64).block_size(2).model_id("fixture").kv_events_config(
+        argv[1]);
+    target_pool = std::make_unique<FixtureBlockManagerPool>(options);
+    journal = target_pool->options().event_journal();
+  } else {
+    publisher = std::make_unique<xllm::KvCacheEventPublisher>(
+        journal, nlohmann::json::parse(argv[1]), "fixture", /*dp_size=*/2);
+  }
   std::array<std::unique_ptr<xllm::BlockManagerImpl>, 2> devices;
   std::array<std::unique_ptr<xllm::BlockManagerImpl>, 2> hosts;
   for (int32_t rank = 0; rank < 2; ++rank) {
@@ -40,7 +79,9 @@ int main(int argc, char** argv) {
         .enable_prefix_cache(true)
         .event_journal(journal)
         .event_scope({"fixture", rank, "gpu"});
-    devices[rank] = std::make_unique<xllm::BlockManagerImpl>(options);
+    if (!target_pool) {
+      devices[rank] = std::make_unique<xllm::BlockManagerImpl>(options);
+    }
     options.event_scope({"fixture", rank, "cpu"});
     hosts[rank] = std::make_unique<xllm::BlockManagerImpl>(options);
   }
@@ -50,7 +91,11 @@ int main(int argc, char** argv) {
     const nlohmann::json command = nlohmann::json::parse(line);
     const std::string operation = command.at("op").get<std::string>();
     if (operation == "stop") {
-      publisher.reset();
+      if (target_pool) {
+        target_pool->stop_publisher();
+      } else {
+        publisher.reset();
+      }
       std::cout << "stopped" << std::endl;
       break;
     }
@@ -59,8 +104,32 @@ int main(int argc, char** argv) {
       continue;
     }
     if (operation == "status") {
-      std::cout << nlohmann::json({{"publisher_healthy", publisher->healthy()},
+      const bool healthy =
+          target_pool ? target_pool->publisher_healthy() : publisher->healthy();
+      std::cout << nlohmann::json({{"publisher_healthy", healthy},
                                    {"journal_enabled", journal->enabled()}})
+                       .dump()
+                << std::endl;
+      continue;
+    }
+    if (operation == "create_draft") {
+      CHECK(target_pool != nullptr);
+      xllm::BlockManagerPool::Options options;
+      options.num_blocks(64)
+          .block_size(2)
+          .model_id("draft")
+          .enable_prefix_cache(command.value("prefix_cache", true));
+      draft_pool = std::make_unique<FixtureBlockManagerPool>(options);
+      xllm::BlockManager* draft = draft_pool->device(0);
+      std::vector<xllm::Block> blocks = draft->allocate(1);
+      CHECK_EQ(blocks.size(), 1);
+      draft->cache(std::vector<int32_t>{700, 701}, blocks);
+      draft->deallocate(blocks);
+      std::cout << nlohmann::json(
+                       {{"draft_journal_attached",
+                         draft_pool->options().event_journal() != nullptr},
+                        {"draft_publisher_healthy",
+                         draft_pool->publisher_healthy()}})
                        .dump()
                 << std::endl;
       continue;
@@ -73,16 +142,17 @@ int main(int argc, char** argv) {
     const int32_t rank = command.at("rank").get<int32_t>();
     CHECK_GE(rank, 0);
     CHECK_LT(rank, 2);
+    xllm::BlockManager* device =
+        target_pool ? target_pool->device(rank) : devices[rank].get();
     if (operation == "store") {
       const auto tokens = command.at("tokens").get<std::vector<int32_t>>();
-      std::vector<xllm::Block> blocks =
-          devices[rank]->allocate(tokens.size() / 2);
+      std::vector<xllm::Block> blocks = device->allocate(tokens.size() / 2);
       CHECK_EQ(blocks.size(), tokens.size() / 2);
-      devices[rank]->cache(tokens, blocks);
-      devices[rank]->deallocate(blocks);
+      device->cache(tokens, blocks);
+      device->deallocate(blocks);
     } else if (operation == "copy") {
       const auto tokens = command.at("tokens").get<std::vector<int32_t>>();
-      std::vector<xllm::Block> source = devices[rank]->allocate_shared(tokens);
+      std::vector<xllm::Block> source = device->allocate_shared(tokens);
       CHECK_EQ(source.size(), tokens.size() / 2);
       std::vector<xllm::Block> blocks = hosts[rank]->allocate(source.size());
       CHECK_EQ(blocks.size(), source.size());
@@ -91,12 +161,12 @@ int main(int argc, char** argv) {
       }
       hosts[rank]->cache(blocks);
       hosts[rank]->deallocate(blocks);
-      devices[rank]->deallocate(source);
+      device->deallocate(source);
     } else if (operation == "clear") {
       const std::string medium = command.at("medium").get<std::string>();
       CHECK(medium == "gpu" || medium == "cpu");
-      xllm::BlockManagerImpl* manager =
-          (medium == "gpu" ? devices[rank] : hosts[rank]).get();
+      xllm::BlockManager* manager =
+          medium == "gpu" ? device : hosts[rank].get();
       const size_t capacity = manager->num_total_blocks();
       std::vector<xllm::Block> blocks = manager->allocate(capacity);
       CHECK_EQ(blocks.size(), capacity);

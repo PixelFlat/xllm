@@ -354,6 +354,9 @@ bool LLMEngine::allocate_kv_cache(
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
+      .kv_events_config(options_.is_draft_engine()
+                            ? std::string()
+                            : kv_cache_config.kv_events_config())
       .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,
                                    options_.num_speculative_tokens(),
                                    options_.speculative_algorithm()))
