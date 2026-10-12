@@ -32,6 +32,12 @@ add_subdirectory(spdlog)
 
 if(USE_NPU)
   add_subdirectory(torch_npu_ops)
+  # These internal ATB caches have incompatible namesakes in torch_npu's
+  # libop_plugin_atb. Keep their instances and methods local to each binary.
+  set_target_properties(torch_npu_kernels PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+  )
 endif()
 add_subdirectory(Mooncake)
 
