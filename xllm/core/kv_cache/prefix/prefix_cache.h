@@ -74,11 +74,11 @@ class PrefixCache {
   };
 
   void set_event_sink(std::shared_ptr<KvCacheEventJournal> journal,
-                      const KvCacheEventScope& scope) {
+                      KvCacheEventScope scope) {
     CHECK_EQ(num_blocks_, 0);
     CHECK(hasher_type_ == BlockHasherType::TEXT);
     event_journal_ = std::move(journal);
-    event_scope_ = scope;
+    event_scope_ = std::move(scope);
   }
 
   // Solid-prefix probe: walks the chain per block position, stops on the

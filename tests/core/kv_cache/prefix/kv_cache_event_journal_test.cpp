@@ -131,6 +131,32 @@ TEST(KvCacheEventJournalTest, IncrementalPaginationDoesNotSkipEvents) {
   EXPECT_EQ(rest["events"][1]["type"], "removed");
 }
 
+TEST(KvCacheEventJournalTest, HostSnapshotTracksEvictionAndDeviceOnlyUpdates) {
+  KvCacheEventJournal journal;
+  journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
+  journal.store_copy(kHost, kFirstHash);
+  const nlohmann::json host =
+      journal.read("", 0, /*limit=*/1024, /*medium=*/"cpu");
+  ASSERT_EQ(host["events"].size(), 1);
+  EXPECT_EQ(host["events"][0]["medium"], "cpu");
+  EXPECT_EQ(host["events"][0]["token_ids"], nlohmann::json({1, 2}));
+
+  journal.remove(kHost, kFirstHash);
+  const nlohmann::json removed = journal.read(
+      host["epoch"], host["cursor"], /*limit=*/1, /*medium=*/"cpu");
+  ASSERT_EQ(removed["events"].size(), 1);
+  EXPECT_EQ(removed["events"][0]["type"], "removed");
+  EXPECT_TRUE(
+      journal.read("", 0, /*limit=*/1024, /*medium=*/"cpu")["events"].empty());
+  EXPECT_EQ(journal.read("", 0)["events"].size(), 1);
+
+  journal.store(kDevice, kSecondHash, kFirstHash, {3, 4}, /*block_index=*/1);
+  const nlohmann::json filtered = journal.read(
+      removed["epoch"], removed["cursor"], /*limit=*/1, /*medium=*/"cpu");
+  EXPECT_TRUE(filtered["events"].empty());
+  EXPECT_GT(filtered["cursor"], removed["cursor"]);
+}
+
 TEST(KvCacheEventJournalTest, PendingOverflowClearsClaimsAndStopsCollection) {
   KvCacheEventJournal journal(/*capacity=*/4096, /*pending_capacity=*/2);
   const nlohmann::json initial = journal.read("", 0);

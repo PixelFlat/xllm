@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   CHECK_EQ(argc, 2) << "Expected publisher configuration JSON";
   auto journal = std::make_shared<xllm::KvCacheEventJournal>();
-  xllm::KvCacheEventPublisher publisher(
+  auto publisher = std::make_unique<xllm::KvCacheEventPublisher>(
       journal, nlohmann::json::parse(argv[1]), "fixture", /*dp_size=*/2);
   std::array<std::unique_ptr<xllm::BlockManagerImpl>, 2> devices;
   std::array<std::unique_ptr<xllm::BlockManagerImpl>, 2> hosts;
@@ -50,10 +50,24 @@ int main(int argc, char** argv) {
     const nlohmann::json command = nlohmann::json::parse(line);
     const std::string operation = command.at("op").get<std::string>();
     if (operation == "stop") {
+      publisher.reset();
+      std::cout << "stopped" << std::endl;
       break;
     }
     if (operation == "state") {
       std::cout << journal->read("", 0).dump() << std::endl;
+      continue;
+    }
+    if (operation == "status") {
+      std::cout << nlohmann::json({{"publisher_healthy", publisher->healthy()},
+                                   {"journal_enabled", journal->enabled()}})
+                       .dump()
+                << std::endl;
+      continue;
+    }
+    if (operation == "disable_events") {
+      journal->disable();
+      std::cout << "ok" << std::endl;
       continue;
     }
     const int32_t rank = command.at("rank").get<int32_t>();

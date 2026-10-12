@@ -47,16 +47,18 @@ class KvCacheEventJournal final {
   bool enabled() const;
   void disable();
 
-  void store(const KvCacheEventScope& scope,
+  void store(KvCacheEventScope scope,
              std::string hash,
              std::string parent_hash,
              std::vector<int32_t> tokens,
              uint32_t block_index);
-  void store_copy(const KvCacheEventScope& scope, const std::string& hash);
-  void remove(const KvCacheEventScope& scope, const std::string& hash);
+  void store_copy(KvCacheEventScope scope, std::string hash);
+  void remove(KvCacheEventScope scope, std::string hash);
+  // Filter before copying residency data; cursors still cover all updates.
   nlohmann::json read(const std::string& epoch,
                       uint64_t cursor,
-                      size_t limit = 1024);
+                      size_t limit = 1024,
+                      const std::string& medium = "");
 
  private:
   using Key = std::tuple<std::string, int32_t, std::string>;

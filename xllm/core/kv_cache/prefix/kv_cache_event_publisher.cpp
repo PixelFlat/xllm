@@ -168,6 +168,10 @@ class ZmqMessage final {
   bool valid_;
 };
 
+constexpr int32_t kMaxReplayFrames = 16;
+constexpr int64_t kMaxReplayRequestBytes = 4096;
+constexpr int32_t kShutdownLingerMilliseconds = 200;
+
 class EventSocket final {
  public:
   EventSocket(void* context,
@@ -188,6 +192,22 @@ class EventSocket final {
                    "KV event HWM")) {
       return;
     }
+    const int32_t verbose = 1;
+    if (type == ZMQ_XPUB &&
+        !check_zmq(
+            zmq_setsockopt(
+                socket_.get(), ZMQ_XPUB_VERBOSE, &verbose, sizeof(verbose)),
+            "KV event verbose subscriptions")) {
+      return;
+    }
+    if (type == ZMQ_ROUTER &&
+        !check_zmq(zmq_setsockopt(socket_.get(),
+                                  ZMQ_MAXMSGSIZE,
+                                  &kMaxReplayRequestBytes,
+                                  sizeof(kMaxReplayRequestBytes)),
+                   "KV replay maximum frame size")) {
+      return;
+    }
     const int32_t send_timeout = 0;
     if (!check_zmq(zmq_setsockopt(socket_.get(),
                                   ZMQ_SNDTIMEO,
@@ -202,6 +222,14 @@ class EventSocket final {
   }
 
   bool valid() const { return valid_; }
+  uint64_t sequence() const { return sequence_; }
+
+  bool set_linger(int32_t milliseconds) {
+    return check_zmq(
+        zmq_setsockopt(
+            socket_.get(), ZMQ_LINGER, &milliseconds, sizeof(milliseconds)),
+        "KV event shutdown linger");
+  }
 
   bool publish(const nlohmann::json& payload) {
     const auto bytes = sequence_bytes(++sequence_);
@@ -225,7 +253,11 @@ class EventSocket final {
     return true;
   }
 
-  bool replay(const std::function<nlohmann::json()>& snapshot) {
+  bool replay(const std::function<nlohmann::json()>& snapshot,
+              uint64_t stream_sequence) {
+    if (discarding_request_) {
+      return discard_request();
+    }
     ZmqMessage identity;
     if (!identity.valid()) {
       return false;
@@ -244,19 +276,39 @@ class EventSocket final {
     }
     bool more = zmq_msg_more(identity.get()) != 0;
     int32_t frames = 0;
-    while (more) {
+    int64_t request_bytes = 0;
+    bool valid_request = true;
+    while (more && frames < kMaxReplayFrames) {
       if (!check_zmq(zmq_msg_recv(frame.get(), socket_.get(), ZMQ_DONTWAIT),
                      "KV replay frame receive")) {
         return false;
       }
       more = zmq_msg_more(frame.get()) != 0;
-      if (++frames > 16) {
-        LOG(ERROR) << "KV replay request contains too many frames";
-        return false;
+      const size_t frame_size = zmq_msg_size(frame.get());
+      ++frames;
+      request_bytes += static_cast<int64_t>(frame_size);
+      valid_request =
+          valid_request && ((frames == 1 && frame_size == 0) ||
+                            (frames == 2 && frame_size == sizeof(uint64_t)));
+      if (request_bytes > kMaxReplayRequestBytes) {
+        discarding_request_ = more;
+        LOG(WARNING) << "Ignoring oversized KV replay request";
+        return true;
       }
     }
+    if (more) {
+      discarding_request_ = true;
+      LOG(WARNING) << "Ignoring KV replay request with too many frames";
+      return true;
+    }
+    if (!valid_request || frames != 2) {
+      LOG(WARNING) << "Ignoring malformed KV replay request";
+      return true;
+    }
     const auto packed = nlohmann::json::to_msgpack(snapshot());
-    const auto bytes = sequence_bytes(sequence_);
+    // Snapshot recovery uses the live engine watermark, not the ROUTER's
+    // independent counter. The next live batch follows this watermark.
+    const auto bytes = sequence_bytes(stream_sequence);
     if (!send_frame(socket_.get(),
                     zmq_msg_data(identity.get()),
                     zmq_msg_size(identity.get()),
@@ -277,10 +329,30 @@ class EventSocket final {
   }
 
  private:
+  bool discard_request() {
+    ZmqMessage frame;
+    if (!frame.valid()) {
+      return false;
+    }
+    // Drain across iterations so peer input cannot monopolize publication.
+    for (int32_t count = 0; discarding_request_ && count < kMaxReplayFrames;
+         ++count) {
+      if (zmq_msg_recv(frame.get(), socket_.get(), ZMQ_DONTWAIT) < 0) {
+        if (zmq_errno() == EAGAIN) {
+          return true;
+        }
+        return check_zmq(-1, "KV replay discard receive");
+      }
+      discarding_request_ = zmq_msg_more(frame.get()) != 0;
+    }
+    return true;
+  }
+
   std::unique_ptr<void, decltype(&zmq_close)> socket_;
   std::string topic_;
   uint64_t sequence_ = 0;
   bool valid_ = false;
+  bool discarding_request_ = false;
 };
 
 nlohmann::json engine_batch(const nlohmann::json& events, int32_t rank) {
@@ -399,104 +471,122 @@ bool KvCacheEventPublisher::run_impl(
   auto repair_until = next_snapshot;
   auto next_repair = next_snapshot;
   bool disabled_reported = false;
-  while (!stopped_.load()) {
-    bool subscription = false;
-    for (int32_t rank = 0; rank < dp_size; ++rank) {
-      if (!engines[rank]->has_subscription(subscription) ||
-          (pools[rank] && !pools[rank]->has_subscription(subscription))) {
-        return false;
+  const auto publish_loop = [&]() -> bool {
+    while (!stopped_.load()) {
+      bool subscription = false;
+      for (int32_t rank = 0; rank < dp_size; ++rank) {
+        if (!engines[rank]->has_subscription(subscription) ||
+            (pools[rank] && !pools[rank]->has_subscription(subscription))) {
+          return false;
+        }
       }
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const bool snapshot = subscription || now >= next_snapshot;
-    const nlohmann::json page = journal_->read(snapshot ? "" : epoch, cursor);
-    if (!journal_->enabled() && !disabled_reported) {
-      LOG(WARNING)
-          << "KV event collection disabled; publishing an empty directory "
-             "until engine restart";
-      disabled_reported = true;
-    }
-    const bool reset = page["reset"].get<bool>();
-    epoch = page["epoch"].get<std::string>();
-    cursor = page["cursor"].get<uint64_t>();
-    if (reset) {
-      next_snapshot = now + std::chrono::seconds(snapshot_seconds);
-      repair_until = now + std::chrono::seconds(2);
-      next_repair = now + std::chrono::milliseconds(250);
-    }
-    for (int32_t rank = 0; rank < dp_size; ++rank) {
-      nlohmann::json engine_events = nlohmann::json::array();
-      nlohmann::json pool_events = nlohmann::json::array();
+      const auto now = std::chrono::steady_clock::now();
+      const bool snapshot = subscription || now >= next_snapshot;
+      const nlohmann::json page = journal_->read(snapshot ? "" : epoch, cursor);
+      if (!journal_->enabled() && !disabled_reported) {
+        LOG(WARNING)
+            << "KV event collection disabled; publishing an empty directory "
+               "until engine restart";
+        disabled_reported = true;
+      }
+      const bool reset = page["reset"].get<bool>();
+      epoch = page["epoch"].get<std::string>();
+      cursor = page["cursor"].get<uint64_t>();
       if (reset) {
-        engine_events.push_back({{"type", "AllBlocksCleared"}});
-        pool_events.push_back(
-            {{"event_type", "cleared"}, {"medium", "cpu"}, {"dp_rank", rank}});
+        next_snapshot = now + std::chrono::seconds(snapshot_seconds);
+        repair_until = now + std::chrono::seconds(2);
+        next_repair = now + std::chrono::milliseconds(250);
       }
-      for (const auto& event : page["events"]) {
-        if (event["model_id"] != model_id || event["dp_rank"] != rank) {
+      for (int32_t rank = 0; rank < dp_size; ++rank) {
+        nlohmann::json engine_events = nlohmann::json::array();
+        nlohmann::json pool_events = nlohmann::json::array();
+        if (reset) {
+          engine_events.push_back({{"type", "AllBlocksCleared"}});
+          pool_events.push_back({{"event_type", "cleared"},
+                                 {"medium", "cpu"},
+                                 {"dp_rank", rank}});
+        }
+        for (const auto& event : page["events"]) {
+          if (event["model_id"] != model_id || event["dp_rank"] != rank) {
+            continue;
+          }
+          engine_events.push_back(engine_event(event));
+          if (event["medium"] == "cpu") {
+            pool_events.push_back(pool_event(event));
+          }
+        }
+        if (!engine_events.empty() &&
+            !engines[rank]->publish(engine_batch(engine_events, rank))) {
+          return false;
+        }
+        if (pools[rank] && !pool_events.empty() &&
+            !pools[rank]->publish({{"events", pool_events}})) {
+          return false;
+        }
+      }
+      // Engine and pool are separate ordered streams. Reconfirm current Host
+      // copies after a reset so either consumer's clear can finish first.
+      if (!pool_endpoint.empty() && now >= next_repair && now < repair_until) {
+        const nlohmann::json state =
+            journal_->read("", 0, /*limit=*/1024, /*medium=*/"cpu");
+        for (int32_t rank = 0; rank < dp_size; ++rank) {
+          nlohmann::json host_engine = nlohmann::json::array();
+          nlohmann::json host_pool = nlohmann::json::array();
+          for (const auto& event : state["events"]) {
+            if (event["model_id"] == model_id && event["dp_rank"] == rank &&
+                event["medium"] == "cpu") {
+              host_engine.push_back(engine_event(event));
+              host_pool.push_back(pool_event(event));
+            }
+          }
+          if (!host_engine.empty()) {
+            if (!engines[rank]->publish(engine_batch(host_engine, rank)) ||
+                (pools[rank] &&
+                 !pools[rank]->publish({{"events", host_pool}}))) {
+              return false;
+            }
+          }
+        }
+        next_repair = now + std::chrono::milliseconds(250);
+      }
+      for (int32_t rank = 0; rank < dp_size; ++rank) {
+        if (!replays[rank]) {
           continue;
         }
-        engine_events.push_back(engine_event(event));
-        if (event["medium"] == "cpu") {
-          pool_events.push_back(pool_event(event));
+        if (!replays[rank]->replay(
+                [&]() {
+                  const nlohmann::json state = journal_->read("", 0);
+                  nlohmann::json replay_events = nlohmann::json::array();
+                  replay_events.push_back({{"type", "AllBlocksCleared"}});
+                  for (const auto& event : state["events"]) {
+                    if (event["model_id"] == model_id &&
+                        event["dp_rank"] == rank) {
+                      replay_events.push_back(engine_event(event));
+                    }
+                  }
+                  return engine_batch(replay_events, rank);
+                },
+                engines[rank]->sequence())) {
+          return false;
         }
       }
-      if (!engine_events.empty() &&
-          !engines[rank]->publish(engine_batch(engine_events, rank))) {
-        return false;
-      }
-      if (pools[rank] && !pool_events.empty() &&
-          !pools[rank]->publish({{"events", pool_events}})) {
-        return false;
-      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    // Engine and pool are separate ordered streams. Reconfirm current Host
-    // copies after a reset so either consumer's clear can finish first.
-    if (now >= next_repair && now < repair_until) {
-      const nlohmann::json state = journal_->read("", 0);
-      for (int32_t rank = 0; rank < dp_size; ++rank) {
-        nlohmann::json host_engine = nlohmann::json::array();
-        nlohmann::json host_pool = nlohmann::json::array();
-        for (const auto& event : state["events"]) {
-          if (event["model_id"] == model_id && event["dp_rank"] == rank &&
-              event["medium"] == "cpu") {
-            host_engine.push_back(engine_event(event));
-            host_pool.push_back(pool_event(event));
-          }
-        }
-        if (!host_engine.empty()) {
-          if (!engines[rank]->publish(engine_batch(host_engine, rank)) ||
-              (pools[rank] && !pools[rank]->publish({{"events", host_pool}}))) {
-            return false;
-          }
-        }
-      }
-      next_repair = now + std::chrono::milliseconds(250);
-    }
-    for (int32_t rank = 0; rank < dp_size; ++rank) {
-      if (!replays[rank]) {
-        continue;
-      }
-      if (!replays[rank]->replay([&]() {
-            const nlohmann::json state = journal_->read("", 0);
-            nlohmann::json replay_events = nlohmann::json::array();
-            replay_events.push_back({{"type", "AllBlocksCleared"}});
-            for (const auto& event : state["events"]) {
-              if (event["model_id"] == model_id && event["dp_rank"] == rank) {
-                replay_events.push_back(engine_event(event));
-              }
-            }
-            return engine_batch(replay_events, rank);
-          })) {
-        return false;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return true;
+  };
+  const bool success = publish_loop();
+  if (!success) {
+    journal_->disable();
+    healthy_.store(false);
   }
+  // Normal stop and transport failure share bounded, best-effort invalidation.
+  // Keep the sockets alive while clearing all independent engine/pool streams.
   for (int32_t rank = 0; rank < dp_size; ++rank) {
+    engines[rank]->set_linger(kShutdownLingerMilliseconds);
     engines[rank]->publish(engine_batch(
         nlohmann::json::array({{{"type", "AllBlocksCleared"}}}), rank));
     if (pools[rank]) {
+      pools[rank]->set_linger(kShutdownLingerMilliseconds);
       pools[rank]->publish({{"events",
                              nlohmann::json::array({{{"event_type", "cleared"},
                                                      {"medium", "cpu"},
@@ -506,7 +596,7 @@ bool KvCacheEventPublisher::run_impl(
   replays.clear();
   pools.clear();
   engines.clear();
-  return true;
+  return success;
 }
 
 }  // namespace xllm

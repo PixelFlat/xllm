@@ -89,27 +89,26 @@ void KvCacheEventJournal::enqueue(Update update) {
   pending_.emplace_back(std::move(update));
 }
 
-void KvCacheEventJournal::store(const KvCacheEventScope& scope,
+void KvCacheEventJournal::store(KvCacheEventScope scope,
                                 std::string hash,
                                 std::string parent_hash,
                                 std::vector<int32_t> tokens,
                                 uint32_t block_index) {
   enqueue({Operation::STORE,
-           scope,
+           std::move(scope),
            std::move(hash),
            std::move(parent_hash),
            std::move(tokens),
            block_index});
 }
 
-void KvCacheEventJournal::store_copy(const KvCacheEventScope& scope,
-                                     const std::string& hash) {
-  enqueue({Operation::COPY, scope, hash, {}, {}, 0});
+void KvCacheEventJournal::store_copy(KvCacheEventScope scope,
+                                     std::string hash) {
+  enqueue({Operation::COPY, std::move(scope), std::move(hash), {}, {}, 0});
 }
 
-void KvCacheEventJournal::remove(const KvCacheEventScope& scope,
-                                 const std::string& hash) {
-  enqueue({Operation::REMOVE, scope, hash, {}, {}, 0});
+void KvCacheEventJournal::remove(KvCacheEventScope scope, std::string hash) {
+  enqueue({Operation::REMOVE, std::move(scope), std::move(hash), {}, {}, 0});
 }
 
 bool KvCacheEventJournal::apply(Update update) {
@@ -179,7 +178,8 @@ bool KvCacheEventJournal::apply(Update update) {
 
 nlohmann::json KvCacheEventJournal::read(const std::string& epoch,
                                          uint64_t cursor,
-                                         size_t limit) {
+                                         size_t limit,
+                                         const std::string& medium) {
   CHECK_GT(limit, 0);
   std::lock_guard<std::mutex> consumer_lock(consumer_mutex_);
   {
@@ -213,11 +213,14 @@ nlohmann::json KvCacheEventJournal::read(const std::string& epoch,
   auto& result = output["events"];
   if (reset) {
     std::vector<nlohmann::json> snapshot;
-    snapshot.reserve(residents_.size() * 2);
+    snapshot.reserve(residents_.size() * (medium.empty() ? 2 : 1));
     for (const auto& [key, entry] : residents_) {
-      for (const std::string& medium : entry.media) {
+      for (const std::string& resident_medium : entry.media) {
+        if (!medium.empty() && resident_medium != medium) {
+          continue;
+        }
         nlohmann::json event = entry.data;
-        event["medium"] = medium;
+        event["medium"] = resident_medium;
         snapshot.emplace_back(std::move(event));
       }
     }
@@ -231,8 +234,11 @@ nlohmann::json KvCacheEventJournal::read(const std::string& epoch,
   } else {
     for (const auto& event : events_) {
       if (event["sequence"].get<uint64_t>() > cursor) {
-        result.push_back(event);
         output["cursor"] = event["sequence"];
+        if (!medium.empty() && event["medium"] != medium) {
+          continue;
+        }
+        result.push_back(event);
         if (result.size() == limit) {
           break;
         }
