@@ -497,6 +497,199 @@ def _verify_subscription_load(
         _terminate(fixture)
 
 
+def _flood_replays(
+    context: zmq.Context, endpoints: list[str], ready: threading.Event, stopped: threading.Event
+) -> list[dict[str, Any]]:
+    with contextlib.ExitStack() as stack:
+        senders = [stack.enter_context(context.socket(zmq.DEALER)) for _ in endpoints]
+        pending = [0] * len(senders)
+        sent = [0] * len(senders)
+        completed = [0] * len(senders)
+        generations: list[dict[float, int]] = [{} for _ in senders]
+        monitors = []
+        for sender, endpoint in zip(senders, endpoints):
+            sender.setsockopt(zmq.LINGER, 0)
+            sender.setsockopt(zmq.SNDHWM, 64)
+            monitors.append(stack.enter_context(sender.get_monitor_socket(events=zmq.EVENT_HANDSHAKE_SUCCEEDED)))
+            sender.connect(endpoint)
+        for sender, monitor in zip(senders, monitors):
+            assert monitor.poll(3000), "replay sender did not complete its handshake"
+            monitor.recv_multipart()
+            sender.disable_monitor()
+        deadline = time.monotonic() + 20
+        while not stopped.is_set() and time.monotonic() < deadline:
+            for rank, sender in enumerate(senders):
+                while pending[rank] < 32:
+                    try:
+                        sender.send_multipart([b"", bytes(8)], zmq.DONTWAIT)
+                    except zmq.Again:
+                        break
+                    pending[rank] += 1
+                    sent[rank] += 1
+                while sender.poll(0):
+                    frames = sender.recv_multipart()
+                    assert len(frames) == 3 and frames[0] == b"" and len(frames[1]) == 8
+                    sequence = int.from_bytes(frames[1], "big")
+                    if sequence == 2**64 - 1:
+                        assert frames[2] == b""
+                        pending[rank] -= 1
+                        completed[rank] += 1
+                        assert pending[rank] >= 0
+                        continue
+                    payload = msgpack.unpackb(frames[2], raw=False)
+                    assert payload[2] == rank
+                    assert payload[1][0]["type"] == "AllBlocksCleared"
+                    generated_at = payload[0]
+                    assert generations[rank].get(generated_at, sequence) == sequence
+                    generations[rank][generated_at] = sequence
+            if min(completed) > 0:
+                ready.set()
+            stopped.wait(0.01)
+        return [
+            {"sent": sent[rank], "completed": completed[rank], "generations": sorted(generations[rank])}
+            for rank in range(len(senders))
+        ]
+
+
+def _query_replay(dealer: zmq.Socket) -> tuple[list[Any], int]:
+    dealer.send_multipart([b"", bytes(8)])
+    frames = dealer.recv_multipart()
+    assert len(frames) == 3 and frames[0] == b"" and len(frames[1]) == 8
+    sequence = int.from_bytes(frames[1], "big")
+    assert sequence != 2**64 - 1
+    payload = msgpack.unpackb(frames[2], raw=False)
+    end = dealer.recv_multipart()
+    assert end == [b"", (2**64 - 1).to_bytes(8, "big"), b""]
+    return payload, sequence
+
+
+def _verify_replay_load(fixture_binary: str, context: zmq.Context, ports: set[int], log: TextIO) -> dict[str, Any]:
+    engine_port = _free_ports(2, ports)
+    pool_port = _free_ports(2, ports)
+    replay_port = _free_ports(2, ports)
+    config = {
+        "endpoint": f"tcp://127.0.0.1:{engine_port}",
+        "motor_pool_endpoint": f"tcp://127.0.0.1:{pool_port}",
+        "replay_endpoint": f"tcp://127.0.0.1:{replay_port}",
+        "snapshot_interval_seconds": 60,
+    }
+    fixture = subprocess.Popen(
+        [fixture_binary, json.dumps(config)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=log,
+        text=True,
+        bufsize=1,
+    )
+    ready = threading.Event()
+    stopped = threading.Event()
+    try:
+        assert _read_line(fixture) == "ready"
+        tokens = [list(range(1200 + rank * 200, 1320 + rank * 200)) for rank in range(2)]
+        for rank in range(2):
+            assert _command(fixture, op="store", rank=rank, tokens=tokens[rank]) == "ok"
+            assert _command(fixture, op="copy", rank=rank, tokens=tokens[rank]) == "ok"
+        with contextlib.ExitStack() as stack:
+            subscribers = []
+            for rank in range(2):
+                for port, source in ((engine_port, "engine"), (pool_port, "pool")):
+                    subscriber = stack.enter_context(context.socket(zmq.SUB))
+                    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+                    subscriber.setsockopt(zmq.LINGER, 0)
+                    subscriber.connect(f"tcp://127.0.0.1:{port + rank}")
+                    subscribers.append((subscriber, source))
+            assert all(count > 0 for count in _collect_snapshots(subscribers, 3.2))
+            endpoints = [f"tcp://127.0.0.1:{replay_port + rank}" for rank in range(2)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                flood = executor.submit(_flood_replays, context, endpoints, ready, stopped)
+                try:
+                    assert ready.wait(3), "valid replay traffic did not start"
+                    # Concurrent normal clients must recover within Motor's
+                    # receive timeout despite pipelined requests on both DPs.
+                    clients = []
+                    for rank, endpoint in enumerate(endpoints):
+                        for _ in range(2):
+                            dealer = stack.enter_context(context.socket(zmq.DEALER))
+                            dealer.setsockopt(zmq.LINGER, 0)
+                            dealer.setsockopt(zmq.RCVTIMEO, 2000)
+                            dealer.connect(endpoint)
+                            clients.append((dealer, rank))
+                    normal_started = time.monotonic()
+                    for dealer, _ in clients:
+                        dealer.send_multipart([b"", bytes(8)])
+                    for dealer, rank in clients:
+                        frames = dealer.recv_multipart()
+                        payload = msgpack.unpackb(frames[2], raw=False)
+                        assert payload[2] == rank
+                        assert any(event["type"] == "BlockStored" for event in payload[1])
+                        assert dealer.recv_multipart()[1] == (2**64 - 1).to_bytes(8, "big")
+                    normal_seconds = time.monotonic() - normal_started
+                    assert normal_seconds < 2, "replay traffic starved normal clients"
+                    assert _command(fixture, op="clear", rank=0, medium="gpu") == "ok"
+                    new_tokens = [1800, 1801]
+                    assert _command(fixture, op="store", rank=0, tokens=new_tokens) == "ok"
+                    assert _command(fixture, op="copy", rank=0, tokens=new_tokens) == "ok"
+                    media: set[str] = set()
+                    deadline = time.monotonic() + 2
+                    while media != {"gpu", "cpu"} and time.monotonic() < deadline:
+                        engine = subscribers[0][0]
+                        if not engine.poll(50):
+                            continue
+                        events = msgpack.unpackb(engine.recv_multipart()[2], raw=False)[1]
+                        for event in events:
+                            if event["type"] == "BlockStored" and event["token_ids"] == new_tokens:
+                                media.add(event["medium"])
+                    assert media == {"gpu", "cpu"}, "replay traffic starved live residency events"
+                    for dealer, rank in clients[:2] + clients[2:3]:
+                        payload, sequence = _query_replay(dealer)
+                        assert payload[2] == rank and sequence > 0
+                        gpu = {
+                            tuple(event["token_ids"])
+                            for event in payload[1]
+                            if event["type"] == "BlockStored" and event["medium"] == "gpu"
+                        }
+                        expected = (
+                            {tuple(new_tokens)}
+                            if rank == 0
+                            else {tuple(tokens[rank][index : index + 2]) for index in range(0, len(tokens[rank]), 2)}
+                        )
+                        assert gpu == expected, "replay reused a stale or foreign-DP snapshot"
+                    assert not flood.done(), "valid replay traffic ended early"
+                    status = json.loads(_command(fixture, op="status"))
+                    assert status["publisher_healthy"] and status["journal_enabled"]
+                    started = time.monotonic()
+                    assert _command(fixture, op="stop") == "stopped"
+                    shutdown_seconds = time.monotonic() - started
+                    assert shutdown_seconds < 2, "replay traffic blocked publisher shutdown"
+                finally:
+                    stopped.set()
+                traffic = flood.result(timeout=3)
+            for rank, counts in enumerate(traffic):
+                generated = counts["generations"]
+                assert len(generated) >= 2, f"DP {rank}: no sustained replay recovery"
+                assert counts["completed"] > len(generated), f"DP {rank}: replay payloads were not coalesced"
+                assert all(b - a >= 0.9 for a, b in zip(generated, generated[1:])), (
+                    f"DP {rank}: replay snapshots regenerated without cooldown: {generated}"
+                )
+            for subscriber, source in subscribers:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if not subscriber.poll(100):
+                        continue
+                    payload = msgpack.unpackb(subscriber.recv_multipart()[2], raw=False)
+                    events = payload[1] if source == "engine" else payload["events"]
+                    key, cleared = ("type", "AllBlocksCleared") if source == "engine" else ("event_type", "cleared")
+                    if len(events) == 1 and events[0][key] == cleared:
+                        break
+                else:
+                    raise AssertionError(f"replay traffic: no final {source} clear")
+            assert fixture.wait(timeout=10) == 0
+            return {"traffic": traffic, "normal_client_seconds": normal_seconds, "shutdown_seconds": shutdown_seconds}
+    finally:
+        stopped.set()
+        _terminate(fixture)
+
+
 def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
     ports: set[int] = set()
     motor_port = _free_ports(1, ports)
@@ -672,6 +865,7 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 observed["subscription_snapshots"] = _verify_subscription_snapshots(
                     fixture_binary, context, ports, fixture_log
                 )
+                observed["replay_load"] = _verify_replay_load(fixture_binary, context, ports, fixture_log)
                 report_path.write_text(json.dumps(observed, indent=2) + "\n")
                 logger.info("Motor integration passed; report: %s", report_path)
             except Exception:

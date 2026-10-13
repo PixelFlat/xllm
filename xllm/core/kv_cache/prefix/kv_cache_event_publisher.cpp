@@ -22,9 +22,9 @@ limitations under the License.
 #include <charconv>
 #include <chrono>
 #include <cstring>
-#include <functional>
 #include <future>
 #include <limits>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -151,10 +151,30 @@ bool send_frame(void* socket, const void* data, size_t size, bool more) {
       "KV event send");
 }
 
+using ReplayPayload = std::shared_ptr<std::vector<uint8_t>>;
+
+void release_replay_payload(void* /*data*/, void* hint) {
+  std::unique_ptr<ReplayPayload> owner(static_cast<ReplayPayload*>(hint));
+}
+
 class ZmqMessage final {
  public:
   ZmqMessage()
       : valid_(check_zmq(zmq_msg_init(&message_), "KV replay frame init")) {}
+  explicit ZmqMessage(ReplayPayload payload) : valid_(false) {
+    // ZMQ keeps this shared owner until its last queued copy is released,
+    // even after the publisher's replay batch has gone out of scope.
+    auto owner = std::make_unique<ReplayPayload>(std::move(payload));
+    valid_ = check_zmq(zmq_msg_init_data(&message_,
+                                         (*owner)->data(),
+                                         (*owner)->size(),
+                                         &release_replay_payload,
+                                         owner.get()),
+                       "KV replay shared payload init");
+    if (valid_) {
+      owner.release();
+    }
+  }
   ~ZmqMessage() {
     if (valid_) {
       zmq_msg_close(&message_);
@@ -171,8 +191,10 @@ class ZmqMessage final {
 };
 
 constexpr int32_t kMaxReplayFrames = 16;
+constexpr int32_t kMaxReplayRequestsPerBatch = 16;
 constexpr int32_t kMaxSubscriptionCommands = 64;
 constexpr std::chrono::seconds kSubscriptionSnapshotInterval{1};
+constexpr std::chrono::seconds kReplaySnapshotInterval{1};
 constexpr int64_t kMaxReplayRequestBytes = 4096;
 constexpr int32_t kShutdownLingerMilliseconds = 200;
 
@@ -270,8 +292,11 @@ class EventSocket final {
     return true;
   }
 
-  bool replay(const std::function<nlohmann::json()>& snapshot,
-              uint64_t stream_sequence) {
+  template <typename Snapshot>
+  bool replay(const Snapshot& snapshot,
+              uint64_t stream_sequence,
+              bool& received) {
+    received = false;
     if (discarding_request_) {
       return discard_request();
     }
@@ -285,6 +310,7 @@ class EventSocket final {
       }
       return true;
     }
+    received = true;
     // vLLM replay: ROUTER receives [identity, empty, start_sequence]. A full
     // current snapshot also covers requests older than the bounded journal.
     ZmqMessage frame;
@@ -309,12 +335,14 @@ class EventSocket final {
                             (frames == 2 && frame_size == sizeof(uint64_t)));
       if (request_bytes > kMaxReplayRequestBytes) {
         discarding_request_ = more;
+        received = !more;
         LOG(WARNING) << "Ignoring oversized KV replay request";
         return true;
       }
     }
     if (more) {
       discarding_request_ = true;
+      received = false;
       LOG(WARNING) << "Ignoring KV replay request with too many frames";
       return true;
     }
@@ -322,7 +350,11 @@ class EventSocket final {
       LOG(WARNING) << "Ignoring malformed KV replay request";
       return true;
     }
-    const auto packed = nlohmann::json::to_msgpack(snapshot());
+    const auto& packed = snapshot();
+    ZmqMessage payload(packed);
+    if (!payload.valid()) {
+      return false;
+    }
     // Snapshot recovery uses the live engine watermark, not the ROUTER's
     // independent counter. The next live batch follows this watermark.
     const auto bytes = sequence_bytes(stream_sequence);
@@ -332,7 +364,8 @@ class EventSocket final {
                     true) ||
         !send_frame(socket_.get(), nullptr, 0, true) ||
         !send_frame(socket_.get(), bytes.data(), bytes.size(), true) ||
-        !send_frame(socket_.get(), packed.data(), packed.size(), false)) {
+        !check_zmq(zmq_msg_send(payload.get(), socket_.get(), ZMQ_DONTWAIT),
+                   "KV replay payload send")) {
       return false;
     }
     const auto end = sequence_bytes(UINT64_MAX);
@@ -376,6 +409,50 @@ class EventSocket final {
 nlohmann::json engine_batch(const nlohmann::json& events, int32_t rank) {
   return nlohmann::json::array({timestamp(), events, rank});
 }
+
+// Borrow the snapshot owned by this publisher iteration. Group once and lazily
+// serialize each requested DP; no cached state survives the replay batch.
+class ReplaySnapshotBatch final {
+ public:
+  ReplaySnapshotBatch(const nlohmann::json& state,
+                      const std::string& model_id,
+                      int32_t dp_size)
+      : events_(state["events"]), indices_(dp_size), payloads_(dp_size) {
+    for (auto& indices : indices_) {
+      indices.reserve(events_.size() / static_cast<size_t>(dp_size) + 1);
+    }
+    for (size_t index = 0; index < events_.size(); ++index) {
+      const auto& event = events_[index];
+      if (event["model_id"] != model_id) {
+        continue;
+      }
+      const int32_t rank = event["dp_rank"].get<int32_t>();
+      if (rank < 0 || rank >= dp_size) {
+        continue;
+      }
+      indices_[rank].emplace_back(index);
+    }
+  }
+
+  const ReplayPayload& payload(int32_t rank) {
+    auto& packed = payloads_[rank];
+    if (!packed) {
+      nlohmann::json events = nlohmann::json::array();
+      events.push_back({{"type", "AllBlocksCleared"}});
+      for (size_t index : indices_[rank]) {
+        events.push_back(KvCacheEventPublisher::engine_event(events_[index]));
+      }
+      packed = std::make_shared<std::vector<uint8_t>>(
+          nlohmann::json::to_msgpack(engine_batch(events, rank)));
+    }
+    return packed;
+  }
+
+ private:
+  const nlohmann::json& events_;
+  std::vector<std::vector<size_t>> indices_;
+  std::vector<ReplayPayload> payloads_;
+};
 
 }  // namespace
 
@@ -487,6 +564,7 @@ bool KvCacheEventPublisher::run_impl(
   uint64_t cursor = 0;
   auto next_snapshot = std::chrono::steady_clock::now();
   auto next_subscription_snapshot = next_snapshot;
+  auto next_replay_snapshot = next_snapshot;
   auto repair_until = next_snapshot;
   auto next_repair = next_snapshot;
   bool disabled_reported = false;
@@ -582,25 +660,46 @@ bool KvCacheEventPublisher::run_impl(
         }
         next_repair = now + std::chrono::milliseconds(250);
       }
-      for (int32_t rank = 0; rank < dp_size; ++rank) {
-        if (!replays[rank]) {
-          continue;
+      if (std::chrono::steady_clock::now() >= next_replay_snapshot) {
+        nlohmann::json replay_state;
+        std::optional<ReplaySnapshotBatch> replay_batch;
+        for (int32_t rank = 0; rank < dp_size; ++rank) {
+          if (!replays[rank]) {
+            continue;
+          }
+          // ROUTER fair-queues peers. Leave requests queued during cooldown;
+          // a bounded batch serves multiple peers without starving live work.
+          for (int32_t request = 0; request < kMaxReplayRequestsPerBatch;
+               ++request) {
+            bool received = false;
+            if (!replays[rank]->replay(
+                    [&]() -> const ReplayPayload& {
+                      if (!replay_batch) {
+                        // A reset already published in this iteration has the
+                        // same live watermarks and needs no second directory
+                        // walk.
+                        if (!reset) {
+                          replay_state = journal_->read("", 0);
+                        }
+                        replay_batch.emplace(
+                            reset ? page : replay_state, model_id, dp_size);
+                      }
+                      return replay_batch->payload(rank);
+                    },
+                    engines[rank]->sequence(),
+                    received)) {
+              return false;
+            }
+            if (!received) {
+              break;
+            }
+          }
         }
-        if (!replays[rank]->replay(
-                [&]() {
-                  const nlohmann::json state = journal_->read("", 0);
-                  nlohmann::json replay_events = nlohmann::json::array();
-                  replay_events.push_back({{"type", "AllBlocksCleared"}});
-                  for (const auto& event : state["events"]) {
-                    if (event["model_id"] == model_id &&
-                        event["dp_rank"] == rank) {
-                      replay_events.push_back(engine_event(event));
-                    }
-                  }
-                  return engine_batch(replay_events, rank);
-                },
-                engines[rank]->sequence())) {
-          return false;
+        if (replay_batch) {
+          // Payloads expire with this batch. Rebuild fresh state next time,
+          // rather than returning stale bytes with a newer live watermark.
+          next_replay_snapshot =
+              std::chrono::steady_clock::now() + kReplaySnapshotInterval;
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
