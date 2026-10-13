@@ -1056,7 +1056,7 @@ class DeepseekV3MLAAttention(Attention):
                 self.q_a_layernorm.weight,
                 self.q_b_proj.weight,
                 self.q_b_proj.weight_scale,
-                self.W_UK,
+                self._decode_latent_weight(hidden.shape[0]),
                 self.kv_a_layernorm.weight,
                 rope_cos,
                 rope_sin,
@@ -1135,6 +1135,9 @@ class DeepseekV3MLAAttention(Attention):
                 self.kv_a_layernorm.eps,
             )
         return q_c, q_latent, q_pe
+
+    def _decode_latent_weight(self, num_tokens: int) -> torch.Tensor:
+        return self.W_UK
 
     def _can_fuse_decode(self) -> bool:
         return self._use_fused_mla_decode and self._fused_mla_ready

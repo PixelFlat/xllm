@@ -368,6 +368,37 @@ def deepseek_mla_preprocess_decode(
     return q_c, q_latent, q_pe
 
 
+def _validate_decode_latent_weight(
+    weight: torch.Tensor,
+    num_heads: int,
+    nope_dim: int,
+    rope_dim: int,
+    latent_dim: int,
+) -> None:
+    if (
+        weight.ndim != 3
+        or weight.shape[0] != num_heads
+        or weight.shape[1] not in (nope_dim, nope_dim + rope_dim)
+        or weight.shape[2] != latent_dim
+    ):
+        raise ValueError("decode latent weight must be [heads, nope or full query dim, latent dim]")
+
+
+def _project_decode_latent_query(
+    query: torch.Tensor,
+    weight: torch.Tensor,
+    nope_dim: int,
+    rope_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.shape[1] == nope_dim + rope_dim:
+        query_rope = query.narrow(-1, nope_dim, rope_dim)
+        query_latent = atb_matmul_ein_sum(query, weight)
+    else:
+        query_nope, query_rope = query.split([nope_dim, rope_dim], dim=-1)
+        query_latent = atb_matmul_ein_sum(query_nope, weight)
+    return query_latent, query_rope
+
+
 @torch.library.custom_op(
     "xllm_python::deepseek_mla_preprocess_decode_dynamic",
     mutates_args={"kv_cache", "rope_cache"},
@@ -402,6 +433,7 @@ def deepseek_mla_preprocess_decode_dynamic(
     Fusion is enabled only when the indexer can consume the same INT8 Q-A as
     Q-B; otherwise it receives the normalized floating-point activation.
     """
+    _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
     forward_context = get_forward_context_or_none()
     graph_buffers = forward_context.execution_state if forward_context is not None else None
 
@@ -484,8 +516,7 @@ def deepseek_mla_preprocess_decode_dynamic(
         num_heads,
         qk_nope_head_dim + qk_rope_head_dim,
     )
-    q_nope, q_rope = q.split([qk_nope_head_dim, qk_rope_head_dim], dim=-1)
-    q_latent = atb_matmul_ein_sum(q_nope, w_uk)
+    q_latent, q_rope = _project_decode_latent_query(q, w_uk, qk_nope_head_dim, qk_rope_head_dim)
     num_tokens = hidden.shape[0]
     q_pe = torch_npu.npu_interleave_rope(
         q_rope.view(num_tokens, num_heads, 1, qk_rope_head_dim),
@@ -534,6 +565,7 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     hidden_scale: torch.Tensor | None = None,
     slot_mapping_int64: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
     del (
         qkv_weight,
         qkv_weight_scale,
