@@ -38,7 +38,46 @@ import zmq
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT))
 from scripts.logger import logger
-from tools.register_motor_kv_events import post_json, register
+
+
+def _rank_endpoint(endpoint: str, rank: int) -> str:
+    address, _, port = endpoint.rpartition(":")
+    return f"{address}:{int(port) + rank}"
+
+
+def _post_json(base_url: str, route: str, body: dict[str, Any]) -> Any:
+    request = urllib.request.Request(
+        base_url.rstrip("/") + route,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.load(response)
+
+
+def _register(args: argparse.Namespace) -> None:
+    for rank in range(args.dp_size):
+        body: dict[str, Any] = {
+            "instance_id": args.instance_id,
+            "type": "vllm",
+            "modelname": args.model,
+            "block_size": args.block_size,
+            "dp_rank": rank,
+            "tenant_id": args.tenant_id,
+        }
+        if args.unregister:
+            _post_json(args.conductor, "/unregister", body)
+            continue
+        # Bind each local Host pool to its exact DP, rather than sharing it
+        # across every DP on the node as a CPU-only pool registration would.
+        body["store_backend"] = "xllm"
+        body["medium_endpoints"] = {"npu": _rank_endpoint(args.engine_endpoint, rank)}
+        if args.pool_endpoint:
+            body["medium_endpoints"]["cpu"] = _rank_endpoint(args.pool_endpoint, rank)
+        if args.replay_endpoint:
+            body["replay_endpoint"] = _rank_endpoint(args.replay_endpoint, rank)
+        _post_json(args.conductor, "/register", body)
 
 
 def _free_ports(count: int, excluded: set[int]) -> int:
@@ -214,22 +253,32 @@ def _verify_non_caching_draft(fixture_binary: str, ports: set[int], log: TextIO)
 
 
 def _flood_subscriptions(
-    context: zmq.Context, endpoints: list[str], ready: threading.Event, stopped: threading.Event
+    context: zmq.Context,
+    endpoints: list[str],
+    ready: threading.Event,
+    stopped: threading.Event,
+    filters: tuple[bytes, ...] = (b"noise",),
 ) -> list[int]:
     # Each socket belongs to this worker. XSUB sends commands directly, avoiding
     # SUB's local option deduplication. Both engine and pool receive sustained input.
     with contextlib.ExitStack() as stack:
         senders = [stack.enter_context(context.socket(zmq.XSUB)) for _ in endpoints]
         counts = [0] * len(senders)
+        monitors = []
         for sender, endpoint in zip(senders, endpoints):
             sender.setsockopt(zmq.LINGER, 0)
             sender.setsockopt(zmq.SNDHWM, 1000)
+            monitors.append(stack.enter_context(sender.get_monitor_socket(events=zmq.EVENT_HANDSHAKE_SUCCEEDED)))
             sender.connect(endpoint)
+        for sender, monitor in zip(senders, monitors):
+            assert monitor.poll(3000), "subscription sender did not complete its handshake"
+            monitor.recv_multipart()
+            sender.disable_monitor()
         deadline = time.monotonic() + 20
         while not stopped.is_set() and time.monotonic() < deadline:
             for index, sender in enumerate(senders):
-                # Irrelevant topics avoid receiving the published KV data here.
-                command = bytes([1 if counts[index] % 2 == 0 else 0]) + b"noise"
+                subscription_filter = filters[(counts[index] // 2) % len(filters)]
+                command = bytes([1 if counts[index] % 2 == 0 else 0]) + subscription_filter
                 try:
                     sender.send(command, zmq.DONTWAIT)
                     counts[index] += 1
@@ -237,7 +286,119 @@ def _flood_subscriptions(
                     stopped.wait(0.001)
             if min(counts) >= 512:
                 ready.set()
+            # XSUB can drop commands before connection or at HWM. Exercise a
+            # sustained connected sender without saturating its local pipe.
+            stopped.wait(0.001)
         return counts
+
+
+def _collect_snapshots(subscribers: list[tuple[zmq.Socket, str]], seconds: float) -> list[int]:
+    poller = zmq.Poller()
+    for subscriber, _ in subscribers:
+        poller.register(subscriber, zmq.POLLIN)
+    counts = [0] * len(subscribers)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        readable = dict(poller.poll(50))
+        for index, (subscriber, source) in enumerate(subscribers):
+            if subscriber not in readable:
+                continue
+            payload = msgpack.unpackb(subscriber.recv_multipart()[2], raw=False)
+            events = payload[1] if source == "engine" else payload["events"]
+            key, cleared = ("type", "AllBlocksCleared") if source == "engine" else ("event_type", "cleared")
+            counts[index] += any(event[key] == cleared for event in events)
+    return counts
+
+
+def _verify_subscription_snapshots(
+    fixture_binary: str, context: zmq.Context, ports: set[int], log: TextIO
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    for name, topic in (("empty", ""), ("binary_long", "kv/缓存\x00" + "x" * 300)):
+        engine_port = _free_ports(2, ports)
+        pool_port = _free_ports(2, ports)
+        endpoints = [
+            (f"tcp://127.0.0.1:{port + rank}", source)
+            for rank in range(2)
+            for port, source in ((engine_port, "engine"), (pool_port, "pool"))
+        ]
+        config = {
+            "endpoint": f"tcp://127.0.0.1:{engine_port}",
+            "motor_pool_endpoint": f"tcp://127.0.0.1:{pool_port}",
+            "topic": topic,
+            "snapshot_interval_seconds": 60,
+        }
+        fixture = subprocess.Popen(
+            [fixture_binary, json.dumps(config)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            assert _read_line(fixture) == "ready"
+            for rank in range(2):
+                tokens = [970 + rank, 980 + rank]
+                assert _command(fixture, op="store", rank=rank, tokens=tokens) == "ok"
+                assert _command(fixture, op="copy", rank=rank, tokens=tokens) == "ok"
+            topic_bytes = topic.encode()
+            # Cover empty, short prefix, exact and >256-byte matching filters.
+            matching = (b"", topic_bytes[:8], topic_bytes, topic_bytes[:280])
+            with contextlib.ExitStack() as stack:
+                subscribers = []
+                for (endpoint, source), subscription_filter in zip(endpoints, matching):
+                    subscriber = stack.enter_context(context.socket(zmq.SUB))
+                    subscriber.setsockopt(zmq.SUBSCRIBE, subscription_filter)
+                    subscriber.setsockopt(zmq.LINGER, 0)
+                    subscriber.connect(endpoint)
+                    subscribers.append((subscriber, source))
+                initial = _collect_snapshots(subscribers, 2.2)
+                assert all(count > 0 for count in initial), f"{name}: matching subscriber did not recover"
+                stages: dict[str, Any] = {}
+                for stage, filters in (
+                    ("unmatched", (topic_bytes + b"suffix", topic_bytes[:-1] + b"y")),
+                    ("matched", matching),
+                ):
+                    ready = threading.Event()
+                    stopped = threading.Event()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        flood = executor.submit(
+                            _flood_subscriptions, context, [ep for ep, _ in endpoints], ready, stopped, filters
+                        )
+                        try:
+                            assert ready.wait(3), f"{name}/{stage}: subscription load did not start"
+                            # Commands sent while waiting for ready can already
+                            # produce a snapshot. Measure only the next window.
+                            for subscriber, _ in subscribers:
+                                while subscriber.poll(0):
+                                    subscriber.recv_multipart()
+                            counts = _collect_snapshots(subscribers, 2.5)
+                            assert not flood.done(), f"{name}/{stage}: load ended before observation"
+                            status = json.loads(_command(fixture, op="status"))
+                            assert status["publisher_healthy"] and status["journal_enabled"]
+                        finally:
+                            stopped.set()
+                        sent = flood.result(timeout=3)
+                    if stage == "unmatched":
+                        assert counts == [0] * len(subscribers), f"{name}: unmatched filters forced snapshots: {counts}"
+                    else:
+                        assert all(1 <= count <= 3 for count in counts), f"{name}: snapshot rate unbounded: {counts}"
+                    stages[stage] = {"snapshots": counts, "commands_sent": sent}
+                # A subscriber joining during the cooldown still gets cached state.
+                late = stack.enter_context(context.socket(zmq.SUB))
+                late.setsockopt(zmq.SUBSCRIBE, topic_bytes)
+                late.setsockopt(zmq.LINGER, 0)
+                late.connect(endpoints[0][0])
+                assert late.poll(3000), f"{name}: coalescing lost a late subscription"
+                frames = late.recv_multipart()
+                assert frames[0] == topic_bytes
+                events = msgpack.unpackb(frames[2], raw=False)[1]
+                assert any(event["type"] == "BlockStored" and event["token_ids"] == [970, 980] for event in events)
+                results[name] = stages
+        finally:
+            _terminate(fixture)
+    return results
 
 
 def _verify_subscription_load(
@@ -394,13 +555,13 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 assert not draft["draft_journal_attached"] and not draft["draft_publisher_healthy"]
                 state = json.loads(_command(fixture, op="state"))
                 assert all(event["model_id"] == "fixture" for event in state["events"])
-                register(registration)
+                _register(registration)
 
                 def _expect(name: str, query_tokens: list[int], rank: int, npu: int, cpu: int) -> None:
                     deadline = time.monotonic() + 8
                     result: dict[str, Any] = {}
                     while time.monotonic() < deadline:
-                        result = post_json(
+                        result = _post_json(
                             url, "/query", {"model": "fixture", "block_size": 2, "token_ids": query_tokens}
                         )
                         counts = result.get("default", {}).get("xllm-fixture", {}).get("DP", {}).get(str(rank), {})
@@ -418,7 +579,7 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 # Inspect the real multipart wire and replay termination marker.
                 with context.socket(zmq.SUB) as subscriber:
                     subscriber.setsockopt(zmq.SUBSCRIBE, b"")
-                    subscriber.setsockopt(zmq.RCVTIMEO, 1000)
+                    subscriber.setsockopt(zmq.RCVTIMEO, 3000)
                     subscriber.connect(engine)
                     frames = subscriber.recv_multipart()
                     assert len(frames) == 3 and len(frames[1]) == 8
@@ -484,21 +645,21 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
 
                 _terminate(conductor)
                 conductor = _start_conductor(conductor_binary, motor_port, motor_log)
-                register(registration)
+                _register(registration)
                 _expect("conductor_restart", tokens, 0, 0, 3)
                 _expect("other_dp_after_restart", other, 1, 3, 0)
                 assert _command(fixture, op="clear", rank=0, medium="cpu") == "ok"
                 _expect("host_eviction", tokens, 0, 0, 0)
                 deadline = time.monotonic() + 2.2
                 while time.monotonic() < deadline:
-                    result = post_json(url, "/query", {"model": "fixture", "block_size": 2, "token_ids": tokens})
+                    result = _post_json(url, "/query", {"model": "fixture", "block_size": 2, "token_ids": tokens})
                     counts = result.get("default", {}).get("xllm-fixture", {}).get("DP", {}).get("0", {})
                     assert counts.get("npu_blocks", 0) == 0 and counts.get("cpu_blocks", 0) == 0
                     time.sleep(0.1)
                 observed["host_eviction_during_repair"] = "passed"
                 _expect("unaffected_dp", other, 1, 3, 0)
                 registration.unregister = True
-                register(registration)
+                _register(registration)
                 _expect("unregister", other, 1, 0, 0)
                 assert _command(fixture, op="state")
                 _verify_lifecycle(fixture_binary, context, ports, fixture_log)
@@ -508,6 +669,9 @@ def _run(fixture_binary: str, conductor_binary: str, report_path: Path) -> None:
                 _verify_non_caching_draft(fixture_binary, ports, fixture_log)
                 observed["non_caching_draft_isolation"] = "passed"
                 observed["subscription_load"] = _verify_subscription_load(fixture_binary, context, ports, fixture_log)
+                observed["subscription_snapshots"] = _verify_subscription_snapshots(
+                    fixture_binary, context, ports, fixture_log
+                )
                 report_path.write_text(json.dumps(observed, indent=2) + "\n")
                 logger.info("Motor integration passed; report: %s", report_path)
             except Exception:

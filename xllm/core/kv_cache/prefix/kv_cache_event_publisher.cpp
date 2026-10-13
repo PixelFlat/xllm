@@ -21,10 +21,12 @@ limitations under the License.
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <limits>
 #include <set>
+#include <vector>
 
 namespace xllm {
 
@@ -170,6 +172,7 @@ class ZmqMessage final {
 
 constexpr int32_t kMaxReplayFrames = 16;
 constexpr int32_t kMaxSubscriptionCommands = 64;
+constexpr std::chrono::seconds kSubscriptionSnapshotInterval{1};
 constexpr int64_t kMaxReplayRequestBytes = 4096;
 constexpr int32_t kShutdownLingerMilliseconds = 200;
 
@@ -180,7 +183,9 @@ class EventSocket final {
               const std::string& endpoint,
               int32_t hwm,
               const std::string& topic)
-      : socket_(zmq_socket(context, type), &zmq_close), topic_(topic) {
+      : socket_(zmq_socket(context, type), &zmq_close),
+        topic_(topic),
+        subscription_buffer_(topic.size() + 1) {
     if (!socket_) {
       check_zmq(-1, "KV event socket");
       return;
@@ -241,15 +246,25 @@ class EventSocket final {
   }
 
   bool has_subscription(bool& subscribed) {
-    std::array<uint8_t, 256> buffer{};
     for (int32_t count = 0; count < kMaxSubscriptionCommands; ++count) {
-      const int32_t size =
-          zmq_recv(socket_.get(), buffer.data(), buffer.size(), ZMQ_DONTWAIT);
+      const int32_t size = zmq_recv(socket_.get(),
+                                    subscription_buffer_.data(),
+                                    subscription_buffer_.size(),
+                                    ZMQ_DONTWAIT);
       if (size < 0) {
         return zmq_errno() == EAGAIN ||
                check_zmq(-1, "KV event subscription receive");
       }
-      subscribed = subscribed || (size > 0 && buffer[0] == 1);
+      if (size <= 0 || subscription_buffer_[0] != 1) {
+        continue;
+      }
+      // ZMQ filters are binary prefixes of the published topic. recv reports
+      // the full frame size even when truncated; longer filters cannot match.
+      const size_t filter_size = static_cast<size_t>(size - 1);
+      subscribed = subscribed || (filter_size <= topic_.size() &&
+                                  std::memcmp(subscription_buffer_.data() + 1,
+                                              topic_.data(),
+                                              filter_size) == 0);
     }
     // Yield even while commands remain, so publication and shutdown progress.
     return true;
@@ -352,6 +367,7 @@ class EventSocket final {
 
   std::unique_ptr<void, decltype(&zmq_close)> socket_;
   std::string topic_;
+  std::vector<uint8_t> subscription_buffer_;
   uint64_t sequence_ = 0;
   bool valid_ = false;
   bool discarding_request_ = false;
@@ -470,9 +486,11 @@ bool KvCacheEventPublisher::run_impl(
   std::string epoch;
   uint64_t cursor = 0;
   auto next_snapshot = std::chrono::steady_clock::now();
+  auto next_subscription_snapshot = next_snapshot;
   auto repair_until = next_snapshot;
   auto next_repair = next_snapshot;
   bool disabled_reported = false;
+  bool subscription_pending = false;
   const auto publish_loop = [&]() -> bool {
     while (!stopped_.load()) {
       bool subscription = false;
@@ -486,7 +504,10 @@ bool KvCacheEventPublisher::run_impl(
         break;
       }
       const auto now = std::chrono::steady_clock::now();
-      const bool snapshot = subscription || now >= next_snapshot;
+      subscription_pending = subscription_pending || subscription;
+      const bool snapshot =
+          now >= next_snapshot ||
+          (subscription_pending && now >= next_subscription_snapshot);
       const nlohmann::json page = journal_->read(snapshot ? "" : epoch, cursor);
       if (!journal_->enabled() && !disabled_reported) {
         LOG(WARNING)
@@ -498,6 +519,7 @@ bool KvCacheEventPublisher::run_impl(
       epoch = page["epoch"].get<std::string>();
       cursor = page["cursor"].get<uint64_t>();
       if (reset) {
+        subscription_pending = false;
         next_snapshot = now + std::chrono::seconds(snapshot_seconds);
         repair_until = now + std::chrono::seconds(2);
         next_repair = now + std::chrono::milliseconds(250);
@@ -528,6 +550,12 @@ bool KvCacheEventPublisher::run_impl(
             !pools[rank]->publish({{"events", pool_events}})) {
           return false;
         }
+      }
+      if (reset) {
+        // Coalesce joins across sockets and iterations without losing a join
+        // received during the cooldown. Incremental events continue meanwhile.
+        next_subscription_snapshot =
+            std::chrono::steady_clock::now() + kSubscriptionSnapshotInterval;
       }
       // Engine and pool are separate ordered streams. Reconfirm current Host
       // copies after a reset so either consumer's clear can finish first.
