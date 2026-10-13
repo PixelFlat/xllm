@@ -152,6 +152,29 @@ def _atb_matmul_ein_sum_out_fake(input: torch.Tensor, weight: torch.Tensor, out:
     return out
 
 
+def _mla_query_rope_out_fake(
+    query: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    patterns: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    tokens = query.shape[0]
+    if query.shape != (tokens, 4, 256) or tokens not in (1, 4, 16) or query.dtype != torch.bfloat16:
+        raise ValueError("MLA query RoPE requires BF16 [T,4,256] for T=1/4/16")
+    if cos.shape != (tokens, 1, 1, 64) or sin.shape != cos.shape:
+        raise ValueError("MLA query RoPE coefficients must be [T,1,1,64]")
+    if patterns.shape != (2, 64) or patterns.dtype != torch.int32:
+        raise ValueError("MLA query RoPE gather patterns must be int32 [2,64]")
+    if output.shape != (tokens, 4, 64):
+        raise ValueError("MLA query RoPE output must be [T,4,64]")
+    if any(value.dtype != query.dtype for value in (cos, sin, output)):
+        raise ValueError("MLA query RoPE coefficients and output must have the query dtype")
+    if any(value.device != query.device or not value.is_contiguous() for value in (query, cos, sin, patterns, output)):
+        raise ValueError("MLA query RoPE tensors must be contiguous and on the same device")
+    return output
+
+
 def _chunk_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1269,6 +1292,7 @@ register_fake("xllm_ops::fused_add_gemma_rms_norm", _fused_add_gemma_rms_norm_fa
 register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
+register_fake("xllm_ops::mla_query_rope_out", _mla_query_rope_out_fake)
 register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)

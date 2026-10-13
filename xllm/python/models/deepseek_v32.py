@@ -1073,6 +1073,7 @@ class DeepseekV3MLAAttention(Attention):
                 fuse_q_norm_quant,
                 hidden_scale,
                 slot_mapping_int64[: hidden.shape[0]] if slot_mapping_int64 is not None else None,
+                self._decode_query_rope_patterns_for(hidden.shape[0]),
             )
             if fuse_q_norm_quant:
                 q_c = (q_c, q_c_scale)
@@ -1138,6 +1139,9 @@ class DeepseekV3MLAAttention(Attention):
 
     def _decode_latent_weight(self, num_tokens: int) -> torch.Tensor:
         return self.W_UK
+
+    def _decode_query_rope_patterns_for(self, num_tokens: int) -> torch.Tensor | None:
+        return None
 
     def _can_fuse_decode(self) -> bool:
         return self._use_fused_mla_decode and self._fused_mla_ready
