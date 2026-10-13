@@ -153,6 +153,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME strided_mla_kv_cache
+  WRAPPER_SRCS strided_mla_kv_cache_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME greedy_prefix_verify
   WRAPPER_SRCS greedy_prefix_verify_wrapper.cpp
 )

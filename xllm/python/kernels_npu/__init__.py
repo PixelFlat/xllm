@@ -62,6 +62,8 @@ _EXPORTS = {
         "supports_mla_preprocess_v2",
         "supports_mla_kv_cache_slot_reuse",
         "supports_strided_q_a_quant_out",
+        "supports_strided_mla_kv_cache_out",
+        "supports_strided_mla_kv_cache_layout",
     ),
     "moe": (
         "cutlass_fused_moe",
@@ -202,6 +204,8 @@ __all__ = [
     "prepare_mla_preprocess_v2_qkv",
     "supports_mla_preprocess_v2",
     "supports_mla_kv_cache_slot_reuse",
+    "supports_strided_mla_kv_cache_out",
+    "supports_strided_mla_kv_cache_layout",
     "quant_matmul",
     "quant_matmul_out",
     "quantize_per_tensor",

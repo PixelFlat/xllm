@@ -236,6 +236,52 @@ def _strided_indexer_layer_norm_out_fake(
     return None
 
 
+def _strided_mla_kv_cache_out_fake(
+    projection: torch.Tensor,
+    gamma: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    slots: torch.Tensor,
+    patterns: torch.Tensor,
+    latent_cache: torch.Tensor,
+    rope_cache: torch.Tensor,
+) -> None:
+    if projection.ndim != 2 or projection.shape[1] != 2624 or projection.dtype != torch.bfloat16:
+        raise ValueError("Strided MLA KV requires a BF16 [T,2624] projection")
+    tokens = projection.shape[0]
+    if tokens not in (1, 2, 4, 8, 16):
+        raise ValueError("Strided MLA KV supports T=1/2/4/8/16")
+    if gamma.shape != (512,) or gamma.dtype != torch.bfloat16:
+        raise ValueError("Strided MLA KV gamma must be BF16 [512]")
+    if any(value.shape != (tokens, 1, 1, 64) or value.dtype != torch.bfloat16 for value in (cos, sin)):
+        raise ValueError("Strided MLA KV angles must be BF16 [T,1,1,64]")
+    if slots.shape != (tokens,) or slots.dtype != torch.int64:
+        raise ValueError("Strided MLA KV slots must be INT64 [T]")
+    if patterns.shape != (2, 64) or patterns.dtype != torch.int32:
+        raise ValueError("Strided MLA KV patterns must be INT32 [2,64]")
+    if (
+        latent_cache.ndim not in (3, 4)
+        or rope_cache.ndim != latent_cache.ndim
+        or latent_cache.shape[:-1] != rope_cache.shape[:-1]
+        or latent_cache.shape[-1] != 512
+        or rope_cache.shape[-1] != 64
+        or latent_cache.dtype != torch.bfloat16
+        or rope_cache.dtype != torch.bfloat16
+        or (latent_cache.ndim == 4 and latent_cache.shape[2] != 1)
+        or not 0 < latent_cache.numel() <= 2**31 - 1
+    ):
+        raise ValueError("Strided MLA KV requires matching single-head PA caches with INT32-safe offsets")
+    inputs = (projection, gamma, cos, sin, slots, patterns)
+    tensors = (*inputs, latent_cache, rope_cache)
+    if any(value.device != projection.device or not value.is_contiguous() for value in tensors):
+        raise ValueError("Strided MLA KV tensors must be contiguous and on the same device")
+    if any(torch._C._is_alias_of(cache, value) for cache in (latent_cache, rope_cache) for value in inputs):
+        raise ValueError("Strided MLA KV caches must not alias inputs")
+    if torch._C._is_alias_of(latent_cache, rope_cache):
+        raise ValueError("Strided MLA KV caches must have independent storage")
+    return None
+
+
 def _rope_table_gather_out_fake(
     cache: torch.Tensor,
     positions: torch.Tensor,
@@ -1387,6 +1433,7 @@ register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
 register_fake("xllm_ops::mla_query_rope_out", _mla_query_rope_out_fake)
 register_fake("xllm_ops::strided_q_a_rms_norm_dynamic_quant_out", _strided_q_a_rms_norm_dynamic_quant_out_fake)
 register_fake("xllm_ops::strided_indexer_layer_norm_out", _strided_indexer_layer_norm_out_fake)
+register_fake("xllm_ops::strided_mla_kv_cache_out", _strided_mla_kv_cache_out_fake)
 register_fake("xllm_ops::rope_table_gather_out", _rope_table_gather_out_fake)
 register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)

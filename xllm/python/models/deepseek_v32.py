@@ -1075,6 +1075,7 @@ class DeepseekV3MLAAttention(Attention):
                 slot_mapping_int64[: hidden.shape[0]] if slot_mapping_int64 is not None else None,
                 self._decode_query_rope_patterns_for(hidden.shape[0]),
                 self._use_strided_q_a_quant_for(hidden.shape[0]),
+                self._decode_kv_rope_patterns_for(hidden.shape[0], context.kv_cache, context.rope_cache),
             )
             if fuse_q_norm_quant:
                 q_c = (q_c, q_c_scale)
@@ -1146,6 +1147,11 @@ class DeepseekV3MLAAttention(Attention):
 
     def _use_strided_q_a_quant_for(self, num_tokens: int) -> bool:
         return False
+
+    def _decode_kv_rope_patterns_for(
+        self, num_tokens: int, kv_cache: torch.Tensor, rope_cache: torch.Tensor
+    ) -> torch.Tensor | None:
+        return None
 
     def _can_fuse_decode(self) -> bool:
         return self._use_fused_mla_decode and self._fused_mla_ready

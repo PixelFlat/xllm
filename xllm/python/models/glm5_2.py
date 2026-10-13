@@ -499,6 +499,7 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         super().__init__(cfg, layer_id, dtype, device)
         self._attn_dp_layout: AttnDpLayout | None = None
         self._decode_strided_q_a_ready = False
+        self._decode_strided_kv_ready = False
         self.register_buffer("_decode_w_uk", None, persistent=False)
         self.register_buffer("_decode_query_rope_patterns", None, persistent=False)
         self.register_buffer("W_UV_owner", torch.empty(0, dtype=dtype, device=device), persistent=False)
@@ -538,11 +539,13 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         self._decode_w_uk = None
         self._decode_query_rope_patterns = None
         self._decode_strided_q_a_ready = False
+        self._decode_strided_kv_ready = False
         if getattr(self, "_attn_dp_layout", None) is None:
             super().process_weights_after_loading()
             self._prepare_decode_latent_weight()
             self._prepare_decode_query_rope()
             self._prepare_decode_q_a_quant()
+            self._prepare_decode_kv_cache()
             return
         if self.o_proj._dynamic_activation and owner_kv_b_proj is None:
             raise ValueError("dynamic attention DP requires the owner TP shard of kv_b_proj")
@@ -683,6 +686,37 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
             and ctx.cp_context is None
             and num_tokens in (1, 2, 4, 8, 16)
         )
+
+    def _prepare_decode_kv_cache(self) -> None:
+        """Select the direct PA writer after the packed projection is ready."""
+        self._decode_strided_kv_ready = False
+        weight = self.kv_a_layernorm.weight
+        if (
+            self._decode_strided_q_a_ready
+            and self._decode_query_rope_patterns is not None
+            and kernels.supports_strided_mla_kv_cache_out(self.kv_a_layernorm.eps)
+            and weight.device.type in ("npu", "privateuseone")
+            and weight.dtype == torch.bfloat16
+            and weight.shape == (512,)
+            and weight.is_contiguous()
+        ):
+            self._decode_strided_kv_ready = True
+
+    def _decode_kv_rope_patterns_for(
+        self, num_tokens: int, kv_cache: torch.Tensor, rope_cache: torch.Tensor
+    ) -> torch.Tensor | None:
+        ctx = get_forward_context()
+        if (
+            self._decode_strided_kv_ready
+            and ctx.execution_state is not None
+            and not ctx.metadata.is_prefill
+            and not ctx.metadata.is_chunked_prefill
+            and ctx.cp_context is None
+            and num_tokens in (1, 2, 4, 8, 16)
+            and kernels.supports_strided_mla_kv_cache_layout(kv_cache, rope_cache)
+        ):
+            return self._decode_query_rope_patterns
+        return None
 
     def _init_a_projections(self, cfg: Glm52Config, device: torch.device) -> None:
         self._combined_qkv: W8A8AttentionLinear | None = None

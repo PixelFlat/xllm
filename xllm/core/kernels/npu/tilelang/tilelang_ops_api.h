@@ -144,6 +144,18 @@ void strided_indexer_layer_norm_out(const torch::Tensor& projection,
                                     torch::Tensor& key,
                                     torch::Tensor& weights);
 
+// Consume BF16 [T,2624] packed projection without an intermediate KV copy.
+// PA caches remain caller-owned; valid unique slots are INT64 [T]. Negative
+// slots are padding. T is 1/2/4/8/16 and RMS epsilon is 1e-5.
+void strided_mla_kv_cache_out(const torch::Tensor& projection,
+                              const torch::Tensor& gamma,
+                              const torch::Tensor& cos,
+                              const torch::Tensor& sin,
+                              const torch::Tensor& slots,
+                              const torch::Tensor& patterns,
+                              torch::Tensor& latent_cache,
+                              torch::Tensor& rope_cache);
+
 // Copy valid angle-table rows to independent contiguous consumer outputs.
 // Cache is BF16 [1048576,64]; positions are contiguous INT32/INT64 [T].
 // Valid positions are in [-1048576,1048576); T is 1, 2, 4, 8 or 16.

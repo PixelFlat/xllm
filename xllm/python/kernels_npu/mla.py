@@ -39,6 +39,7 @@ _KV_RMSNORM_ROPE_CACHE = getattr(
     None,
 )
 _STRIDED_Q_A_QUANT_OUT = getattr(torch.ops.xllm_ops, "strided_q_a_rms_norm_dynamic_quant_out", None)
+_STRIDED_MLA_KV_CACHE_OUT = getattr(torch.ops.xllm_ops, "strided_mla_kv_cache_out", None)
 # ModelArgs stores epsilon as a C++ float before exporting it to Python.
 # Accept only the literal and its exact FP32 representation, not nearby values.
 _STRIDED_Q_A_QUANT_EPSILONS = (1e-5, struct.unpack("f", struct.pack("f", 1e-5))[0])
@@ -47,6 +48,44 @@ _STRIDED_Q_A_QUANT_EPSILONS = (1e-5, struct.unpack("f", struct.pack("f", 1e-5))[
 def supports_strided_q_a_quant_out(epsilon: float = 1e-5) -> bool:
     """Whether the initialized native library provides direct Q-A quantization."""
     return _STRIDED_Q_A_QUANT_OUT is not None and epsilon in _STRIDED_Q_A_QUANT_EPSILONS
+
+
+def supports_strided_mla_kv_cache_out(epsilon: float = 1e-5) -> bool:
+    """Whether the initialized library provides the fixed-epsilon KV writer."""
+    return _STRIDED_MLA_KV_CACHE_OUT is not None and epsilon in _STRIDED_Q_A_QUANT_EPSILONS
+
+
+def supports_strided_mla_kv_cache_layout(kv_cache: torch.Tensor, rope_cache: torch.Tensor) -> bool:
+    """Select the direct writer only for its supported one-head PA storage."""
+    return (
+        kv_cache.device.type in ("npu", "privateuseone")
+        and kv_cache.device == rope_cache.device
+        and kv_cache.dtype == rope_cache.dtype == torch.bfloat16
+        and kv_cache.ndim == rope_cache.ndim
+        and kv_cache.ndim in (3, 4)
+        and kv_cache.shape[:-1] == rope_cache.shape[:-1]
+        and kv_cache.shape[-1] == 512
+        and rope_cache.shape[-1] == 64
+        and (kv_cache.ndim == 3 or kv_cache.shape[2] == 1)
+        and 0 < kv_cache.numel() <= 2**31 - 1
+        and kv_cache.is_contiguous()
+        and rope_cache.is_contiguous()
+        and torch_npu.get_npu_format(kv_cache) in (torch_npu.Format.ND, torch_npu.Format.NCHW)
+        and torch_npu.get_npu_format(rope_cache) in (torch_npu.Format.ND, torch_npu.Format.NCHW)
+    )
+
+
+def _validate_strided_mla_kv_cache_geometry(
+    tokens: int, kv_lora_rank: int, q_lora_rank: int, qk_rope_head_dim: int, epsilon: float
+) -> None:
+    if (
+        tokens not in (1, 2, 4, 8, 16)
+        or kv_lora_rank != 512
+        or q_lora_rank != 2048
+        or qk_rope_head_dim != 64
+        or epsilon not in _STRIDED_Q_A_QUANT_EPSILONS
+    ):
+        raise ValueError("Strided KV requires supported decode graph geometry")
 
 
 def _validate_strided_q_a_quant_geometry(
@@ -472,6 +511,7 @@ def deepseek_mla_preprocess_decode_dynamic(
     slot_mapping_int64: torch.Tensor | None = None,
     query_rope_patterns: torch.Tensor | None = None,
     strided_q_a_quant: bool = False,
+    kv_rope_patterns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Preprocess MLA and return Q-A and the activation scale used by Q-B.
 
@@ -487,6 +527,21 @@ def deepseek_mla_preprocess_decode_dynamic(
         )
         if graph_buffers is None:
             raise ValueError("Strided Q-A requires a graph-owned execution state")
+    if kv_rope_patterns is not None:
+        _validate_strided_mla_kv_cache_geometry(
+            hidden.shape[0], kv_lora_rank, q_lora_rank, qk_rope_head_dim, kv_norm_epsilon
+        )
+        if graph_buffers is None:
+            raise ValueError("Strided KV requires a graph-owned execution state")
+        if not supports_strided_mla_kv_cache_layout(kv_cache, rope_cache):
+            raise ValueError("Strided KV requires contiguous one-head BF16 PA caches")
+        if slot_mapping_int64 is not None and (
+            slot_mapping_int64.dtype != torch.int64
+            or slot_mapping_int64.shape != slot_mapping.shape
+            or slot_mapping_int64.device != slot_mapping.device
+            or not slot_mapping_int64.is_contiguous()
+        ):
+            raise ValueError("prepared MLA slots must be contiguous INT64 matching the original slot mapping")
 
     qkv_output = None
     q_output = None
@@ -533,7 +588,8 @@ def deepseek_mla_preprocess_decode_dynamic(
         )
     kv_dim = kv_lora_rank + qk_rope_head_dim
     if strided_q_a_quant:
-        kv = qkv_a[:, :kv_dim]
+        if kv_rope_patterns is None:
+            kv = qkv_a[:, :kv_dim]
         q_c_int8, q_c_scale = _quantize_strided_q_a(qkv_a, q_norm_weight)
         q_c = q_c_int8
     elif fuse_q_norm_quant:
@@ -583,19 +639,31 @@ def deepseek_mla_preprocess_decode_dynamic(
     else:
         q_pe = torch.empty((num_tokens, num_heads, qk_rope_head_dim), dtype=q.dtype, device=q.device)
         torch.ops.xllm_ops.mla_query_rope_out(q, rope_cos, rope_sin, query_rope_patterns, q_pe)
-    _write_mla_kv_cache(
-        kv,
-        kv_norm_weight,
-        rope_cos,
-        rope_sin,
-        slot_mapping,
-        kv_cache,
-        rope_cache,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        kv_norm_epsilon,
-        slot_mapping_int64,
-    )
+    if kv_rope_patterns is not None:
+        _STRIDED_MLA_KV_CACHE_OUT(
+            qkv_a,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            slot_mapping.to(torch.int64) if slot_mapping_int64 is None else slot_mapping_int64,
+            kv_rope_patterns,
+            kv_cache,
+            rope_cache,
+        )
+    else:
+        _write_mla_kv_cache(
+            kv,
+            kv_norm_weight,
+            rope_cos,
+            rope_sin,
+            slot_mapping,
+            kv_cache,
+            rope_cache,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_norm_epsilon,
+            slot_mapping_int64,
+        )
     return q_c, q_c_scale, q_latent, q_pe
 
 
@@ -626,11 +694,16 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     slot_mapping_int64: torch.Tensor | None = None,
     query_rope_patterns: torch.Tensor | None = None,
     strided_q_a_quant: bool = False,
+    kv_rope_patterns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
     if strided_q_a_quant:
         _validate_strided_q_a_quant_geometry(
             hidden.shape[0], kv_lora_rank, q_lora_rank, qk_rope_head_dim, q_norm_epsilon, fuse_q_norm_quant
+        )
+    if kv_rope_patterns is not None:
+        _validate_strided_mla_kv_cache_geometry(
+            hidden.shape[0], kv_lora_rank, q_lora_rank, qk_rope_head_dim, kv_norm_epsilon
         )
     del (
         qkv_weight,
@@ -727,4 +800,6 @@ __all__ = [
     "prepare_mla_preprocess_v2_qkv",
     "supports_mla_preprocess_v2",
     "supports_strided_q_a_quant_out",
+    "supports_strided_mla_kv_cache_out",
+    "supports_strided_mla_kv_cache_layout",
 ]
