@@ -427,6 +427,7 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         super().__init__(cfg, layer_id, dtype, device)
         self._attn_dp_layout: AttnDpLayout | None = None
         self.register_buffer("_decode_w_uk", None, persistent=False)
+        self.register_buffer("_decode_query_rope_patterns", None, persistent=False)
         self.register_buffer("W_UV_owner", torch.empty(0, dtype=dtype, device=device), persistent=False)
         if not cfg.enable_attn_dp_weight_sharding:
             return
@@ -462,9 +463,11 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
     def process_weights_after_loading(self, owner_kv_b_proj: torch.Tensor | None = None) -> None:
         # Reloads must not retain a projection absorbed from the previous weights.
         self._decode_w_uk = None
+        self._decode_query_rope_patterns = None
         if getattr(self, "_attn_dp_layout", None) is None:
             super().process_weights_after_loading()
             self._prepare_decode_latent_weight()
+            self._prepare_decode_query_rope()
             return
         if self.o_proj._dynamic_activation and owner_kv_b_proj is None:
             raise ValueError("dynamic attention DP requires the owner TP shard of kv_b_proj")
@@ -541,6 +544,29 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         ):
             return self._decode_w_uk
         return self.W_UK
+
+    def _prepare_decode_query_rope(self) -> None:
+        self._decode_query_rope_patterns = None
+        if not self._can_pad_decode_latent_weight():
+            return
+        # Gather indices address FP32 UB elements, not the BF16 GM input.
+        even = torch.arange(0, 64, 2, dtype=torch.int32)
+        odd = even + 1
+        patterns = torch.stack((torch.cat((even, odd)), torch.cat((odd, even)))) * 4
+        self._decode_query_rope_patterns = patterns.to(self.W_UK.device)
+
+    def _decode_query_rope_patterns_for(self, num_tokens: int) -> torch.Tensor | None:
+        ctx = get_forward_context()
+        if (
+            self._decode_query_rope_patterns is not None
+            and ctx.execution_state is not None
+            and not ctx.metadata.is_prefill
+            and not ctx.metadata.is_chunked_prefill
+            and ctx.cp_context is None
+            and num_tokens in (1, 4, 16)
+        ):
+            return self._decode_query_rope_patterns
+        return None
 
     def _mlapo_enabled(self, cfg: Glm52Config, device: torch.device) -> bool:
         return _can_use_mlapo_v2(cfg, device)

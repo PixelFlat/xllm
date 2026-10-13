@@ -118,6 +118,15 @@ void rope_in_place(torch::Tensor& input,
                    const torch::Tensor& sin_cache,
                    const torch::Tensor& cos_cache);
 
+// Read interleaved channels from contiguous BF16 [T, 4, 256] query storage.
+// Patterns are initialization-owned int32 [2, 64] byte gather offsets;
+// coefficients are contiguous [T, 1, 1, 64], output is [T, 4, 64].
+torch::Tensor mla_query_rope_out(const torch::Tensor& query,
+                                 const torch::Tensor& cos,
+                                 const torch::Tensor& sin,
+                                 const torch::Tensor& patterns,
+                                 torch::Tensor& output);
+
 // Compute fused GDN gating outputs on NPU.
 // Invalid inputs trigger CHECK failures.
 std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(

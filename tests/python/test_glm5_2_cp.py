@@ -1009,6 +1009,7 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
     attention.kv_a_layernorm = SimpleNamespace(weight=torch.ones(1), eps=1e-5)
     attention.W_UK = torch.ones(1, 1, 1)
     attention._decode_w_uk = None
+    attention._decode_query_rope_patterns = None
     attention.W_UV = torch.ones(1, 1, 2)
     attention.o_proj = nn.Identity()
 

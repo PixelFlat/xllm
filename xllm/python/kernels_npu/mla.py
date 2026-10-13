@@ -427,6 +427,7 @@ def deepseek_mla_preprocess_decode_dynamic(
     fuse_q_norm_quant: bool,
     hidden_scale: torch.Tensor | None = None,
     slot_mapping_int64: torch.Tensor | None = None,
+    query_rope_patterns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Preprocess MLA and return Q-A and the activation scale used by Q-B.
 
@@ -518,11 +519,15 @@ def deepseek_mla_preprocess_decode_dynamic(
     )
     q_latent, q_rope = _project_decode_latent_query(q, w_uk, qk_nope_head_dim, qk_rope_head_dim)
     num_tokens = hidden.shape[0]
-    q_pe = torch_npu.npu_interleave_rope(
-        q_rope.view(num_tokens, num_heads, 1, qk_rope_head_dim),
-        rope_cos,
-        rope_sin,
-    ).view(num_tokens, num_heads, qk_rope_head_dim)
+    if query_rope_patterns is None:
+        q_pe = torch_npu.npu_interleave_rope(
+            q_rope.view(num_tokens, num_heads, 1, qk_rope_head_dim),
+            rope_cos,
+            rope_sin,
+        ).view(num_tokens, num_heads, qk_rope_head_dim)
+    else:
+        q_pe = torch.empty((num_tokens, num_heads, qk_rope_head_dim), dtype=q.dtype, device=q.device)
+        torch.ops.xllm_ops.mla_query_rope_out(q, rope_cos, rope_sin, query_rope_patterns, q_pe)
     _write_mla_kv_cache(
         kv,
         kv_norm_weight,
@@ -564,6 +569,7 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     fuse_q_norm_quant: bool,
     hidden_scale: torch.Tensor | None = None,
     slot_mapping_int64: torch.Tensor | None = None,
+    query_rope_patterns: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
     del (
