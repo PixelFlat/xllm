@@ -729,6 +729,9 @@ TORCH_LIBRARY(xllm_ops, m) {
       "rms_norm_dynamic_quant(Tensor input, Tensor weight, float eps) -> "
       "(Tensor, Tensor)");
   m.def(
+      "strided_q_a_rms_norm_dynamic_quant_out(Tensor projection, Tensor "
+      "gamma, Tensor(a!) output, Tensor(b!) scales) -> ()");
+  m.def(
       "mla_query_rope_out(Tensor query, Tensor cos, Tensor sin, Tensor "
       "patterns, "
       "Tensor(a!) output) -> Tensor(a!)");
@@ -960,6 +963,10 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("fused_add_rms_norm", TORCH_FN(xllm::fused_add_rms_norm_npu));
   m.impl("rms_norm_dynamic_quant",
          TORCH_FN(xllm::kernel::npu::rms_norm_dynamic_quant));
+  m.impl(
+      "strided_q_a_rms_norm_dynamic_quant_out",
+      TORCH_FN(
+          xllm::kernel::npu::tilelang::strided_q_a_rms_norm_dynamic_quant_out));
   m.impl("mla_query_rope_out",
          TORCH_FN(xllm::kernel::npu::tilelang::mla_query_rope_out));
   m.impl("rope_table_gather_out",

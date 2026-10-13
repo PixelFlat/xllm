@@ -763,6 +763,7 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
     attention.q_a_proj = dynamic_projection(q_weight, q_scale)
     attention.kv_a_proj_with_mqa = dynamic_projection(kv_weight, kv_scale)
     attention.q_b_proj = dynamic_projection(torch.empty(2, 2, dtype=torch.int8), torch.ones(2, 1))
+    attention.q_a_layernorm = SimpleNamespace(weight=torch.ones(2), eps=1e-5)
     attention.o_proj = SimpleNamespace(process_weights_after_loading=MagicMock())
     attention.kv_b_proj = SimpleNamespace(weight=SimpleNamespace(data=torch.ones(3, 1)))
     attention.num_heads_local = 1
@@ -787,6 +788,7 @@ def test_dynamic_attention_prepares_one_fused_qkv_projection() -> None:
     torch.testing.assert_close(attention._combined_qkv.weight_scale, expected_scale)
     assert attention._dynamic_mla_ready is True
     assert attention._fused_mla_ready is True
+    assert attention._decode_strided_q_a_ready is False
 
 
 @pytest.mark.parametrize(

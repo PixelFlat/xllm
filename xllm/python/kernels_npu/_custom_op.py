@@ -175,6 +175,35 @@ def _mla_query_rope_out_fake(
     return output
 
 
+def _strided_q_a_rms_norm_dynamic_quant_out_fake(
+    projection: torch.Tensor,
+    gamma: torch.Tensor,
+    output: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    if projection.ndim != 2 or projection.shape[1] != 2624 or projection.dtype != torch.bfloat16:
+        raise ValueError("Strided Q-A requires a BF16 [T,2624] projection")
+    tokens = projection.shape[0]
+    if tokens not in (1, 2, 4, 8, 16):
+        raise ValueError("Strided Q-A supports T=1/2/4/8/16")
+    if gamma.shape != (2048,) or gamma.dtype != torch.bfloat16:
+        raise ValueError("Strided Q-A gamma must be BF16 [2048]")
+    if output.shape != (tokens, 2048) or output.dtype != torch.int8:
+        raise ValueError("Strided Q-A output must be INT8 [T,2048]")
+    if scales.shape != (tokens,) or scales.dtype != torch.float32:
+        raise ValueError("Strided Q-A scales must be FP32 [T]")
+    tensors = (projection, gamma, output, scales)
+    if any(value.device != projection.device or not value.is_contiguous() for value in tensors):
+        raise ValueError("Strided Q-A tensors must be contiguous and on the same device")
+    if any(
+        torch._C._is_alias_of(destination, value) for destination in (output, scales) for value in (projection, gamma)
+    ):
+        raise ValueError("Strided Q-A outputs must not alias inputs")
+    if torch._C._is_alias_of(output, scales):
+        raise ValueError("Strided Q-A outputs must have independent storage")
+    return None
+
+
 def _rope_table_gather_out_fake(
     cache: torch.Tensor,
     positions: torch.Tensor,
@@ -1324,6 +1353,7 @@ register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
 register_fake("xllm_ops::mla_query_rope_out", _mla_query_rope_out_fake)
+register_fake("xllm_ops::strided_q_a_rms_norm_dynamic_quant_out", _strided_q_a_rms_norm_dynamic_quant_out_fake)
 register_fake("xllm_ops::rope_table_gather_out", _rope_table_gather_out_fake)
 register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)
