@@ -22,7 +22,7 @@ limitations under the License.
 #include <string>
 #include <thread>
 
-#include "core/kv_cache/prefix/kv_cache_event_journal.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 
 namespace xllm {
 

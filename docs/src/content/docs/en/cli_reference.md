@@ -99,7 +99,7 @@ Add the following flag to an existing launch command to enable event publication
 --kv_events_config='{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:6557"}'
 ```
 
-Current support covers ordinary non-PD text inference with prefix caching enabled, flat KV layouts and local Host offload. Events describe the Device/Host residency of reusable prefix blocks; Host copies are advertised after successful copy acknowledgements. The publisher runs on a background thread. Multi-resource composite/linear-state layouts, multimodal inference, XTensor, PD separation and external KV stores are not yet supported.
+Current support covers ordinary non-PD text inference with prefix caching enabled, flat KV layouts and local Host offload. Events describe the Device/Host residency of reusable prefix blocks; Host copies are advertised after successful copy acknowledgements. The publisher runs on a background thread. Multi-resource composite/linear-state layouts, multimodal inference, virtual-memory KV, PD separation and external KV stores are not yet supported.
 
 ## KVCacheStoreConfig
 

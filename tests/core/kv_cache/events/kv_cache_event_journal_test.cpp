@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/kv_cache/prefix/kv_cache_event_journal.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -29,7 +29,7 @@ limitations under the License.
 #include <optional>
 #include <thread>
 
-#include "core/kv_cache/prefix/kv_cache_event_publisher.h"
+#include "core/kv_cache/events/kv_cache_event_publisher.h"
 
 extern "C" int __real_zmq_msg_recv(zmq_msg_t* message, void* socket, int flags);
 

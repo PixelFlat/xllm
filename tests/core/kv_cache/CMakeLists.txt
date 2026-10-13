@@ -1,5 +1,6 @@
 add_subdirectory(layout)
 add_subdirectory(storage)
 add_subdirectory(block)
+add_subdirectory(events)
 add_subdirectory(prefix)
 add_subdirectory(transfer)

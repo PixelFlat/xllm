@@ -33,8 +33,8 @@ limitations under the License.
 #include "common/types.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/kv_cache/block/block.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 #include "core/kv_cache/prefix/block_hasher.h"
-#include "core/kv_cache/prefix/kv_cache_event_journal.h"
 #include "util/timer.h"
 
 namespace xllm {

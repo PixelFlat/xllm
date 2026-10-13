@@ -99,7 +99,7 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 --kv_events_config='{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:6557"}'
 ```
 
-当前支持开启 prefix cache 的普通非 PD 分离文本推理、flat KV 布局和本地 Host offload。上报的是可复用前缀 block 的 Device/Host 驻留元数据；Host 副本在拷贝成功确认后发布。发布器在后台线程运行。多资源复合/linear-state 布局、多模态、XTensor、PD 分离和外部 KV 存储尚未支持。
+当前支持开启 prefix cache 的普通非 PD 分离文本推理、flat KV 布局和本地 Host offload。上报的是可复用前缀 block 的 Device/Host 驻留元数据；Host 副本在拷贝成功确认后发布。发布器在后台线程运行。多资源复合/linear-state 布局、多模态、虚拟内存 KV、PD 分离和外部 KV 存储尚未支持。
 
 ## KVCacheStoreConfig
 

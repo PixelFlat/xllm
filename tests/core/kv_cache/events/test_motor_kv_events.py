@@ -11,7 +11,7 @@
 
 """Run the production prefix-cache fixture against the supplied KVConductor.
 
-Usage: python tests/core/kv_cache/prefix/test_motor_kv_events.py
+Usage: python tests/core/kv_cache/events/test_motor_kv_events.py
     --fixture /path/to/kv_cache_event_fixture --conductor /path/to/kv-conductor
 Requires pyzmq and msgpack. Does not allocate NPU tensors or load a model.
 """

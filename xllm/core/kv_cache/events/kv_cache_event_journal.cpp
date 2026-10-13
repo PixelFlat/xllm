@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/kv_cache/prefix/kv_cache_event_journal.h"
+#include "core/kv_cache/events/kv_cache_event_journal.h"
 
 #include <glog/logging.h>
 

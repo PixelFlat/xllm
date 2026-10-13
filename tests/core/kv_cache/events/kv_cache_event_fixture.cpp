@@ -26,7 +26,7 @@ limitations under the License.
 #include "core/framework/block/composite_block_manager.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/block/block_manager_impl.h"
-#include "core/kv_cache/prefix/kv_cache_event_publisher.h"
+#include "core/kv_cache/events/kv_cache_event_publisher.h"
 
 namespace {
 

@@ -23,7 +23,7 @@ limitations under the License.
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/block/concurrent_block_manager_impl.h"
 #include "core/kv_cache/block/linear_state_block_manager.h"
-#include "core/kv_cache/prefix/kv_cache_event_publisher.h"
+#include "core/kv_cache/events/kv_cache_event_publisher.h"
 #include "framework/model/model_input_params.h"
 
 namespace xllm {
@@ -41,8 +41,8 @@ BlockManagerPool::BlockManagerPool(const Options& options,
           options_.hasher_type() == BlockHasherType::TEXT &&
           !options_.enable_disagg_pd() && !options_.enable_kvcache_store())
         << "KV events currently support text, flat KV prefix caches with local "
-           "Host offload; composite/MM/XTensor/PD/external stores need logical "
-           "residency observers";
+           "Host offload; composite/MM/virtual-memory/PD/external stores "
+           "need logical residency observers";
     if (!event_config.empty()) {
       options_.event_journal(KVCacheEventJournal::get_instance());
       event_publisher_ = std::make_unique<KVCacheEventPublisher>(
