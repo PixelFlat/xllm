@@ -536,7 +536,7 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
           .enable_kvcache_store(options_.enable_kvcache_store())
           .enable_host_offload(options_.enable_host_offload());
       if (host_options.event_journal()) {
-        KvCacheEventScope scope = host_options.event_scope();
+        KVCacheEventScope scope = host_options.event_scope();
         scope.medium = "cpu";
         host_options.event_scope(scope);
       }

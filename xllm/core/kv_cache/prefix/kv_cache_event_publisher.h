@@ -28,15 +28,15 @@ namespace xllm {
 
 // vLLM's three-frame msgpack wire protocol. The optional pool socket confirms
 // residency of xLLM's local Host copies to Motor; it is not a KV data store.
-class KvCacheEventPublisher final {
+class KVCacheEventPublisher final {
  public:
-  KvCacheEventPublisher(std::shared_ptr<KvCacheEventJournal> journal,
+  KVCacheEventPublisher(std::shared_ptr<KVCacheEventJournal> journal,
                         const nlohmann::json& config,
                         const std::string& model_id,
                         int32_t dp_size);
-  ~KvCacheEventPublisher();
-  KvCacheEventPublisher(const KvCacheEventPublisher&) = delete;
-  KvCacheEventPublisher& operator=(const KvCacheEventPublisher&) = delete;
+  ~KVCacheEventPublisher();
+  KVCacheEventPublisher(const KVCacheEventPublisher&) = delete;
+  KVCacheEventPublisher& operator=(const KVCacheEventPublisher&) = delete;
   bool healthy() const;
 
   static uint64_t wire_hash(const std::string& hash);
@@ -55,7 +55,7 @@ class KvCacheEventPublisher final {
                 const std::shared_ptr<std::promise<void>>& ready,
                 bool& ready_sent);
 
-  std::shared_ptr<KvCacheEventJournal> journal_;
+  std::shared_ptr<KVCacheEventJournal> journal_;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> healthy_{false};
   std::thread thread_;

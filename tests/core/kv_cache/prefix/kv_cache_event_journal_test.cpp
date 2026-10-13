@@ -37,9 +37,9 @@ namespace xllm {
 namespace {
 const std::string kFirstHash(32, '1');
 const std::string kSecondHash(32, '2');
-const KvCacheEventScope kDevice{"model", 0, "gpu"};
-const KvCacheEventScope kHost{"model", 0, "cpu"};
-std::atomic<std::shared_ptr<KvCacheEventJournal>> replay_update_journal;
+const KVCacheEventScope kDevice{"model", 0, "gpu"};
+const KVCacheEventScope kHost{"model", 0, "cpu"};
+std::atomic<std::shared_ptr<KVCacheEventJournal>> replay_update_journal;
 
 struct EventFrame {
   uint64_t sequence = 0;
@@ -161,11 +161,11 @@ extern "C" int __wrap_zmq_msg_recv(zmq_msg_t* message,
   return result;
 }
 
-TEST(KvCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
+TEST(KVCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
   BoundPort engine_port;
   BoundPort pool_port;
   BoundPort replay_port;
-  auto journal = std::make_shared<KvCacheEventJournal>();
+  auto journal = std::make_shared<KVCacheEventJournal>();
   journal->store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal->store_copy(kHost, kFirstHash);
   std::unique_ptr<void, decltype(&zmq_ctx_term)> context(zmq_ctx_new(),
@@ -174,7 +174,7 @@ TEST(KvCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
   engine_port.release();
   pool_port.release();
   replay_port.release();
-  KvCacheEventPublisher publisher(
+  KVCacheEventPublisher publisher(
       journal,
       {{"endpoint", engine_port.endpoint()},
        {"motor_pool_endpoint", pool_port.endpoint()},
@@ -222,7 +222,7 @@ TEST(KvCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
       if (event["type"] == "BlockStored" && event["medium"] == "gpu") {
         EXPECT_NE(
             event["block_hashes"],
-            nlohmann::json({KvCacheEventPublisher::wire_hash(kSecondHash)}))
+            nlohmann::json({KVCacheEventPublisher::wire_hash(kSecondHash)}))
             << "A replay-covered update was published again as a live delta";
       }
     }
@@ -230,12 +230,12 @@ TEST(KvCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
   EXPECT_GT(following->sequence, recovered->sequence);
   ASSERT_EQ(following->payload[1].size(), 1);
   EXPECT_EQ(following->payload[1][0]["block_hashes"],
-            nlohmann::json({KvCacheEventPublisher::wire_hash(kSecondHash)}));
+            nlohmann::json({KVCacheEventPublisher::wire_hash(kSecondHash)}));
   EXPECT_TRUE(publisher.healthy());
 }
 
-TEST(KvCacheEventJournalTest, HostCopySurvivesDeviceEviction) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, HostCopySurvivesDeviceEviction) {
+  KVCacheEventJournal journal;
   journal.store(kDevice, kFirstHash, "", {11, 12}, /*block_index=*/0);
   journal.store_copy(kHost, kFirstHash);
   journal.remove(kDevice, kFirstHash);
@@ -249,8 +249,8 @@ TEST(KvCacheEventJournalTest, HostCopySurvivesDeviceEviction) {
   EXPECT_EQ(journal.read("", 0)["events"][0]["medium"], "gpu");
 }
 
-TEST(KvCacheEventJournalTest, DuplicateStoreDoesNotProduceAnotherEvent) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, DuplicateStoreDoesNotProduceAnotherEvent) {
+  KVCacheEventJournal journal;
   const nlohmann::json initial = journal.read("", 0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
@@ -260,8 +260,8 @@ TEST(KvCacheEventJournalTest, DuplicateStoreDoesNotProduceAnotherEvent) {
   EXPECT_EQ(page["cursor"], 1);
 }
 
-TEST(KvCacheEventJournalTest, OverflowAndRestartReturnCurrentSnapshot) {
-  KvCacheEventJournal journal(/*capacity=*/2);
+TEST(KVCacheEventJournalTest, OverflowAndRestartReturnCurrentSnapshot) {
+  KVCacheEventJournal journal(/*capacity=*/2);
   const nlohmann::json initial = journal.read("", 0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store(kDevice, kSecondHash, kFirstHash, {3, 4}, /*block_index=*/1);
@@ -276,8 +276,8 @@ TEST(KvCacheEventJournalTest, OverflowAndRestartReturnCurrentSnapshot) {
   EXPECT_TRUE(journal.read(initial["epoch"], 100)["reset"].get<bool>());
 }
 
-TEST(KvCacheEventJournalTest, RankAndModelResidenciesAreIndependent) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, RankAndModelResidenciesAreIndependent) {
+  KVCacheEventJournal journal;
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store({"model", 1, "gpu"}, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store({"other", 0, "gpu"}, kFirstHash, "", {1, 2}, /*block_index=*/0);
@@ -285,8 +285,8 @@ TEST(KvCacheEventJournalTest, RankAndModelResidenciesAreIndependent) {
   EXPECT_EQ(journal.read("", 0)["events"].size(), 2);
 }
 
-TEST(KvCacheEventJournalTest, IncrementalPaginationDoesNotSkipEvents) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, IncrementalPaginationDoesNotSkipEvents) {
+  KVCacheEventJournal journal;
   const nlohmann::json initial = journal.read("", 0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store_copy(kHost, kFirstHash);
@@ -298,8 +298,8 @@ TEST(KvCacheEventJournalTest, IncrementalPaginationDoesNotSkipEvents) {
   EXPECT_EQ(rest["events"][1]["type"], "removed");
 }
 
-TEST(KvCacheEventJournalTest, HostSnapshotTracksEvictionAndDeviceOnlyUpdates) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, HostSnapshotTracksEvictionAndDeviceOnlyUpdates) {
+  KVCacheEventJournal journal;
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store_copy(kHost, kFirstHash);
   const nlohmann::json host =
@@ -324,8 +324,8 @@ TEST(KvCacheEventJournalTest, HostSnapshotTracksEvictionAndDeviceOnlyUpdates) {
   EXPECT_GT(filtered["cursor"], removed["cursor"]);
 }
 
-TEST(KvCacheEventJournalTest, PendingOverflowClearsClaimsAndStopsCollection) {
-  KvCacheEventJournal journal(/*capacity=*/4096, /*pending_capacity=*/2);
+TEST(KVCacheEventJournalTest, PendingOverflowClearsClaimsAndStopsCollection) {
+  KVCacheEventJournal journal(/*capacity=*/4096, /*pending_capacity=*/2);
   const nlohmann::json initial = journal.read("", 0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store(kDevice, kSecondHash, kFirstHash, {3, 4}, /*block_index=*/1);
@@ -339,8 +339,8 @@ TEST(KvCacheEventJournalTest, PendingOverflowClearsClaimsAndStopsCollection) {
   EXPECT_TRUE(journal.read("", 0)["events"].empty());
 }
 
-TEST(KvCacheEventJournalTest, InvalidMetadataClearsPreviouslyPublishedClaims) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventJournalTest, InvalidMetadataClearsPreviouslyPublishedClaims) {
+  KVCacheEventJournal journal;
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   const nlohmann::json initial = journal.read("", 0);
   ASSERT_EQ(initial["events"].size(), 1);
@@ -352,9 +352,9 @@ TEST(KvCacheEventJournalTest, InvalidMetadataClearsPreviouslyPublishedClaims) {
   EXPECT_TRUE(reset["events"].empty());
 }
 
-TEST(KvCacheEventJournalTest,
+TEST(KVCacheEventJournalTest,
      ConcurrentProducersPreserveResidencyDuringSnapshots) {
-  KvCacheEventJournal journal;
+  KVCacheEventJournal journal;
   std::atomic<bool> done{false};
   std::thread reader([&]() {
     while (!done.load()) {
@@ -365,7 +365,7 @@ TEST(KvCacheEventJournalTest,
   writers.reserve(4);
   for (int32_t rank = 0; rank < 4; ++rank) {
     writers.emplace_back([&, rank]() {
-      const KvCacheEventScope scope{"model", rank, "gpu"};
+      const KVCacheEventScope scope{"model", rank, "gpu"};
       for (int32_t index = 0; index < 500; ++index) {
         const std::string suffix = std::to_string(index);
         const std::string hash = std::string(32 - suffix.size(), '0') + suffix;
@@ -382,29 +382,29 @@ TEST(KvCacheEventJournalTest,
   EXPECT_EQ(journal.read("", 0)["events"].size(), 2000);
 }
 
-TEST(KvCacheEventPublisherTest,
+TEST(KVCacheEventPublisherTest,
      InvalidConfigTypeDisablesExporterWithoutTerminatingCaller) {
-  auto journal = std::make_shared<KvCacheEventJournal>();
-  KvCacheEventPublisher publisher(
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  KVCacheEventPublisher publisher(
       journal, {{"endpoint", 123}}, "model", /*dp_size=*/1);
   EXPECT_FALSE(publisher.healthy());
   EXPECT_FALSE(journal->enabled());
 }
 
-TEST(KvCacheEventPublisherTest,
+TEST(KVCacheEventPublisherTest,
      EmptyEndpointDisablesExporterWithoutTerminatingCaller) {
-  auto journal = std::make_shared<KvCacheEventJournal>();
-  KvCacheEventPublisher publisher(
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  KVCacheEventPublisher publisher(
       journal, {{"endpoint", ""}}, "model", /*dp_size=*/1);
   EXPECT_FALSE(publisher.healthy());
   EXPECT_FALSE(journal->enabled());
 }
 
-TEST(KvCacheEventPublisherTest,
+TEST(KVCacheEventPublisherTest,
      BindFailureDisablesExporterWithoutTerminatingCaller) {
   BoundPort occupied;
-  auto journal = std::make_shared<KvCacheEventJournal>();
-  KvCacheEventPublisher publisher(
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  KVCacheEventPublisher publisher(
       journal, {{"endpoint", occupied.endpoint()}}, "model", /*dp_size=*/1);
   EXPECT_FALSE(publisher.healthy());
   EXPECT_FALSE(journal->enabled());
@@ -412,13 +412,13 @@ TEST(KvCacheEventPublisherTest,
   EXPECT_TRUE(journal->read("", 0)["events"].empty());
 }
 
-TEST(KvCacheEventPublisherTest,
+TEST(KVCacheEventPublisherTest,
      BackgroundMetadataFailureDoesNotTerminateCaller) {
   BoundPort reserved;
   const std::string endpoint = reserved.endpoint();
   reserved.release();
-  auto journal = std::make_shared<KvCacheEventJournal>();
-  KvCacheEventPublisher publisher(
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  KVCacheEventPublisher publisher(
       journal, {{"endpoint", endpoint}}, "model", /*dp_size=*/1);
   ASSERT_TRUE(publisher.healthy());
   journal->store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
@@ -432,23 +432,23 @@ TEST(KvCacheEventPublisherTest,
   EXPECT_FALSE(publisher.healthy());
 }
 
-TEST(KvCacheEventPublisherTest, StoredRemovedAndParentUseSameWireIdentity) {
-  KvCacheEventJournal journal;
+TEST(KVCacheEventPublisherTest, StoredRemovedAndParentUseSameWireIdentity) {
+  KVCacheEventJournal journal;
   const nlohmann::json initial = journal.read("", 0);
   journal.store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
   journal.store(kDevice, kSecondHash, kFirstHash, {3, 4}, /*block_index=*/1);
   journal.remove(kDevice, kFirstHash);
   const auto events = journal.read(initial["epoch"], 0)["events"];
-  const auto first = KvCacheEventPublisher::engine_event(events[0]);
-  const auto second = KvCacheEventPublisher::engine_event(events[1]);
-  const auto removed = KvCacheEventPublisher::engine_event(events[2]);
+  const auto first = KVCacheEventPublisher::engine_event(events[0]);
+  const auto second = KVCacheEventPublisher::engine_event(events[1]);
+  const auto removed = KVCacheEventPublisher::engine_event(events[2]);
   EXPECT_EQ(first["block_hashes"], removed["block_hashes"]);
   EXPECT_EQ(first["block_hashes"][0], second["parent_block_hash"]);
   EXPECT_TRUE(first["parent_block_hash"].is_null());
   EXPECT_EQ(second["token_ids"], nlohmann::json({3, 4}));
-  EXPECT_EQ(KvCacheEventPublisher::pool_event(events[1])["seq_hashes"],
+  EXPECT_EQ(KVCacheEventPublisher::pool_event(events[1])["seq_hashes"],
             second["block_hashes"]);
-  EXPECT_EQ(KvCacheEventPublisher::rank_endpoint("tcp://*:5557", 2),
+  EXPECT_EQ(KVCacheEventPublisher::rank_endpoint("tcp://*:5557", 2),
             "tcp://*:5559");
 }
 

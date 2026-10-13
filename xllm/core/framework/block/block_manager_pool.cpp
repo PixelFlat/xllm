@@ -44,8 +44,8 @@ BlockManagerPool::BlockManagerPool(const Options& options,
            "Host offload; composite/MM/XTensor/PD/external stores need logical "
            "residency observers";
     if (!event_config.empty()) {
-      options_.event_journal(KvCacheEventJournal::get_instance());
-      event_publisher_ = std::make_unique<KvCacheEventPublisher>(
+      options_.event_journal(KVCacheEventJournal::get_instance());
+      event_publisher_ = std::make_unique<KVCacheEventPublisher>(
           options_.event_journal(),
           nlohmann::json::parse(event_config),
           options_.model_id(),
@@ -80,7 +80,7 @@ BlockManagerPool::BlockManagerPool(const Options& options,
   for (int32_t i = 0; i < dp_size; ++i) {
     if (options_.event_journal()) {
       block_options.event_journal(options_.event_journal())
-          .event_scope(KvCacheEventScope{options_.model_id(), i, "gpu"});
+          .event_scope(KVCacheEventScope{options_.model_id(), i, "gpu"});
     }
     // The pool always holds a CompositeBlockManager. Its KV leaf is a flat
     // BlockManagerImpl, or a VirtualMemoryKVCacheBlockManager when

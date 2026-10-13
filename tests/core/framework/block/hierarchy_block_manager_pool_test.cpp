@@ -447,7 +447,7 @@ TEST(HierarchyBlockManagerPoolTest, FlatKvHasSingleHostKvLeaf) {
 TEST(HierarchyBlockManagerPoolTest,
      KvEventsPublishHostOnlyAfterSuccessfulCopy) {
   for (bool success : {false, true}) {
-    auto journal = std::make_shared<KvCacheEventJournal>();
+    auto journal = std::make_shared<KVCacheEventJournal>();
     auto coordinator = std::make_shared<DeferredOffloadCoordinator>();
     BlockManagerPool::Options options = make_flat_kv_options();
     options.event_journal(journal);
@@ -478,7 +478,7 @@ TEST(HierarchyBlockManagerPoolTest,
 
 TEST(HierarchyBlockManagerPoolTest,
      EmptyCopyResultsDoNotAdvertiseHostResidency) {
-  auto journal = std::make_shared<KvCacheEventJournal>();
+  auto journal = std::make_shared<KVCacheEventJournal>();
   auto coordinator =
       std::make_shared<DeferredOffloadCoordinator>(/*empty_results=*/true);
   BlockManagerPool::Options options = make_flat_kv_options();

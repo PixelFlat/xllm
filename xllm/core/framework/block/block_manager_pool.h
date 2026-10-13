@@ -37,7 +37,7 @@ class BlockManagerPool : public KVCacheManager {
   struct Options {
     // Empty for caches that must not publish, including external draft caches.
     PROPERTY(std::string, kv_events_config);
-    PROPERTY(std::shared_ptr<KvCacheEventJournal>, event_journal);
+    PROPERTY(std::shared_ptr<KVCacheEventJournal>, event_journal);
     PROPERTY(uint32_t, num_blocks) = 0;
     PROPERTY(uint32_t, host_num_blocks) = 0;
     // Host prefix-cache capacity keyed by the cache block type. Empty keeps the
@@ -154,7 +154,7 @@ class BlockManagerPool : public KVCacheManager {
  protected:
   // the options for the block manager
   Options options_;
-  std::unique_ptr<KvCacheEventPublisher> event_publisher_;
+  std::unique_ptr<KVCacheEventPublisher> event_publisher_;
   std::vector<std::unique_ptr<BlockManager>> block_managers_;
 };
 

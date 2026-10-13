@@ -30,7 +30,7 @@ std::string create_epoch() {
 }
 }  // namespace
 
-KvCacheEventJournal::KvCacheEventJournal(size_t capacity,
+KVCacheEventJournal::KVCacheEventJournal(size_t capacity,
                                          size_t pending_capacity)
     : capacity_(capacity),
       pending_capacity_(pending_capacity),
@@ -41,12 +41,12 @@ KvCacheEventJournal::KvCacheEventJournal(size_t capacity,
   draining_.reserve(pending_capacity_);
 }
 
-std::shared_ptr<KvCacheEventJournal> KvCacheEventJournal::get_instance() {
-  static const auto journal = std::make_shared<KvCacheEventJournal>();
+std::shared_ptr<KVCacheEventJournal> KVCacheEventJournal::get_instance() {
+  static const auto journal = std::make_shared<KVCacheEventJournal>();
   return journal;
 }
 
-std::string KvCacheEventJournal::encode_hash(const uint8_t* hash) {
+std::string KVCacheEventJournal::encode_hash(const uint8_t* hash) {
   constexpr char kHex[] = "0123456789abcdef";
   std::string result(32, '0');
   for (size_t i = 0; i < 16; ++i) {
@@ -56,7 +56,7 @@ std::string KvCacheEventJournal::encode_hash(const uint8_t* hash) {
   return result;
 }
 
-void KvCacheEventJournal::append(nlohmann::json event) {
+void KVCacheEventJournal::append(nlohmann::json event) {
   event["sequence"] = ++sequence_;
   events_.emplace_back(std::move(event));
   if (events_.size() > capacity_) {
@@ -64,15 +64,15 @@ void KvCacheEventJournal::append(nlohmann::json event) {
   }
 }
 
-bool KvCacheEventJournal::enabled() const {
+bool KVCacheEventJournal::enabled() const {
   return enabled_.load(std::memory_order_relaxed);
 }
 
-void KvCacheEventJournal::disable() {
+void KVCacheEventJournal::disable() {
   enabled_.store(false, std::memory_order_relaxed);
 }
 
-void KvCacheEventJournal::enqueue(Update update) {
+void KVCacheEventJournal::enqueue(Update update) {
   if (!enabled()) {
     return;
   }
@@ -89,7 +89,7 @@ void KvCacheEventJournal::enqueue(Update update) {
   pending_.emplace_back(std::move(update));
 }
 
-void KvCacheEventJournal::store(KvCacheEventScope scope,
+void KVCacheEventJournal::store(KVCacheEventScope scope,
                                 std::string hash,
                                 std::string parent_hash,
                                 std::vector<int32_t> tokens,
@@ -102,16 +102,16 @@ void KvCacheEventJournal::store(KvCacheEventScope scope,
            block_index});
 }
 
-void KvCacheEventJournal::store_copy(KvCacheEventScope scope,
+void KVCacheEventJournal::store_copy(KVCacheEventScope scope,
                                      std::string hash) {
   enqueue({Operation::COPY, std::move(scope), std::move(hash), {}, {}, 0});
 }
 
-void KvCacheEventJournal::remove(KvCacheEventScope scope, std::string hash) {
+void KVCacheEventJournal::remove(KVCacheEventScope scope, std::string hash) {
   enqueue({Operation::REMOVE, std::move(scope), std::move(hash), {}, {}, 0});
 }
 
-bool KvCacheEventJournal::apply(Update update) {
+bool KVCacheEventJournal::apply(Update update) {
   const Key key{update.scope.model_id, update.scope.dp_rank, update.hash};
   if (update.operation == Operation::REMOVE) {
     auto iter = residents_.find(key);
@@ -176,7 +176,7 @@ bool KvCacheEventJournal::apply(Update update) {
   return true;
 }
 
-nlohmann::json KvCacheEventJournal::read(const std::string& epoch,
+nlohmann::json KVCacheEventJournal::read(const std::string& epoch,
                                          uint64_t cursor,
                                          size_t limit,
                                          const std::string& medium) {

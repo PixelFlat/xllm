@@ -30,7 +30,7 @@ limitations under the License.
 
 namespace xllm {
 
-uint64_t KvCacheEventPublisher::wire_hash(const std::string& hash) {
+uint64_t KVCacheEventPublisher::wire_hash(const std::string& hash) {
   CHECK_EQ(hash.size(), 32) << "KV event journal must validate hash length";
   // Fold the full chained 128-bit identity, including its prefix, to an opaque
   // 64-bit sequence identity. Routers derive their content hashes from tokens.
@@ -42,7 +42,7 @@ uint64_t KvCacheEventPublisher::wire_hash(const std::string& hash) {
   return result;
 }
 
-nlohmann::json KvCacheEventPublisher::engine_event(
+nlohmann::json KVCacheEventPublisher::engine_event(
     const nlohmann::json& event) {
   const bool stored = event["type"] == "stored";
   nlohmann::json result = {
@@ -61,14 +61,14 @@ nlohmann::json KvCacheEventPublisher::engine_event(
   return result;
 }
 
-nlohmann::json KvCacheEventPublisher::pool_event(const nlohmann::json& event) {
+nlohmann::json KVCacheEventPublisher::pool_event(const nlohmann::json& event) {
   return {{"event_type", event["type"]},
           {"medium", "cpu"},
           {"dp_rank", event["dp_rank"]},
           {"seq_hashes", {wire_hash(event["block_hash"].get<std::string>())}}};
 }
 
-std::string KvCacheEventPublisher::rank_endpoint(const std::string& endpoint,
+std::string KVCacheEventPublisher::rank_endpoint(const std::string& endpoint,
                                                  int32_t rank) {
   if (endpoint.substr(0, 6) != "tcp://") {
     LOG(ERROR) << "KV events require a TCP endpoint";
@@ -96,8 +96,8 @@ std::string KvCacheEventPublisher::rank_endpoint(const std::string& endpoint,
   return endpoint.substr(0, delimiter + 1) + std::to_string(port);
 }
 
-KvCacheEventPublisher::KvCacheEventPublisher(
-    std::shared_ptr<KvCacheEventJournal> journal,
+KVCacheEventPublisher::KVCacheEventPublisher(
+    std::shared_ptr<KVCacheEventJournal> journal,
     const nlohmann::json& config,
     const std::string& model_id,
     int32_t dp_size)
@@ -105,15 +105,15 @@ KvCacheEventPublisher::KvCacheEventPublisher(
   auto ready = std::make_shared<std::promise<void>>();
   auto future = ready->get_future();
   thread_ = std::thread(
-      &KvCacheEventPublisher::run, this, config, model_id, dp_size, ready);
+      &KVCacheEventPublisher::run, this, config, model_id, dp_size, ready);
   future.get();
 }
 
-bool KvCacheEventPublisher::healthy() const {
+bool KVCacheEventPublisher::healthy() const {
   return healthy_.load() && journal_->enabled();
 }
 
-KvCacheEventPublisher::~KvCacheEventPublisher() {
+KVCacheEventPublisher::~KVCacheEventPublisher() {
   stopped_.store(true);
   if (thread_.joinable()) {
     thread_.join();
@@ -446,7 +446,7 @@ class ReplaySnapshotBatch final {
       nlohmann::json events = nlohmann::json::array();
       events.push_back({{"type", "AllBlocksCleared"}});
       for (size_t index : indices_[rank]) {
-        events.push_back(KvCacheEventPublisher::engine_event(events_[index]));
+        events.push_back(KVCacheEventPublisher::engine_event(events_[index]));
       }
       packed = std::make_shared<std::vector<uint8_t>>(
           nlohmann::json::to_msgpack(engine_batch(events, rank)));
@@ -462,7 +462,7 @@ class ReplaySnapshotBatch final {
 
 }  // namespace
 
-void KvCacheEventPublisher::run(
+void KVCacheEventPublisher::run(
     const nlohmann::json& config,
     const std::string& model_id,
     int32_t dp_size,
@@ -478,7 +478,7 @@ void KvCacheEventPublisher::run(
   }
 }
 
-bool KvCacheEventPublisher::run_impl(
+bool KVCacheEventPublisher::run_impl(
     const nlohmann::json& config,
     const std::string& model_id,
     int32_t dp_size,

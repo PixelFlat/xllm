@@ -170,14 +170,14 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
         std::string parent =
             block_idx == 0
                 ? std::string()
-                : KvCacheEventJournal::encode_hash(
+                : KVCacheEventJournal::encode_hash(
                       blocks[block_idx - 1].get_immutable_hash_value());
         const size_t begin = block_idx * block_size_;
         std::vector<int32_t> tokens(token_ids.begin() + begin,
                                     token_ids.begin() + begin + block_size_);
         event_journal_->store(
             event_scope_,
-            KvCacheEventJournal::encode_hash(token_hash_key.data),
+            KVCacheEventJournal::encode_hash(token_hash_key.data),
             std::move(parent),
             std::move(tokens),
             static_cast<uint32_t>(block_idx));
@@ -230,7 +230,7 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
       if (event_journal_ && event_journal_->enabled()) {
         event_journal_->store_copy(
             event_scope_,
-            KvCacheEventJournal::encode_hash(token_hash_key.data));
+            KVCacheEventJournal::encode_hash(token_hash_key.data));
       }
     }
   }
@@ -283,7 +283,7 @@ size_t PrefixCache::evict(size_t n_blocks) {
     cached_blocks_.erase(token_hash_key);
     if (event_journal_ && event_journal_->enabled()) {
       event_journal_->remove(
-          event_scope_, KvCacheEventJournal::encode_hash(token_hash_key.data));
+          event_scope_, KVCacheEventJournal::encode_hash(token_hash_key.data));
     }
 
     delete del_node;

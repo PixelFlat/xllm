@@ -54,8 +54,8 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   CHECK(argc == 2 || (argc == 3 && std::string(argv[2]) == "--pool"))
       << "Expected publisher configuration JSON and optional --pool";
-  auto journal = std::make_shared<xllm::KvCacheEventJournal>();
-  std::unique_ptr<xllm::KvCacheEventPublisher> publisher;
+  auto journal = std::make_shared<xllm::KVCacheEventJournal>();
+  std::unique_ptr<xllm::KVCacheEventPublisher> publisher;
   std::unique_ptr<FixtureBlockManagerPool> target_pool;
   std::unique_ptr<FixtureBlockManagerPool> draft_pool;
   if (argc == 3) {
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
     target_pool = std::make_unique<FixtureBlockManagerPool>(options);
     journal = target_pool->options().event_journal();
   } else {
-    publisher = std::make_unique<xllm::KvCacheEventPublisher>(
+    publisher = std::make_unique<xllm::KVCacheEventPublisher>(
         journal, nlohmann::json::parse(argv[1]), "fixture", /*dp_size=*/2);
   }
   std::array<std::unique_ptr<xllm::BlockManagerImpl>, 2> devices;

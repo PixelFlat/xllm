@@ -66,15 +66,15 @@ class PrefixCache {
     if (event_journal_) {
       for (const auto& [hash, node] : cached_blocks_) {
         event_journal_->remove(event_scope_,
-                               KvCacheEventJournal::encode_hash(hash.data));
+                               KVCacheEventJournal::encode_hash(hash.data));
       }
     }
     exited_.store(true);
     sleep(2);
   };
 
-  void set_event_sink(std::shared_ptr<KvCacheEventJournal> journal,
-                      KvCacheEventScope scope) {
+  void set_event_sink(std::shared_ptr<KVCacheEventJournal> journal,
+                      KVCacheEventScope scope) {
     CHECK_EQ(num_blocks_, 0);
     CHECK(hasher_type_ == BlockHasherType::TEXT);
     event_journal_ = std::move(journal);
@@ -135,8 +135,8 @@ class PrefixCache {
                                     const size_t cached_blocks = 0);
 
  protected:
-  std::shared_ptr<KvCacheEventJournal> event_journal_;
-  KvCacheEventScope event_scope_;
+  std::shared_ptr<KVCacheEventJournal> event_journal_;
+  KVCacheEventScope event_scope_;
   struct Node {
     Block block;
     int64_t last_access_time = 0;

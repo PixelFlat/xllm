@@ -29,7 +29,7 @@ limitations under the License.
 
 namespace xllm {
 
-struct KvCacheEventScope {
+struct KVCacheEventScope {
   std::string model_id;
   int32_t dp_rank = 0;
   std::string medium = "gpu";
@@ -38,22 +38,22 @@ struct KvCacheEventScope {
 // The cache owns residency; exporters own transport and protocol conversion.
 // Producers only enqueue native records. The consumer owns residency, JSON
 // conversion and snapshots, and never holds the producer lock while doing them.
-class KvCacheEventJournal final {
+class KVCacheEventJournal final {
  public:
-  explicit KvCacheEventJournal(size_t capacity = 4096,
+  explicit KVCacheEventJournal(size_t capacity = 4096,
                                size_t pending_capacity = 65536);
-  static std::shared_ptr<KvCacheEventJournal> get_instance();
+  static std::shared_ptr<KVCacheEventJournal> get_instance();
   static std::string encode_hash(const uint8_t* hash);
   bool enabled() const;
   void disable();
 
-  void store(KvCacheEventScope scope,
+  void store(KVCacheEventScope scope,
              std::string hash,
              std::string parent_hash,
              std::vector<int32_t> tokens,
              uint32_t block_index);
-  void store_copy(KvCacheEventScope scope, std::string hash);
-  void remove(KvCacheEventScope scope, std::string hash);
+  void store_copy(KVCacheEventScope scope, std::string hash);
+  void remove(KVCacheEventScope scope, std::string hash);
   // Filter before copying residency data; cursors still cover all updates.
   nlohmann::json read(const std::string& epoch,
                       uint64_t cursor,
@@ -69,7 +69,7 @@ class KvCacheEventJournal final {
   enum class Operation : uint8_t { STORE, COPY, REMOVE };
   struct Update {
     Operation operation;
-    KvCacheEventScope scope;
+    KVCacheEventScope scope;
     std::string hash;
     std::string parent_hash;
     std::vector<int32_t> tokens;
