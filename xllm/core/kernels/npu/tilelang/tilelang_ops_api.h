@@ -135,6 +135,15 @@ void strided_q_a_rms_norm_dynamic_quant_out(const torch::Tensor& projection,
                                             torch::Tensor& output,
                                             torch::Tensor& scales);
 
+// Normalize the first 128 channels of BF16 [T,160] projection storage, with
+// prepared FP32 [128] affine values and epsilon 1e-6. Write independent
+// contiguous BF16 key [T,128] and weights [T,32]; T is 1/2/4/8/16.
+void strided_indexer_layer_norm_out(const torch::Tensor& projection,
+                                    const torch::Tensor& gamma,
+                                    const torch::Tensor& beta,
+                                    torch::Tensor& key,
+                                    torch::Tensor& weights);
+
 // Copy valid angle-table rows to independent contiguous consumer outputs.
 // Cache is BF16 [1048576,64]; positions are contiguous INT32/INT64 [T].
 // Valid positions are in [-1048576,1048576); T is 1, 2, 4, 8 or 16.

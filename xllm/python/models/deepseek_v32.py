@@ -1342,6 +1342,16 @@ class DeepseekV3Indexer(nn.Module):
             return self._project_k_and_weights(hidden)
         return self._project_key(cache_hidden), self._project_weights(hidden)
 
+    def _project_normalized_index_inputs(
+        self,
+        hidden: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        ctx: MlaIndexContext,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Return explicit normalization state with the projected key."""
+        k, weights = self._project_index_inputs(hidden, cache_hidden)
+        return k, weights, False
+
     def _pad_q_heads_to_kernel_gsize(
         self,
         q: torch.Tensor,
@@ -1398,9 +1408,13 @@ class DeepseekV3Indexer(nn.Module):
         ctx: MlaIndexContext,
         cos_sin: tuple[torch.Tensor, torch.Tensor],
         projected_k: torch.Tensor | None = None,
+        projected_k_is_normalized: bool = False,
     ) -> None:
+        if projected_k_is_normalized and projected_k is None:
+            raise ValueError("An already-normalized index key must be supplied explicitly")
         k = self._project_key(cache_hidden) if projected_k is None else projected_k
-        k = self.k_norm(k)
+        if not projected_k_is_normalized:
+            k = self.k_norm(k)
         if self.indexer_rope_interleave:
             k = self._apply_interleaved_rope(k, cos_sin)
         else:
@@ -1457,11 +1471,12 @@ class DeepseekV3Indexer(nn.Module):
         # Empty CP ranks still update/gather K without launching empty Q or
         # weights projections.
         has_queries = ctx.cp_context is None or ctx.cp_context.query_index.numel() != 0
+        k_is_normalized = False
         if has_queries:
             if self._weights_stream is not None:
                 self._weights_stream.wait_for_current()
             with self._weights_stream.activate() if self._weights_stream is not None else nullcontext():
-                k, weights = self._project_index_inputs(hidden, cache_hidden)
+                k, weights, k_is_normalized = self._project_normalized_index_inputs(hidden, cache_hidden, ctx)
             if self._q_stream is not None:
                 self._q_stream.wait_for_current()
                 with self._q_stream.activate():
@@ -1481,6 +1496,7 @@ class DeepseekV3Indexer(nn.Module):
             ctx,
             key_cos_sin,
             projected_k=k,
+            projected_k_is_normalized=k_is_normalized,
         )
         index_cache = ctx.index_cache
         index_cache_scale = ctx.index_cache_scale

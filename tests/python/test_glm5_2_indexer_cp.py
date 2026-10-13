@@ -543,7 +543,9 @@ def test_indexer_consumes_explicit_distinct_query_and_key_cos_sin(multi_stream: 
         indexer.select_qli(hidden, hidden, ctx, query_cos_sin, key_cos_sin, cache_hidden=hidden)
 
     project_key.assert_called_once_with(hidden)
-    update_cache.assert_called_once_with(hidden, ctx, key_cos_sin, projected_k=projected_k)
+    update_cache.assert_called_once_with(
+        hidden, ctx, key_cos_sin, projected_k=projected_k, projected_k_is_normalized=False
+    )
     assert update_cache.call_args.kwargs["projected_k"] is projected_k
     ctx.update_index_cache.assert_called_once()
     key, scale = ctx.update_index_cache.call_args.args

@@ -148,6 +148,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME strided_indexer_layer_norm
+  WRAPPER_SRCS strided_indexer_layer_norm_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME greedy_prefix_verify
   WRAPPER_SRCS greedy_prefix_verify_wrapper.cpp
 )

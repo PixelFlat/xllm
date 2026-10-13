@@ -1020,11 +1020,41 @@ class Glm52Indexer(DeepseekV3Indexer):
             persistent=False,
         )
         self._wk_weights_proj_ready = False
+        self._direct_index_norm_ready = False
+        self._direct_index_norm_layout = (
+            dtype == torch.bfloat16
+            and device.type in ("npu", "privateuseone")
+            and cfg.hidden_size == 6144
+            and cfg.index_head_dim == 128
+            and cfg.index_n_heads == 32
+            and cfg.tp_size == 16
+            and cfg.dp_size == 1
+            and cfg.cp_size == 1
+            and cfg.layerwise_split_size == 1
+        )
+        self.register_buffer(
+            "_index_norm_gamma",
+            torch.empty(self.head_dim, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_index_norm_beta",
+            torch.empty(self.head_dim, dtype=torch.float32, device=device),
+            persistent=False,
+        )
 
     def process_weights_after_loading(self) -> None:
+        self._wk_weights_proj_ready = False
+        self._direct_index_norm_ready = False
         self.wq_b.process_weights_after_loading()
         with torch.no_grad():
             self._wk_weights_proj_weight.copy_(torch.cat((self.wk.weight, self.weights_proj.weight), dim=0))
+            if self._direct_index_norm_layout and kernels.supports_strided_indexer_layer_norm_out(self.k_norm.eps):
+                # Preserve the runtime BF16 checkpoint rounding before promoting
+                # affine values once, outside graph capture and replay.
+                self._index_norm_gamma.copy_(self.k_norm.weight)
+                self._index_norm_beta.copy_(self.k_norm.bias)
+                self._direct_index_norm_ready = True
         self._wk_weights_proj_ready = True
 
     def _load_from_state_dict(
@@ -1037,6 +1067,8 @@ class Glm52Indexer(DeepseekV3Indexer):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
+        self._wk_weights_proj_ready = False
+        self._direct_index_norm_ready = False
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -1046,7 +1078,42 @@ class Glm52Indexer(DeepseekV3Indexer):
             unexpected_keys,
             error_msgs,
         )
-        self._wk_weights_proj_ready = False
+
+    def _use_direct_index_norm_for(
+        self,
+        hidden: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        ctx: MlaIndexContext,
+    ) -> bool:
+        if not self._direct_index_norm_ready or not self._wk_weights_proj_ready:
+            return False
+        forward_ctx = get_forward_context()
+        return (
+            forward_ctx.execution_state is not None
+            and not forward_ctx.metadata.is_prefill
+            and not forward_ctx.metadata.is_chunked_prefill
+            and ctx.cp_context is None
+            and hidden is cache_hidden
+            and hidden.ndim == 2
+            and hidden.shape[0] in (1, 2, 4, 8, 16)
+            and hidden.dtype == torch.bfloat16
+            and hidden.device == self._wk_weights_proj_weight.device
+            and hidden.is_contiguous()
+        )
+
+    def _project_normalized_index_inputs(
+        self,
+        hidden: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        ctx: MlaIndexContext,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        if not self._use_direct_index_norm_for(hidden, cache_hidden, ctx):
+            return super()._project_normalized_index_inputs(hidden, cache_hidden, ctx)
+        projected = F.linear(hidden, self._wk_weights_proj_weight)
+        key = torch.empty((hidden.shape[0], self.head_dim), dtype=projected.dtype, device=projected.device)
+        weights = torch.empty((hidden.shape[0], self.n_head), dtype=projected.dtype, device=projected.device)
+        kernels.strided_indexer_layer_norm_out(projected, self._index_norm_gamma, self._index_norm_beta, key, weights)
+        return key, weights, True
 
     def _project_k_and_weights(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(self, "_wk_weights_proj_ready", False):

@@ -204,6 +204,38 @@ def _strided_q_a_rms_norm_dynamic_quant_out_fake(
     return None
 
 
+def _strided_indexer_layer_norm_out_fake(
+    projection: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+) -> None:
+    if projection.ndim != 2 or projection.shape[1] != 160 or projection.dtype != torch.bfloat16:
+        raise ValueError("Strided Indexer normalization requires a BF16 [T,160] projection")
+    tokens = projection.shape[0]
+    if tokens not in (1, 2, 4, 8, 16):
+        raise ValueError("Strided Indexer normalization supports T=1/2/4/8/16")
+    if any(value.shape != (128,) or value.dtype != torch.float32 for value in (gamma, beta)):
+        raise ValueError("Strided Indexer affine values must be FP32 [128]")
+    if key.shape != (tokens, 128) or key.dtype != torch.bfloat16:
+        raise ValueError("Strided Indexer key must be BF16 [T,128]")
+    if weights.shape != (tokens, 32) or weights.dtype != torch.bfloat16:
+        raise ValueError("Strided Indexer weights must be BF16 [T,32]")
+    tensors = (projection, gamma, beta, key, weights)
+    if any(value.device != projection.device or not value.is_contiguous() for value in tensors):
+        raise ValueError("Strided Indexer tensors must be contiguous and on the same device")
+    if any(
+        torch._C._is_alias_of(destination, value)
+        for destination in (key, weights)
+        for value in (projection, gamma, beta)
+    ):
+        raise ValueError("Strided Indexer outputs must not alias inputs")
+    if torch._C._is_alias_of(key, weights):
+        raise ValueError("Strided Indexer outputs must have independent storage")
+    return None
+
+
 def _rope_table_gather_out_fake(
     cache: torch.Tensor,
     positions: torch.Tensor,
@@ -1354,6 +1386,7 @@ register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
 register_fake("xllm_ops::mla_query_rope_out", _mla_query_rope_out_fake)
 register_fake("xllm_ops::strided_q_a_rms_norm_dynamic_quant_out", _strided_q_a_rms_norm_dynamic_quant_out_fake)
+register_fake("xllm_ops::strided_indexer_layer_norm_out", _strided_indexer_layer_norm_out_fake)
 register_fake("xllm_ops::rope_table_gather_out", _rope_table_gather_out_fake)
 register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)

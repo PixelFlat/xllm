@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import struct
+
 import torch
 import torch_npu
 
@@ -23,6 +25,24 @@ rms_norm = torch.ops.xllm_ops.rms_norm
 fused_add_rms_norm = torch.ops.xllm_ops.fused_add_rms_norm
 fused_add_gemma_rms_norm = torch.ops.xllm_ops.fused_add_gemma_rms_norm
 _FUSED_ADD_RMS_NORM_DYNAMIC_QUANT = torch_npu.npu_add_rms_norm_dynamic_quant
+_STRIDED_INDEXER_LAYER_NORM_OUT = getattr(torch.ops.xllm_ops, "strided_indexer_layer_norm_out", None)
+_STRIDED_INDEXER_EPSILONS = (1e-6, struct.unpack("f", struct.pack("f", 1e-6))[0])
+
+
+def supports_strided_indexer_layer_norm_out(epsilon: float) -> bool:
+    """Check direct Indexer normalization capability before graph capture."""
+    return _STRIDED_INDEXER_LAYER_NORM_OUT is not None and epsilon in _STRIDED_INDEXER_EPSILONS
+
+
+def strided_indexer_layer_norm_out(
+    projection: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+) -> None:
+    """Normalize packed projection storage into caller-owned key and weights."""
+    _STRIDED_INDEXER_LAYER_NORM_OUT(projection, gamma, beta, key, weights)
 
 
 def gemma_rms_norm(
@@ -149,6 +169,8 @@ __all__ = [
     "fused_add_gemma_rms_norm",
     "fused_add_rms_norm_dynamic_quant",
     "rms_norm_dynamic_quant",
+    "strided_indexer_layer_norm_out",
+    "supports_strided_indexer_layer_norm_out",
     "l2_norm",
     "rms_norm_gated",
     "rms_norm_sigmoid_gated",

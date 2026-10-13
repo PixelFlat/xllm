@@ -98,6 +98,8 @@ _EXPORTS = {
         "rms_norm_dynamic_quant",
         "rms_norm_gated",
         "rms_norm_sigmoid_gated",
+        "strided_indexer_layer_norm_out",
+        "supports_strided_indexer_layer_norm_out",
     ),
     "quantization": (
         "dynamic_quant",
