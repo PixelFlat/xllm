@@ -732,6 +732,9 @@ TORCH_LIBRARY(xllm_ops, m) {
       "mla_query_rope_out(Tensor query, Tensor cos, Tensor sin, Tensor "
       "patterns, "
       "Tensor(a!) output) -> Tensor(a!)");
+  m.def(
+      "rope_table_gather_out(Tensor cache, Tensor positions, Tensor(a!) "
+      "half_cos, Tensor(b!) half_sin, Tensor(c!) cos, Tensor(d!) sin) -> ()");
   // In-place partial rotary embedding (interleaved). x is 4D [B,N,S,D], r1/r2
   // are cos/sin [B,1,1,rope_head_dim]; partial_slice=[rope_start,
   // rope_head_dim]. Mirrors C++ apply_partial_rope
@@ -959,6 +962,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
          TORCH_FN(xllm::kernel::npu::rms_norm_dynamic_quant));
   m.impl("mla_query_rope_out",
          TORCH_FN(xllm::kernel::npu::tilelang::mla_query_rope_out));
+  m.impl("rope_table_gather_out",
+         TORCH_FN(xllm::kernel::npu::tilelang::rope_table_gather_out));
   m.impl("npu_inplace_partial_rotary_mul",
          TORCH_FN(xllm::kernel::npu::npu_inplace_partial_rotary_mul));
   m.impl("silu_and_mul", TORCH_FN(xllm::silu_and_mul_npu));

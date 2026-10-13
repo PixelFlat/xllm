@@ -56,6 +56,7 @@ from xllm.python.model_executor.cp_utils import (
 )
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
+    in_acl_graph,
     record_layer_event,
 )
 from xllm.python.model_loader import W8A8WeightLoader, mla_head_split, moe_shard
@@ -68,13 +69,11 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekV3MLP,
     DeepseekV3Model,
     DeepseekV3MoE,
+    DeepseekYarnRotaryEmbedding,
     W8A8AttentionLinear,
     _interleave_rope_with,
     _tp_rank_from_device,
     _validate_rope_cos_sin,
-)
-from xllm.python.models.deepseek_v32 import (
-    DeepseekYarnRotaryEmbedding as Glm52YarnRotaryEmbedding,
 )
 
 _MLAPO_V2_Q_LORA_RANK = 1536
@@ -82,6 +81,79 @@ _MLAPO_V2_KV_LORA_RANK = 512
 _MLAPO_V2_QK_NOPE_HEAD_DIM = 128
 _MLAPO_V2_QK_ROPE_HEAD_DIM = 64
 _MLAPO_V2_V_HEAD_DIM = 128
+
+
+class Glm52YarnRotaryEmbedding(DeepseekYarnRotaryEmbedding):
+    """Keep table values unchanged while preparing stable decode layouts."""
+
+    _decode_gather_available: bool = False
+
+    def __init__(
+        self,
+        head_dim: int,
+        original_max_position_embeddings: int,
+        scaling_factor: float,
+        base: float,
+        beta_fast: int,
+        beta_slow: int,
+        mscale: float,
+        mscale_all_dim: float,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        *,
+        enable_decode_gather: bool = False,
+    ) -> None:
+        super().__init__(
+            head_dim,
+            original_max_position_embeddings,
+            scaling_factor,
+            base,
+            beta_fast,
+            beta_slow,
+            mscale,
+            mscale_all_dim,
+            dtype=dtype,
+            device=device,
+        )
+        self._decode_gather_available = (
+            enable_decode_gather
+            and self.cos_sin_cache.device.type in ("npu", "privateuseone")
+            and kernels.supports_rope_table_gather_out(self.cos_sin_cache)
+        )
+
+    def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not (
+            self._decode_gather_available
+            and in_acl_graph()
+            and positions.ndim == 1
+            and positions.shape[0] in (1, 2, 4, 8, 16)
+            and positions.dtype in (torch.int32, torch.int64)
+            and positions.device == self.cos_sin_cache.device
+            and positions.is_contiguous()
+        ):
+            return super().forward(positions)
+        tokens = positions.shape[0]
+        shapes = ((tokens, 32), (tokens, 32), (tokens, 1, 1, 64), (tokens, 1, 1, 64))
+        outputs = tuple(
+            torch.empty(shape, dtype=self.cos_sin_cache.dtype, device=self.cos_sin_cache.device) for shape in shapes
+        )
+        return kernels.rope_table_gather_out(self.cos_sin_cache, positions, *outputs)
+
+
+def _make_glm_rotary_embedding(cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> Glm52YarnRotaryEmbedding:
+    return Glm52YarnRotaryEmbedding(
+        cfg.qk_rope_head_dim,
+        cfg.original_max_position_embeddings,
+        cfg.rope_scaling_factor,
+        cfg.rope_theta,
+        cfg.rope_beta_fast,
+        cfg.rope_beta_slow,
+        cfg.rope_mscale,
+        cfg.rope_mscale_all_dim,
+        dtype=dtype,
+        device=device,
+        enable_decode_gather=cfg.cp_size == 1 and cfg.layerwise_split_size == 1,
+    )
 
 
 def _can_use_mlapo_v2(cfg: Glm52Config, device: torch.device) -> bool:
@@ -1095,6 +1167,11 @@ class Glm52Model(DeepseekV3Model):
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(cfg, dtype, device)
         self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
+
+    def _make_rotary_embedding(
+        self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device
+    ) -> Glm52YarnRotaryEmbedding:
+        return _make_glm_rotary_embedding(cfg, dtype, device)
 
     def _make_decoder(
         self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device

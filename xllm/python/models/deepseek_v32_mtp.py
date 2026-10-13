@@ -35,7 +35,6 @@ from xllm.python.models.deepseek_v32 import (
     DeepseekV3Config,
     DeepseekV3ForCausalLM,
     DeepseekV3Model,
-    DeepseekYarnRotaryEmbedding,
 )
 
 # The loader strips "model.", so a bare "shared_head.norm.weight" needs no entry.
@@ -78,18 +77,7 @@ class DeepseekV32MtpModel(DeepseekV3Model):
         self.hnorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
         self.layers = nn.ModuleList([self._make_decoder(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype, device)
-        self.rotary = DeepseekYarnRotaryEmbedding(
-            cfg.qk_rope_head_dim,
-            cfg.original_max_position_embeddings,
-            cfg.rope_scaling_factor,
-            cfg.rope_theta,
-            cfg.rope_beta_fast,
-            cfg.rope_beta_slow,
-            cfg.rope_mscale,
-            cfg.rope_mscale_all_dim,
-            dtype=dtype,
-            device=device,
-        )
+        self.rotary = self._make_rotary_embedding(cfg, dtype, device)
         self.enable_rot = False
         self._reuse_topk_by_layer = (False,) * cfg.n_layers
 

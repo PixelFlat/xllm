@@ -2231,7 +2231,14 @@ class DeepseekV3Model(nn.Module):
         )
         self.layers = nn.ModuleList([self._make_decoder(cfg, i, dtype, device) for i in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device)
-        self.rotary = DeepseekYarnRotaryEmbedding(
+        self.rotary = self._make_rotary_embedding(cfg, dtype, device)
+
+        self.aux_hidden_capture = AuxHiddenCapture(())
+
+    def _make_rotary_embedding(
+        self, cfg: DeepseekV3Config, dtype: torch.dtype, device: torch.device
+    ) -> DeepseekYarnRotaryEmbedding:
+        return DeepseekYarnRotaryEmbedding(
             cfg.qk_rope_head_dim,
             cfg.original_max_position_embeddings,
             cfg.rope_scaling_factor,
@@ -2243,8 +2250,6 @@ class DeepseekV3Model(nn.Module):
             dtype=dtype,
             device=device,
         )
-
-        self.aux_hidden_capture = AuxHiddenCapture(())
 
     def _make_decoder(
         self, cfg: DeepseekV3Config, layer_id: int, dtype: torch.dtype, device: torch.device
