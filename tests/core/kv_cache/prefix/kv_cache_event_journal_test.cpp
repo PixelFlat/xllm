@@ -20,12 +20,18 @@ limitations under the License.
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <zmq.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <thread>
 
 #include "core/kv_cache/prefix/kv_cache_event_publisher.h"
+
+extern "C" int __real_zmq_msg_recv(zmq_msg_t* message, void* socket, int flags);
 
 namespace xllm {
 namespace {
@@ -33,6 +39,71 @@ const std::string kFirstHash(32, '1');
 const std::string kSecondHash(32, '2');
 const KvCacheEventScope kDevice{"model", 0, "gpu"};
 const KvCacheEventScope kHost{"model", 0, "cpu"};
+std::atomic<std::shared_ptr<KvCacheEventJournal>> replay_update_journal;
+
+struct EventFrame {
+  uint64_t sequence = 0;
+  nlohmann::json payload;
+};
+
+class SubscriberSocket final {
+ public:
+  SubscriberSocket(void* context, int32_t type, const std::string& endpoint)
+      : socket_(zmq_socket(context, type), &zmq_close) {
+    CHECK(socket_);
+    const int32_t linger = 0;
+    const int32_t timeout = 2000;
+    CHECK_EQ(zmq_setsockopt(socket_.get(), ZMQ_LINGER, &linger, sizeof(linger)),
+             0);
+    CHECK_EQ(
+        zmq_setsockopt(socket_.get(), ZMQ_RCVTIMEO, &timeout, sizeof(timeout)),
+        0);
+    if (type == ZMQ_SUB) {
+      CHECK_EQ(zmq_setsockopt(socket_.get(), ZMQ_SUBSCRIBE, "", 0), 0);
+    }
+    CHECK_EQ(zmq_connect(socket_.get(), endpoint.c_str()), 0);
+  }
+
+  bool request_replay() {
+    const std::array<uint8_t, 8> start{};
+    return zmq_send(socket_.get(), nullptr, 0, ZMQ_SNDMORE) == 0 &&
+           zmq_send(socket_.get(), start.data(), start.size(), 0) ==
+               static_cast<int32_t>(start.size());
+  }
+
+  std::optional<EventFrame> receive() {
+    std::array<uint8_t, 4096> buffer{};
+    EventFrame result;
+    for (int32_t frame = 0; frame < 3; ++frame) {
+      const int32_t size =
+          zmq_recv(socket_.get(), buffer.data(), buffer.size(), 0);
+      if (size < 0 || static_cast<size_t>(size) > buffer.size()) {
+        return std::nullopt;
+      }
+      int32_t more = 0;
+      size_t length = sizeof(more);
+      if (zmq_getsockopt(socket_.get(), ZMQ_RCVMORE, &more, &length) != 0 ||
+          (more != 0) != (frame < 2)) {
+        return std::nullopt;
+      }
+      if (frame == 1) {
+        if (size != static_cast<int32_t>(sizeof(uint64_t))) {
+          return std::nullopt;
+        }
+        for (int32_t index = 0; index < size; ++index) {
+          result.sequence = (result.sequence << 8) | buffer[index];
+        }
+      } else if (frame == 2 && size > 0) {
+        result.payload =
+            nlohmann::json::from_msgpack(buffer.begin(), buffer.begin() + size);
+      }
+    }
+    return result;
+  }
+
+ private:
+  std::unique_ptr<void, decltype(&zmq_close)> socket_;
+};
 
 class BoundPort final {
  public:
@@ -66,6 +137,102 @@ class BoundPort final {
   std::string endpoint_;
 };
 }  // namespace
+
+// This test binary alone wraps replay receive. Inject a producer update after
+// the live publication boundary and immediately before the snapshot callback.
+extern "C" int __wrap_zmq_msg_recv(zmq_msg_t* message,
+                                   void* socket,
+                                   int flags) {
+  const int32_t result = __real_zmq_msg_recv(message, socket, flags);
+  if (result < 0) {
+    return result;
+  }
+  int32_t type = 0;
+  size_t length = sizeof(type);
+  if (zmq_getsockopt(socket, ZMQ_TYPE, &type, &length) != 0 ||
+      type != ZMQ_ROUTER) {
+    return result;
+  }
+  const auto journal = replay_update_journal.exchange(nullptr);
+  if (journal) {
+    journal->store(kDevice, kSecondHash, kFirstHash, {3, 4}, /*block_index=*/1);
+    journal->store_copy(kHost, kSecondHash);
+  }
+  return result;
+}
+
+TEST(KvCacheEventPublisherTest, ReplaySnapshotMatchesItsLivePublication) {
+  BoundPort engine_port;
+  BoundPort pool_port;
+  BoundPort replay_port;
+  auto journal = std::make_shared<KvCacheEventJournal>();
+  journal->store(kDevice, kFirstHash, "", {1, 2}, /*block_index=*/0);
+  journal->store_copy(kHost, kFirstHash);
+  std::unique_ptr<void, decltype(&zmq_ctx_term)> context(zmq_ctx_new(),
+                                                         &zmq_ctx_term);
+  ASSERT_TRUE(context);
+  engine_port.release();
+  pool_port.release();
+  replay_port.release();
+  KvCacheEventPublisher publisher(
+      journal,
+      {{"endpoint", engine_port.endpoint()},
+       {"motor_pool_endpoint", pool_port.endpoint()},
+       {"replay_endpoint", replay_port.endpoint()},
+       {"snapshot_interval_seconds", 60}},
+      "model",
+      /*dp_size=*/1);
+  ASSERT_TRUE(publisher.healthy());
+  SubscriberSocket engine(context.get(), ZMQ_SUB, engine_port.endpoint());
+  SubscriberSocket pool(context.get(), ZMQ_SUB, pool_port.endpoint());
+  SubscriberSocket replay(context.get(), ZMQ_DEALER, replay_port.endpoint());
+  ASSERT_TRUE(engine.receive());
+  ASSERT_TRUE(pool.receive());
+  // Let any coalesced subscription reset finish; the injection then exercises
+  // an ordinary incremental iteration, rather than a pre-existing reset page.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  replay_update_journal.store(journal);
+  ASSERT_TRUE(replay.request_replay());
+  const auto recovered = replay.receive();
+  ASSERT_TRUE(recovered);
+  const auto end = replay.receive();
+  ASSERT_TRUE(end);
+  EXPECT_EQ(end->sequence, UINT64_MAX);
+  EXPECT_TRUE(end->payload.is_null());
+  EXPECT_FALSE(replay_update_journal.load());
+  ASSERT_EQ(recovered->payload[1].size(), 5);
+  EXPECT_EQ(recovered->payload[1][0]["type"], "AllBlocksCleared");
+
+  std::optional<EventFrame> live;
+  do {
+    live = engine.receive();
+    ASSERT_TRUE(live);
+  } while (live->sequence < recovered->sequence);
+  EXPECT_EQ(live->sequence, recovered->sequence);
+  EXPECT_EQ(live->payload[1], recovered->payload[1]);
+
+  const auto snapshot = journal->read("", 0);
+  EXPECT_EQ(snapshot["events"].size(), 4);
+  journal->remove(kDevice, kSecondHash);
+  std::optional<EventFrame> following;
+  do {
+    following = engine.receive();
+    ASSERT_TRUE(following);
+    for (const auto& event : following->payload[1]) {
+      if (event["type"] == "BlockStored" && event["medium"] == "gpu") {
+        EXPECT_NE(
+            event["block_hashes"],
+            nlohmann::json({KvCacheEventPublisher::wire_hash(kSecondHash)}))
+            << "A replay-covered update was published again as a live delta";
+      }
+    }
+  } while (following->payload[1][0]["type"] != "BlockRemoved");
+  EXPECT_GT(following->sequence, recovered->sequence);
+  ASSERT_EQ(following->payload[1].size(), 1);
+  EXPECT_EQ(following->payload[1][0]["block_hashes"],
+            nlohmann::json({KvCacheEventPublisher::wire_hash(kSecondHash)}));
+  EXPECT_TRUE(publisher.healthy());
+}
 
 TEST(KvCacheEventJournalTest, HostCopySurvivesDeviceEviction) {
   KvCacheEventJournal journal;

@@ -153,6 +153,11 @@ bool send_frame(void* socket, const void* data, size_t size, bool more) {
 
 using ReplayPayload = std::shared_ptr<std::vector<uint8_t>>;
 
+struct ReplaySnapshot {
+  ReplayPayload payload;
+  uint64_t sequence = 0;
+};
+
 void release_replay_payload(void* /*data*/, void* hint) {
   std::unique_ptr<ReplayPayload> owner(static_cast<ReplayPayload*>(hint));
 }
@@ -293,9 +298,7 @@ class EventSocket final {
   }
 
   template <typename Snapshot>
-  bool replay(const Snapshot& snapshot,
-              uint64_t stream_sequence,
-              bool& received) {
+  bool replay(const Snapshot& snapshot, bool& received) {
     received = false;
     if (discarding_request_) {
       return discard_request();
@@ -350,14 +353,17 @@ class EventSocket final {
       LOG(WARNING) << "Ignoring malformed KV replay request";
       return true;
     }
-    const auto& packed = snapshot();
-    ZmqMessage payload(packed);
+    const std::optional<ReplaySnapshot> response = snapshot();
+    if (!response) {
+      return false;
+    }
+    ZmqMessage payload(response->payload);
     if (!payload.valid()) {
       return false;
     }
     // Snapshot recovery uses the live engine watermark, not the ROUTER's
     // independent counter. The next live batch follows this watermark.
-    const auto bytes = sequence_bytes(stream_sequence);
+    const auto bytes = sequence_bytes(response->sequence);
     if (!send_frame(socket_.get(),
                     zmq_msg_data(identity.get()),
                     zmq_msg_size(identity.get()),
@@ -569,6 +575,46 @@ bool KvCacheEventPublisher::run_impl(
   auto next_repair = next_snapshot;
   bool disabled_reported = false;
   bool subscription_pending = false;
+  const auto publish_page = [&](const nlohmann::json& page) -> bool {
+    const bool reset = page["reset"].get<bool>();
+    for (int32_t rank = 0; rank < dp_size; ++rank) {
+      nlohmann::json engine_events = nlohmann::json::array();
+      nlohmann::json pool_events = nlohmann::json::array();
+      if (reset) {
+        engine_events.push_back({{"type", "AllBlocksCleared"}});
+        pool_events.push_back(
+            {{"event_type", "cleared"}, {"medium", "cpu"}, {"dp_rank", rank}});
+      }
+      for (const auto& event : page["events"]) {
+        if (event["model_id"] != model_id || event["dp_rank"] != rank) {
+          continue;
+        }
+        engine_events.push_back(engine_event(event));
+        if (event["medium"] == "cpu") {
+          pool_events.push_back(pool_event(event));
+        }
+      }
+      if (!engine_events.empty() &&
+          !engines[rank]->publish(engine_batch(engine_events, rank))) {
+        return false;
+      }
+      if (pools[rank] && !pool_events.empty() &&
+          !pools[rank]->publish({{"events", pool_events}})) {
+        return false;
+      }
+    }
+    epoch = page["epoch"].get<std::string>();
+    cursor = page["cursor"].get<uint64_t>();
+    if (reset) {
+      const auto published_at = std::chrono::steady_clock::now();
+      subscription_pending = false;
+      next_snapshot = published_at + std::chrono::seconds(snapshot_seconds);
+      next_subscription_snapshot = published_at + kSubscriptionSnapshotInterval;
+      repair_until = published_at + std::chrono::seconds(2);
+      next_repair = published_at + std::chrono::milliseconds(250);
+    }
+    return true;
+  };
   const auto publish_loop = [&]() -> bool {
     while (!stopped_.load()) {
       bool subscription = false;
@@ -594,50 +640,62 @@ bool KvCacheEventPublisher::run_impl(
         disabled_reported = true;
       }
       const bool reset = page["reset"].get<bool>();
-      epoch = page["epoch"].get<std::string>();
-      cursor = page["cursor"].get<uint64_t>();
-      if (reset) {
-        subscription_pending = false;
-        next_snapshot = now + std::chrono::seconds(snapshot_seconds);
-        repair_until = now + std::chrono::seconds(2);
-        next_repair = now + std::chrono::milliseconds(250);
+      if (!publish_page(page)) {
+        return false;
       }
-      for (int32_t rank = 0; rank < dp_size; ++rank) {
-        nlohmann::json engine_events = nlohmann::json::array();
-        nlohmann::json pool_events = nlohmann::json::array();
-        if (reset) {
-          engine_events.push_back({{"type", "AllBlocksCleared"}});
-          pool_events.push_back({{"event_type", "cleared"},
-                                 {"medium", "cpu"},
-                                 {"dp_rank", rank}});
-        }
-        for (const auto& event : page["events"]) {
-          if (event["model_id"] != model_id || event["dp_rank"] != rank) {
+      if (std::chrono::steady_clock::now() >= next_replay_snapshot) {
+        nlohmann::json replay_state;
+        std::optional<ReplaySnapshotBatch> replay_batch;
+        for (int32_t rank = 0; rank < dp_size; ++rank) {
+          if (!replays[rank]) {
             continue;
           }
-          engine_events.push_back(engine_event(event));
-          if (event["medium"] == "cpu") {
-            pool_events.push_back(pool_event(event));
+          // ROUTER fair-queues peers. Leave requests queued during cooldown;
+          // a bounded batch serves multiple peers without starving live work.
+          for (int32_t request = 0; request < kMaxReplayRequestsPerBatch;
+               ++request) {
+            bool received = false;
+            if (!replays[rank]->replay(
+                    [&]() -> std::optional<ReplaySnapshot> {
+                      if (!replay_batch) {
+                        if (!reset) {
+                          replay_state = journal_->read("", 0);
+                          // The fresh read may include updates that arrived
+                          // after the live page. Publish this exact state and
+                          // advance the cursor before capturing its watermark.
+                          const bool unpublished =
+                              replay_state["epoch"] != epoch ||
+                              replay_state["cursor"] != cursor;
+                          if (unpublished && !publish_page(replay_state)) {
+                            return std::nullopt;
+                          }
+                        }
+                        replay_batch.emplace(
+                            reset ? page : replay_state, model_id, dp_size);
+                      }
+                      return ReplaySnapshot{replay_batch->payload(rank),
+                                            engines[rank]->sequence()};
+                    },
+                    received)) {
+              return false;
+            }
+            if (!received) {
+              break;
+            }
           }
         }
-        if (!engine_events.empty() &&
-            !engines[rank]->publish(engine_batch(engine_events, rank))) {
-          return false;
-        }
-        if (pools[rank] && !pool_events.empty() &&
-            !pools[rank]->publish({{"events", pool_events}})) {
-          return false;
+        if (replay_batch) {
+          // Payloads expire with this batch. Rebuild fresh state next time,
+          // rather than returning stale bytes with a newer live watermark.
+          next_replay_snapshot =
+              std::chrono::steady_clock::now() + kReplaySnapshotInterval;
         }
       }
-      if (reset) {
-        // Coalesce joins across sockets and iterations without losing a join
-        // received during the cooldown. Incremental events continue meanwhile.
-        next_subscription_snapshot =
-            std::chrono::steady_clock::now() + kSubscriptionSnapshotInterval;
-      }
-      // Engine and pool are separate ordered streams. Reconfirm current Host
-      // copies after a reset so either consumer's clear can finish first.
-      if (!pool_endpoint.empty() && now >= next_repair && now < repair_until) {
+      // Replay replies precede Host repair so a reused reset page cannot be
+      // paired with the sequence of a newer Host-only publication.
+      const auto repair_now = std::chrono::steady_clock::now();
+      if (!pool_endpoint.empty() && repair_now >= next_repair &&
+          repair_now < repair_until) {
         const nlohmann::json state =
             journal_->read("", 0, /*limit=*/1024, /*medium=*/"cpu");
         for (int32_t rank = 0; rank < dp_size; ++rank) {
@@ -658,49 +716,7 @@ bool KvCacheEventPublisher::run_impl(
             }
           }
         }
-        next_repair = now + std::chrono::milliseconds(250);
-      }
-      if (std::chrono::steady_clock::now() >= next_replay_snapshot) {
-        nlohmann::json replay_state;
-        std::optional<ReplaySnapshotBatch> replay_batch;
-        for (int32_t rank = 0; rank < dp_size; ++rank) {
-          if (!replays[rank]) {
-            continue;
-          }
-          // ROUTER fair-queues peers. Leave requests queued during cooldown;
-          // a bounded batch serves multiple peers without starving live work.
-          for (int32_t request = 0; request < kMaxReplayRequestsPerBatch;
-               ++request) {
-            bool received = false;
-            if (!replays[rank]->replay(
-                    [&]() -> const ReplayPayload& {
-                      if (!replay_batch) {
-                        // A reset already published in this iteration has the
-                        // same live watermarks and needs no second directory
-                        // walk.
-                        if (!reset) {
-                          replay_state = journal_->read("", 0);
-                        }
-                        replay_batch.emplace(
-                            reset ? page : replay_state, model_id, dp_size);
-                      }
-                      return replay_batch->payload(rank);
-                    },
-                    engines[rank]->sequence(),
-                    received)) {
-              return false;
-            }
-            if (!received) {
-              break;
-            }
-          }
-        }
-        if (replay_batch) {
-          // Payloads expire with this batch. Rebuild fresh state next time,
-          // rather than returning stale bytes with a newer live watermark.
-          next_replay_snapshot =
-              std::chrono::steady_clock::now() + kReplaySnapshotInterval;
-        }
+        next_repair = repair_now + std::chrono::milliseconds(250);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

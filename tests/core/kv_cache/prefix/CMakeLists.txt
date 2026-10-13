@@ -9,6 +9,20 @@ cc_test(
     :kv_cache_events
     GTest::gtest_main
 )
+target_link_options(kv_cache_event_journal_test PRIVATE
+  "-Wl,--wrap=zmq_msg_recv")
+if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+  target_include_directories(kv_cache_event_journal_test SYSTEM PRIVATE
+    ${ZMQ_INCLUDE_DIR})
+  target_link_libraries(kv_cache_event_journal_test PRIVATE ${ZMQ_LIBRARY})
+else()
+  find_package(ZeroMQ CONFIG REQUIRED)
+  if(TARGET libzmq-static)
+    target_link_libraries(kv_cache_event_journal_test PRIVATE libzmq-static)
+  else()
+    target_link_libraries(kv_cache_event_journal_test PRIVATE libzmq)
+  endif()
+endif()
 
 include(cc_binary)
 cc_binary(
