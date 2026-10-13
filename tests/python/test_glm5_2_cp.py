@@ -987,6 +987,7 @@ def test_glm_attention_dynamic_fused_decode_reuses_topk_after_cache_write() -> N
     attention._fused_mla_ready = True
     attention._use_mlapo_v2 = False
     attention._dynamic_mla_ready = True
+    attention._decode_strided_q_a_ready = False
     attention.indexer = MagicMock()
     attention.num_heads_local = 1
     attention.q_lora_rank = 2

@@ -127,6 +127,14 @@ torch::Tensor mla_query_rope_out(const torch::Tensor& query,
                                  const torch::Tensor& patterns,
                                  torch::Tensor& output);
 
+// Read Q-A directly at offset 576 from BF16 [T,2624] KV/Q-A storage.
+// Gamma is BF16 [2048], output INT8 [T,2048], scales FP32 [T].
+// T is 1/2/4/8/16 and RMS epsilon is 1e-5. Outputs must not alias inputs.
+void strided_q_a_rms_norm_dynamic_quant_out(const torch::Tensor& projection,
+                                            const torch::Tensor& gamma,
+                                            torch::Tensor& output,
+                                            torch::Tensor& scales);
+
 // Copy valid angle-table rows to independent contiguous consumer outputs.
 // Cache is BF16 [1048576,64]; positions are contiguous INT32/INT64 [T].
 // Valid positions are in [-1048576,1048576); T is 1, 2, 4, 8 or 16.

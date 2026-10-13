@@ -498,6 +498,7 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
     def __init__(self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(cfg, layer_id, dtype, device)
         self._attn_dp_layout: AttnDpLayout | None = None
+        self._decode_strided_q_a_ready = False
         self.register_buffer("_decode_w_uk", None, persistent=False)
         self.register_buffer("_decode_query_rope_patterns", None, persistent=False)
         self.register_buffer("W_UV_owner", torch.empty(0, dtype=dtype, device=device), persistent=False)
@@ -536,10 +537,12 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
         # Reloads must not retain a projection absorbed from the previous weights.
         self._decode_w_uk = None
         self._decode_query_rope_patterns = None
+        self._decode_strided_q_a_ready = False
         if getattr(self, "_attn_dp_layout", None) is None:
             super().process_weights_after_loading()
             self._prepare_decode_latent_weight()
             self._prepare_decode_query_rope()
+            self._prepare_decode_q_a_quant()
             return
         if self.o_proj._dynamic_activation and owner_kv_b_proj is None:
             raise ValueError("dynamic attention DP requires the owner TP shard of kv_b_proj")
@@ -642,6 +645,44 @@ class Glm52MLAAttention(DeepseekV3MLAAttention):
 
     def _mlapo_enabled(self, cfg: Glm52Config, device: torch.device) -> bool:
         return _can_use_mlapo_v2(cfg, device)
+
+    def _prepare_decode_q_a_quant(self) -> None:
+        """Choose the exact supported direct-read path after loading weights."""
+        self._decode_strided_q_a_ready = False
+        weight = self.q_a_layernorm.weight
+        projection = self._a_projection()
+        if (
+            self._use_fused_mla_decode
+            and self._dynamic_mla_ready
+            and self._can_fuse_q_norm_quant()
+            and kernels.supports_strided_q_a_quant_out(self.q_a_layernorm.eps)
+            and projection is not None
+            and projection.weight.shape == (6144, 2624)
+            and weight.device.type in ("npu", "privateuseone")
+            and weight.dtype == torch.bfloat16
+            and weight.shape == (2048,)
+            and weight.is_contiguous()
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and self.q_lora_rank == 2048
+            and self.cfg.tp_size == 16
+            and self.cfg.dp_size == 1
+            and self.cfg.cp_size == 1
+            and self.cfg.layerwise_split_size == 1
+            and self._attn_dp_layout is None
+        ):
+            self._decode_strided_q_a_ready = True
+
+    def _use_strided_q_a_quant_for(self, num_tokens: int) -> bool:
+        ctx = get_forward_context()
+        return (
+            self._decode_strided_q_a_ready
+            and ctx.execution_state is not None
+            and not ctx.metadata.is_prefill
+            and not ctx.metadata.is_chunked_prefill
+            and ctx.cp_context is None
+            and num_tokens in (1, 2, 4, 8, 16)
+        )
 
     def _init_a_projections(self, cfg: Glm52Config, device: torch.device) -> None:
         self._combined_qkv: W8A8AttentionLinear | None = None

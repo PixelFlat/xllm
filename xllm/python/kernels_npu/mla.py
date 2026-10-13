@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import struct
+
 import torch
 import torch_npu
 
@@ -36,6 +38,47 @@ _KV_RMSNORM_ROPE_CACHE = getattr(
     "npu_kv_rmsnorm_rope_cache",
     None,
 )
+_STRIDED_Q_A_QUANT_OUT = getattr(torch.ops.xllm_ops, "strided_q_a_rms_norm_dynamic_quant_out", None)
+# ModelArgs stores epsilon as a C++ float before exporting it to Python.
+# Accept only the literal and its exact FP32 representation, not nearby values.
+_STRIDED_Q_A_QUANT_EPSILONS = (1e-5, struct.unpack("f", struct.pack("f", 1e-5))[0])
+
+
+def supports_strided_q_a_quant_out(epsilon: float = 1e-5) -> bool:
+    """Whether the initialized native library provides direct Q-A quantization."""
+    return _STRIDED_Q_A_QUANT_OUT is not None and epsilon in _STRIDED_Q_A_QUANT_EPSILONS
+
+
+def _validate_strided_q_a_quant_geometry(
+    tokens: int,
+    kv_lora_rank: int,
+    q_lora_rank: int,
+    qk_rope_head_dim: int,
+    epsilon: float,
+    fuse_q_norm_quant: bool,
+) -> None:
+    if (
+        not fuse_q_norm_quant
+        or tokens not in (1, 2, 4, 8, 16)
+        or kv_lora_rank != 512
+        or qk_rope_head_dim != 64
+        or q_lora_rank != 2048
+        or epsilon not in _STRIDED_Q_A_QUANT_EPSILONS
+    ):
+        raise ValueError("Strided Q-A requires supported fused decode graph geometry")
+
+
+def _quantize_strided_q_a(
+    projection: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write Q-A without materializing its view or retaining intermediates."""
+    tokens = projection.shape[0]
+    # Capture owns the allocation's replay address; consumers own its lifetime.
+    output = torch.empty((tokens, 2048), dtype=torch.int8, device=projection.device)
+    scales = torch.empty((tokens,), dtype=torch.float32, device=projection.device)
+    _STRIDED_Q_A_QUANT_OUT(projection, norm_weight, output, scales)
+    return output, scales
 
 
 def has_mla_preprocess_v2() -> bool:
@@ -428,6 +471,7 @@ def deepseek_mla_preprocess_decode_dynamic(
     hidden_scale: torch.Tensor | None = None,
     slot_mapping_int64: torch.Tensor | None = None,
     query_rope_patterns: torch.Tensor | None = None,
+    strided_q_a_quant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Preprocess MLA and return Q-A and the activation scale used by Q-B.
 
@@ -437,6 +481,12 @@ def deepseek_mla_preprocess_decode_dynamic(
     _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
     forward_context = get_forward_context_or_none()
     graph_buffers = forward_context.execution_state if forward_context is not None else None
+    if strided_q_a_quant:
+        _validate_strided_q_a_quant_geometry(
+            hidden.shape[0], kv_lora_rank, q_lora_rank, qk_rope_head_dim, q_norm_epsilon, fuse_q_norm_quant
+        )
+        if graph_buffers is None:
+            raise ValueError("Strided Q-A requires a graph-owned execution state")
 
     qkv_output = None
     q_output = None
@@ -482,11 +532,16 @@ def deepseek_mla_preprocess_decode_dynamic(
             qkv_output,
         )
     kv_dim = kv_lora_rank + qk_rope_head_dim
-    kv, q_a = qkv_a.split([kv_dim, q_lora_rank], dim=-1)
-    if fuse_q_norm_quant:
+    if strided_q_a_quant:
+        kv = qkv_a[:, :kv_dim]
+        q_c_int8, q_c_scale = _quantize_strided_q_a(qkv_a, q_norm_weight)
+        q_c = q_c_int8
+    elif fuse_q_norm_quant:
+        kv, q_a = qkv_a.split([kv_dim, q_lora_rank], dim=-1)
         q_c_int8, q_c_scale = rms_norm_dynamic_quant(q_a, q_norm_weight, q_norm_epsilon)
         q_c = q_c_int8
     else:
+        kv, q_a = qkv_a.split([kv_dim, q_lora_rank], dim=-1)
         q_c = rms_norm(q_a, q_norm_weight, q_norm_epsilon)
         q_c_int8, q_c_scale = dynamic_quant(q_c)
     if q_output is None:
@@ -570,8 +625,13 @@ def _deepseek_mla_preprocess_decode_dynamic_fake(
     hidden_scale: torch.Tensor | None = None,
     slot_mapping_int64: torch.Tensor | None = None,
     query_rope_patterns: torch.Tensor | None = None,
+    strided_q_a_quant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _validate_decode_latent_weight(w_uk, num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank)
+    if strided_q_a_quant:
+        _validate_strided_q_a_quant_geometry(
+            hidden.shape[0], kv_lora_rank, q_lora_rank, qk_rope_head_dim, q_norm_epsilon, fuse_q_norm_quant
+        )
     del (
         qkv_weight,
         qkv_weight_scale,
@@ -666,4 +726,5 @@ __all__ = [
     "prepare_mla_preprocess_v2_q_b",
     "prepare_mla_preprocess_v2_qkv",
     "supports_mla_preprocess_v2",
+    "supports_strided_q_a_quant_out",
 ]
