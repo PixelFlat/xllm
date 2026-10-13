@@ -138,6 +138,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME rope_table_gather
+  WRAPPER_SRCS rope_table_gather_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME greedy_prefix_verify
   WRAPPER_SRCS greedy_prefix_verify_wrapper.cpp
 )

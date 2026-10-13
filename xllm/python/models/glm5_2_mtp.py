@@ -25,8 +25,10 @@ from xllm.python.models.glm5_2 import (
     Glm52Config,
     Glm52DecoderLayer,
     Glm52ForCausalLM,
+    Glm52YarnRotaryEmbedding,
     _attn_dp_gather_inputs,
     _attn_dp_owner_rows,
+    _make_glm_rotary_embedding,
 )
 
 
@@ -65,6 +67,11 @@ class Glm52MtpModel(DeepseekV32MtpModel):
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(cfg, dtype, device)
         self._reuse_topk_by_layer = _resolve_mtp_topk_reuse(cfg)
+
+    def _make_rotary_embedding(
+        self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device
+    ) -> Glm52YarnRotaryEmbedding:
+        return _make_glm_rotary_embedding(cfg, dtype, device)
 
     def _make_decoder(
         self, cfg: Glm52Config, layer_id: int, dtype: torch.dtype, device: torch.device

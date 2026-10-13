@@ -127,6 +127,16 @@ torch::Tensor mla_query_rope_out(const torch::Tensor& query,
                                  const torch::Tensor& patterns,
                                  torch::Tensor& output);
 
+// Copy valid angle-table rows to independent contiguous consumer outputs.
+// Cache is BF16 [1048576,64]; positions are contiguous INT32/INT64 [T].
+// Valid positions are in [-1048576,1048576); T is 1, 2, 4, 8 or 16.
+void rope_table_gather_out(const torch::Tensor& cache,
+                           const torch::Tensor& positions,
+                           torch::Tensor& half_cos,
+                           torch::Tensor& half_sin,
+                           torch::Tensor& cos,
+                           torch::Tensor& sin);
+
 // Compute fused GDN gating outputs on NPU.
 // Invalid inputs trigger CHECK failures.
 std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(

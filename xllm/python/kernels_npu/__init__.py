@@ -105,6 +105,8 @@ _EXPORTS = {
         "quantize_per_tensor",
     ),
     "rotary_embedding": (
+        "supports_rope_table_gather_out",
+        "rope_table_gather_out",
         "build_split_qkv_rmsnorm_mrope_gather_pattern",
         "fused_qk_norm_rope",
         "has_split_qkv_rmsnorm_mrope_specialization",
@@ -139,6 +141,8 @@ _EXPORTS = {
 }
 
 __all__ = [
+    "supports_rope_table_gather_out",
+    "rope_table_gather_out",
     "rms_norm",
     "gemma_rms_norm",
     "fused_add_rms_norm",

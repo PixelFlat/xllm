@@ -20,6 +20,30 @@ import torch
 import torch_npu
 
 
+def supports_rope_table_gather_out(cache: torch.Tensor) -> bool:
+    """Select the bounded AOT table geometry before model execution."""
+    return (
+        cache.device.type in ("npu", "privateuseone")
+        and cache.dtype == torch.bfloat16
+        and cache.shape == (1048576, 64)
+        and cache.is_contiguous()
+        and hasattr(torch.ops.xllm_ops, "rope_table_gather_out")
+    )
+
+
+def rope_table_gather_out(
+    cache: torch.Tensor,
+    positions: torch.Tensor,
+    half_cos: torch.Tensor,
+    half_sin: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy table rows into four independent graph-owned consumer layouts."""
+    torch.ops.xllm_ops.rope_table_gather_out(cache, positions, half_cos, half_sin, cos, sin)
+    return half_cos, half_sin, cos, sin
+
+
 def has_split_qkv_rmsnorm_mrope_specialization(
     num_q_heads: int,
     num_kv_heads: int,
@@ -277,6 +301,8 @@ def npu_inplace_partial_rotary_mul(
 
 
 __all__ = [
+    "supports_rope_table_gather_out",
+    "rope_table_gather_out",
     "build_split_qkv_rmsnorm_mrope_gather_pattern",
     "fused_qk_norm_rope",
     "has_split_qkv_rmsnorm_mrope_specialization",

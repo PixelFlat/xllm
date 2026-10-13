@@ -175,6 +175,37 @@ def _mla_query_rope_out_fake(
     return output
 
 
+def _rope_table_gather_out_fake(
+    cache: torch.Tensor,
+    positions: torch.Tensor,
+    half_cos: torch.Tensor,
+    half_sin: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> None:
+    tokens = positions.numel()
+    if cache.shape != (1048576, 64) or cache.dtype != torch.bfloat16:
+        raise ValueError("RoPE gather requires a BF16 [1048576,64] table")
+    if positions.shape != (tokens,) or positions.dtype not in (torch.int32, torch.int64):
+        raise ValueError("RoPE gather positions must be one-dimensional INT32/INT64")
+    if tokens not in (1, 2, 4, 8, 16):
+        raise ValueError("RoPE gather supports T=1/2/4/8/16")
+    if half_cos.shape != (tokens, 32) or half_sin.shape != half_cos.shape:
+        raise ValueError("Half-angle outputs must be [T,32]")
+    if cos.shape != (tokens, 1, 1, 64) or sin.shape != cos.shape:
+        raise ValueError("Expanded-angle outputs must be [T,1,1,64]")
+    outputs = (half_cos, half_sin, cos, sin)
+    if any(value.dtype != cache.dtype for value in outputs):
+        raise ValueError("RoPE gather outputs must have the table dtype")
+    if any(value.device != cache.device or not value.is_contiguous() for value in (cache, positions, *outputs)):
+        raise ValueError("RoPE gather tensors must be contiguous and on the same device")
+    if any(torch._C._is_alias_of(output, value) for output in outputs for value in (cache, positions)):
+        raise ValueError("RoPE gather outputs must not alias inputs")
+    if any(torch._C._is_alias_of(output, other) for index, output in enumerate(outputs) for other in outputs[:index]):
+        raise ValueError("RoPE gather outputs must have independent storage")
+    return None
+
+
 def _chunk_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1293,6 +1324,7 @@ register_fake("xllm_ops::l2_norm", _l2_norm_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum", _atb_matmul_ein_sum_fake)
 register_fake("xllm_ops::atb_matmul_ein_sum_out", _atb_matmul_ein_sum_out_fake)
 register_fake("xllm_ops::mla_query_rope_out", _mla_query_rope_out_fake)
+register_fake("xllm_ops::rope_table_gather_out", _rope_table_gather_out_fake)
 register_fake("xllm_ops::moe_gating_top_k_softmax", _moe_gating_top_k_softmax_fake)
 register_fake("xllm_ops::split_qkv_rmsnorm_mrope", _split_qkv_rmsnorm_mrope_fake)
 register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
