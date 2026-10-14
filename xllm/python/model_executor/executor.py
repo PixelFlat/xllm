@@ -155,6 +155,7 @@ def _create_attention_backend(
             device=device,
             dtype=dtype,
             num_decoding_tokens=num_decoding_tokens,
+            mla_block_draft=model_type == "glm5_dspark",
         )
     if current_platform.is_cuda():
         from xllm.python.attention.flashinfer import FlashInferBackend
@@ -338,7 +339,7 @@ class ModelExecutor:
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
         self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
-        self._prepared_dspark = config.get("model_type") == "DSparkDraftModel"
+        self._prepared_dspark = config.get("model_type") in ("DSparkDraftModel", "glm5_dspark")
         self._prepared_block_draft = self._prepared_dspark or config.get("model_type") in (
             "DFlashDraftModel",
             "DFlash2DraftModel",
@@ -393,7 +394,7 @@ class ModelExecutor:
                 dp_rank,
             )
         elif graph_backend == "aclgraph":
-            if config.get("model_type") == "DSparkDraftModel":
+            if self._prepared_dspark:
                 from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAclGraphRunner
 
                 self.context_kv_graph_runner = ContextKvAclGraphRunner(model, device)
@@ -439,7 +440,7 @@ class ModelExecutor:
                     block_draft=self._prepared_dspark,
                 )
             else:
-                if config.get("model_type") == "DSparkDraftModel":
+                if self._prepared_dspark:
                     self.decode_graph_runner = BlockDraftAclGraphRunner(
                         execution_model,
                         self.attention_backend,

@@ -151,6 +151,7 @@ inline const std::unordered_set<std::string>& mla_model_type_set() {
       "glm4_moe_lite",
       "glm_moe_dsa",  // glm5 model type
       "glm_moe_dsa_mtp",
+      "glm5_dspark",    // Dense MLA DSpark draft; no sparse indexer.
       "glm5_next",      // GLM-5.3-Flash (absorbed MLA, NoPE, kv_lora=512)
       "glm5_next_mtp",  // GLM-5.3-Flash MTP draft (same absorbed-MLA attention)
       "joyai_llm_flash"};

@@ -150,6 +150,10 @@ class DFlashContextProjection(nn.Module):
 
 
 class DFlashQwen3Model(Qwen3Model):
+    @property
+    def context_projection_weight(self) -> torch.Tensor:
+        return self.fc.weight
+
     def __init__(
         self,
         cfg: DFlashQwen3Config,

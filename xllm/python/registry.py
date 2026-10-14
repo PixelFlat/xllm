@@ -74,6 +74,12 @@ def get_model_class(name: str) -> type[nn.Module]:
 
 def _register_builtin_models() -> None:
     _register_model_path(
+        "xllm.python.models.glm5_dspark",
+        "Glm5DSparkForCausalLM",
+        "Glm5DSparkForCausalLM",
+        "glm5_dspark",
+    )
+    _register_model_path(
         "xllm.python.models.qwen3",
         "Qwen3ForCausalLM",
         "Qwen3ForCausalLM",

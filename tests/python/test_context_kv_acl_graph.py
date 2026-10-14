@@ -28,7 +28,7 @@ from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAcl
 @pytest.fixture
 def runner(monkeypatch: pytest.MonkeyPatch) -> ContextKvAclGraphRunner:
     model = SimpleNamespace(
-        model=SimpleNamespace(fc=SimpleNamespace(weight=torch.ones(2, 4))),
+        model=SimpleNamespace(context_projection_weight=torch.ones(2, 4)),
         write_context_kv=Mock(side_effect=lambda hidden, *_: hidden[:, :2].clone()),
     )
     monkeypatch.setattr(

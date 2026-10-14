@@ -217,7 +217,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
         num_decoding_tokens: int = 1,
+        mla_block_draft: bool = False,
     ) -> None:
+        self._mla_block_draft = mla_block_draft
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -238,7 +240,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._graph_metadata_updated_in_place = False
         self._use_expanded_decode = False
         self._block_table_i32: torch.Tensor | None = None
-        self._block_attention_masks: dict[tuple[int, int] | None, torch.Tensor] = {}
+        self._block_attention_masks: dict[tuple[int, int] | tuple[str, int, int] | None, torch.Tensor] = {}
         self._actual_seq_lens: list[int] | None = None
         self._actual_seq_q: list[int] = []
         self._actual_seq_kv: list[int] = []
@@ -413,6 +415,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if block_table is None:
                 raise ValueError("prepared MLA requires a block table for every forward type")
             query_tensor = metadata.q_cu_seq_lens
+            if self._mla_block_draft and query_tensor is not None and query_tensor.numel() == batch_size + 1:
+                query_tensor = query_tensor[1:]
             kv_tensor = metadata.kv_seq_lens
             slot_mapping = metadata.slot_mapping
             for tensor in (query_tensor, kv_tensor, slot_mapping):
@@ -429,6 +433,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if not query_ends or query_ends[-1] != slot_mapping.numel():
                 raise ValueError("prepared MLA query ends must describe all input tokens")
             query_lengths = [end - start for start, end in zip([0, *query_ends[:-1]], query_ends)]
+            if self._mla_block_draft and (
+                not query_lengths or query_lengths[0] <= 0 or any(width != query_lengths[0] for width in query_lengths)
+            ):
+                raise ValueError("MLA block attention requires fixed-width queries")
             return _PreparedMlaAttention(
                 block_table=block_table,
                 slot_mapping=slot_mapping,
@@ -480,7 +488,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._graph_metadata_updated_in_place = False
         prepared = getattr(metadata, "prepared_attention_state", None)
         if isinstance(prepared, _PreparedMlaAttention):
-            if not self._is_mla or (graph_mode and (prepared.is_prefill or prepared.is_chunked_prefill)):
+            block_graph = self._mla_block_draft and prepared.is_chunked_prefill and not prepared.is_prefill
+            if not self._is_mla or (
+                graph_mode and (prepared.is_prefill or prepared.is_chunked_prefill) and not block_graph
+            ):
                 raise ValueError("prepared MLA graph state requires decode")
             self._metadata = prepared
             self._use_expanded_decode = False
@@ -956,6 +967,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 # alongside the sparse/KDA path so the non-sparse MLA config still
                 # works. Only models with rope (qk_rope_head_dim > 0) reach here.
                 if topk is None:
+                    if not layer.causal:
+                        return self._mla_block_fia_v2(
+                            q_latent, q_pe, nope_cache, rope_cache, self._block_table_i32, layer
+                        )
                     return self._mla_dense_fia_v2(
                         q_latent,
                         q_pe,
@@ -1497,6 +1512,57 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             value_quant_mode=2,
             rope_head_dim=q_pe.shape[-1],
         )  # [T, H, kv_lora]
+
+    def _mla_block_fia_v2(
+        self,
+        q_latent: torch.Tensor,
+        q_pe: torch.Tensor,
+        nope_cache: torch.Tensor,
+        rope_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        layer: Attention,
+    ) -> torch.Tensor:
+        """Non-causal compressed MLA with a captured live-device prefix mask.
+
+        FIA's sequence lengths are Host lists captured by value. Keep their
+        capacity constant and recompute the mask from Slot KV lengths inside
+        capture, so accepted-prefix changes never expose stale cache rows.
+        """
+        if not self._mla_block_draft or not self._use_fia_v2:
+            raise RuntimeError("non-causal MLA requires the MLA block-draft FIA v2 backend")
+        lengths = self._mla_actual_seq_kv
+        query_ends = self._mla_actual_seq_q_host
+        if lengths is None or not query_ends or block_table.shape[0] != len(query_ends):
+            raise ValueError("MLA block attention requires one query and KV length per sequence")
+        widths = [end - start for start, end in zip([0, *query_ends[:-1]], query_ends)]
+        if widths[0] <= 0 or any(width != widths[0] for width in widths):
+            raise ValueError("MLA block attention requires fixed-width queries")
+        capacity = block_table.shape[1] * nope_cache.shape[1]
+        mask_key = ("mla", widths[0], capacity)
+        mask = self._block_attention_masks.get(mask_key)
+        if mask is None:
+            keys = torch.arange(capacity, device=q_latent.device).view(1, 1, 1, -1)
+            mask = (keys >= lengths.view(-1, 1, 1, 1)).expand(-1, 1, widths[0], -1).contiguous()
+            self._block_attention_masks[mask_key] = mask
+        output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(
+            q_latent,
+            nope_cache.flatten(2),
+            nope_cache.flatten(2),
+            query_rope=q_pe,
+            key_rope=rope_cache.flatten(2),
+            atten_mask=mask,
+            actual_seq_qlen=query_ends,
+            actual_seq_kvlen=[capacity] * len(query_ends),
+            block_table=block_table,
+            num_query_heads=layer.num_heads,
+            num_key_value_heads=1,
+            softmax_scale=layer.scale,
+            input_layout="TND",
+            sparse_mode=_SPARSE_MODE_NONE,
+            block_size=nope_cache.shape[1],
+            return_softmax_lse=False,
+        )
+        return output
 
     def _mla_dense_fia_v2_out(
         self,

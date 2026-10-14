@@ -2376,7 +2376,9 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
           is_dspark && util::is_deepseek_v4_model_type(args.model_type());
       std::string draft_model_type = "DFlashDraftModel";
       if (is_dspark) {
-        draft_model_type = "DSparkDraftModel";
+        draft_model_type = args.model_type() == "glm5_dspark"
+                               ? "glm5_dspark"
+                               : "DSparkDraftModel";
       } else if (SpeculativeConfig::is_dflash2_algorithm(
                      speculative_algorithm)) {
         draft_model_type = std::string(kDFlash2DraftModelType);

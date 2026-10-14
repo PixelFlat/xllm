@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/framework/model/aux_hidden_capture.h"
 #include "core/framework/model/rec_causal_lm.h"
+#include "core/framework/model_loader/hf_model_args.h"
 #include "core/framework/speculative/mtp_utils.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
@@ -31,6 +32,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/util/model_config_utils.h"
+#include "core/util/utils.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -529,6 +531,52 @@ TEST(HFModelLoaderTest, Glm5NextNativeMtpRejectsUnsupportedLayerCounts) {
                                             /*speculative_algorithm=*/"MTP",
                                             /*is_draft_engine=*/true),
                "n_layers");
+}
+
+TEST(HFModelLoaderTest, Glm5DSparkSpeculatorsArgsPreserveMlaGeometry) {
+#if defined(USE_NPU)
+  ModelArgsLoader loader = ModelRegistry::get_model_args_loader("glm5_dspark");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json({
+    "architectures": ["Glm5DSparkForCausalLM"],
+    "speculators_model_type": "dspark",
+    "dtype": "bfloat16",
+    "markov_rank": 256,
+    "enable_confidence_head": true,
+    "confidence_head_with_markov": true,
+    "transformer_layer_config": {
+      "model_type": "glm5_dspark",
+      "hidden_size": 6144,
+      "num_hidden_layers": 5,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 64,
+      "head_dim": 64,
+      "q_lora_rank": 2048,
+      "kv_lora_rank": 512,
+      "qk_nope_head_dim": 192,
+      "qk_rope_head_dim": 64,
+      "v_head_dim": 256,
+      "rope_parameters": {"rope_theta": 8000000}
+    }
+  })json"));
+  normalize_config_torch_dtype(reader);
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.model_type(), "glm5_dspark");
+  EXPECT_EQ(args.dtype(), "bfloat16");
+  EXPECT_EQ(args.n_layers(), 5);
+  EXPECT_EQ(args.n_heads(), 64);
+  EXPECT_EQ(args.n_kv_heads(), 1);
+  EXPECT_EQ(args.head_dim(), 256);
+  EXPECT_EQ(args.kv_lora_rank(), 512);
+  EXPECT_EQ(args.rotary_dim(), 64);
+  EXPECT_EQ(args.index_topk(), 0);
+  EXPECT_EQ(args.markov_rank(), 256);
+  EXPECT_FLOAT_EQ(args.rope_theta(), 8000000.0f);
+  EXPECT_TRUE(args.enable_confidence_head());
+  EXPECT_TRUE(util::is_mla_model_type(args.model_type()));
+#endif
 }
 
 TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {

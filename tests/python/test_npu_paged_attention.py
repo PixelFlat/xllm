@@ -305,6 +305,124 @@ def _mla_metadata(*, prefill: bool = False, chunked: bool = False) -> SimpleName
     return metadata
 
 
+def test_mla_block_mask_tracks_device_lengths_and_keeps_noncausal_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _mla_backend()
+    backend._mla_block_draft = True
+    backend._use_fia_v2 = True
+    backend._mla_actual_seq_q_host = [3]
+    backend._mla_actual_seq_kv = torch.tensor([5], dtype=torch.int32)
+    query = torch.zeros(3, 2, 4)
+    query_rope = torch.zeros(3, 2, 2)
+    cache = torch.zeros(2, 4, 1, 4)
+    rope_cache = torch.zeros(2, 4, 1, 2)
+    table = torch.tensor([[0, 1]], dtype=torch.int32)
+    calls = []
+
+    def fia(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: object) -> tuple:
+        calls.append(kwargs)
+        return query, torch.empty(0)
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score_v2", fia)
+    layer = SimpleNamespace(num_heads=2, scale=0.5)
+    backend._mla_block_fia_v2(query, query_rope, cache, rope_cache, table, layer)
+    mask = calls[-1]["atten_mask"]
+    assert mask.shape == (1, 1, 3, 8)
+    assert not mask[..., :5].any()
+    assert mask[..., 5:].all()
+    assert calls[-1]["sparse_mode"] == 0
+    assert calls[-1]["actual_seq_kvlen"] == [8]
+    # Every query can see the complete draft block, not only its causal prefix.
+    assert torch.equal(mask[0, 0, 0], mask[0, 0, 2])
+    backend._mla_actual_seq_kv.fill_(3)
+    backend._block_attention_masks.clear()
+    backend._mla_block_fia_v2(query, query_rope, cache, rope_cache, table, layer)
+    assert calls[-1]["atten_mask"][..., 3:].all()
+
+
+def test_prepared_mla_block_capture_borrows_live_lengths() -> None:
+    backend = _mla_backend()
+    backend._mla_block_draft = True
+    metadata = _mla_metadata(chunked=True)
+    metadata.q_cu_seq_lens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = [0, 3, 6]
+    metadata.q_seq_lens = torch.tensor([3, 3], dtype=torch.int32)
+    metadata.slot_mapping = torch.arange(6, dtype=torch.int32)
+    metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+    backend.prepare(metadata, graph_mode=True)
+    assert backend._mla_actual_seq_kv is metadata.kv_seq_lens
+    assert backend._mla_actual_seq_q.tolist() == [3, 6]
+
+
+@torch.inference_mode()
+def test_mla_block_graph_matches_cpu_attention_after_prefix_changes() -> None:
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    from xllm.python.model_executor.runners.acl_graph import StaticGraphAttentionMetadata
+
+    device = torch.device("npu:0")
+    width, heads, latent_dim, rope_dim, page_size = 8, 4, 512, 64, 128
+    backend = NpuPagedAttentionBackend(
+        heads, 1, latent_dim + rope_dim, 256**-0.5, 0, True, device, torch.bfloat16, mla_block_draft=True
+    )
+    torch.manual_seed(83)
+    latent = torch.randn(4, page_size, 1, latent_dim, dtype=torch.bfloat16, device=device) * 0.1
+    rope = torch.randn(4, page_size, 1, rope_dim, dtype=torch.bfloat16, device=device) * 0.1
+    query = torch.randn(2 * width, heads, latent_dim, dtype=torch.bfloat16, device=device) * 0.1
+    query_rope = torch.randn(2 * width, heads, rope_dim, dtype=torch.bfloat16, device=device) * 0.1
+    backend.bind_kv_caches([LayerCache(latent, rope)])
+    metadata = StaticGraphAttentionMetadata(
+        slot_mapping=torch.full((2 * width,), -1, dtype=torch.int32, device=device),
+        paged_kv_indptr=None,
+        paged_kv_indices=None,
+        paged_kv_last_page_len=None,
+        block_table=torch.arange(4, dtype=torch.int32, device=device).view(2, 2),
+        q_seq_lens=torch.full((2,), width, dtype=torch.int32),
+        q_cu_seq_lens=torch.tensor([0, width, 2 * width], dtype=torch.int32, device=device),
+        q_cu_seq_lens_host_values=[width, 2 * width],
+        kv_seq_lens=torch.tensor([23, 130], dtype=torch.int32, device=device),
+        kv_seq_lens_host_values=[256, 256],
+        is_chunked_prefill=True,
+    )
+    metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+    layer = SimpleNamespace(num_heads=heads, scale=256**-0.5)
+
+    def attend() -> torch.Tensor:
+        backend.prepare(metadata, graph_mode=True)
+        return backend._mla_block_fia_v2(query, query_rope, latent, rope, metadata.block_table, layer)
+
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        for _ in range(3):
+            attend()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=stream):
+        captured = attend()
+    torch.npu.synchronize()
+
+    q_cpu, q_rope_cpu = query.cpu().float(), query_rope.cpu().float()
+    latent_cpu, rope_cpu = latent.cpu().float(), rope.cpu().float()
+    for lengths in ([187, 130], [5, 72], [201, 199]):
+        metadata.kv_seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            graph.replay()
+        torch.npu.synchronize()
+        expected = []
+        for sequence, length in enumerate(lengths):
+            keys = latent_cpu[2 * sequence : 2 * sequence + 2].flatten(0, 1)[:length, 0]
+            key_rope = rope_cpu[2 * sequence : 2 * sequence + 2].flatten(0, 1)[:length, 0]
+            rows = slice(sequence * width, (sequence + 1) * width)
+            scores = (
+                torch.einsum("thd,sd->hts", q_cpu[rows], keys) + torch.einsum("thd,sd->hts", q_rope_cpu[rows], key_rope)
+            ) * layer.scale
+            expected.append(torch.einsum("hts,sd->thd", scores.softmax(-1), keys))
+        torch.testing.assert_close(captured.cpu().float(), torch.cat(expected), rtol=1e-2, atol=2e-3)
+
+
 def test_sparse_mtp_page_crossing_updates_without_host_lengths_or_query_rebuild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1110,13 +1228,14 @@ def test_kda_verify_reads_expanded_lengths_and_sequence_layout() -> None:
     backend._kda_verify_width = 4
     conv_cache = torch.zeros(8, 1, 3)
     ssm_cache = torch.zeros(8, 1, 1, 1)
+    kv_lengths = torch.tensor([40, 41, 42, 43, 60, 61, 62, 63], dtype=torch.int32)
     expanded = SimpleNamespace(
         enabled=True,
-        kv_seq_lens=torch.tensor([40, 41, 42, 43, 60, 61, 62, 63], dtype=torch.int32),
+        kv_seq_lens=kv_lengths,
         block_table=torch.zeros(8, 1, dtype=torch.int32),
-        paged_kv_indptr=None,
-        paged_kv_indices=None,
-        paged_kv_last_page_len=None,
+        paged_kv_indptr=torch.arange(9, dtype=torch.int32),
+        paged_kv_indices=torch.zeros(8, dtype=torch.int32),
+        paged_kv_last_page_len=kv_lengths,
         paged_attention_tiling_data=None,
         kv_seq_lens_host=None,
         kv_seq_lens_host_values=None,

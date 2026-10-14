@@ -81,7 +81,7 @@ class ContextKvAclGraphRunner:
     def warmup(self, max_rows: int) -> None:
         if self._kv_caches is None or max_rows <= 0:
             raise ValueError("context KV graph warmup requires bound caches and positive capacity")
-        weight = self.model.model.fc.weight
+        weight = self.model.model.context_projection_weight
         if weight.shape[1] == 0:
             raise RuntimeError("context projection weights must be loaded before graph warmup")
         bucket = 1
@@ -175,8 +175,8 @@ class ContextKvAclGraphRunner:
             or hidden.shape[0] <= 0
             or positions.shape != (hidden.shape[0],)
             or slots.shape != positions.shape
-            or hidden.shape[1] != self.model.model.fc.weight.shape[1]
-            or hidden.dtype != self.model.model.fc.weight.dtype
+            or hidden.shape[1] != self.model.model.context_projection_weight.shape[1]
+            or hidden.dtype != self.model.model.context_projection_weight.dtype
             or positions.dtype != torch.int32
             or slots.dtype != torch.int32
             or any(tensor.device != self.device for tensor in (hidden, positions, slots))
