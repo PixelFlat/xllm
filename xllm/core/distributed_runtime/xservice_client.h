@@ -76,6 +76,7 @@ class XServiceClient {
 
   bool register_instance_with_retry(const std::string& key,
                                     const std::string& value);
+  bool register_direct_instance();
   bool reconcile_registration();
   void reconcile_registration_loop();
 
@@ -109,6 +110,8 @@ class XServiceClient {
   std::string incarnation_id_;
   std::string registration_key_;
   std::string registration_value_;
+  xllm_service::proto::InstanceMetaInfo direct_registration_;
+  bool direct_service_ = false;
 
   std::string master_xservice_addr_;
   std::unordered_map<std::string, std::unique_ptr<brpc::Channel>>

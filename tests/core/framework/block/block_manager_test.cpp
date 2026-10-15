@@ -697,6 +697,48 @@ TEST_F(BlockManagerPoolTest, AllocateAfterPrefixCacheHitAllocatesSuffixBlocks) {
             hit_seq.num_tokens());
 }
 
+TEST_F(BlockManagerPoolTest, PdPrefillPublishesReusableComputedPrefix) {
+  auto journal = std::make_shared<KVCacheEventJournal>();
+  BlockManagerPool::Options options;
+  options.num_blocks(16)
+      .block_size(4)
+      .enable_prefix_cache(true)
+      .enable_disagg_pd(true)
+      .event_journal(journal);
+  BlockManagerPool pool(options, /*dp_size=*/1);
+
+  Sequence source =
+      make_sequence(0, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8});
+  ASSERT_TRUE(pool.allocate(&source));
+  EXPECT_TRUE(journal->read("", 0)["events"].empty());
+  source.kv_state().set_kv_cache_tokens_num(source.num_tokens());
+  pool.cache(&source);
+  pool.deallocate(&source);
+
+  const nlohmann::json snapshot = journal->read("", 0);
+  ASSERT_EQ(snapshot["events"].size(), 2);
+  for (const auto& event : snapshot["events"]) {
+    EXPECT_EQ(event["medium"], "gpu");
+  }
+  Sequence hit =
+      make_sequence(1, /*prompt_tokens=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+  ASSERT_TRUE(pool.allocate(&hit, hit.num_tokens()));
+  EXPECT_EQ(hit.kv_state().shared_blocks_num(BlockType::KV), 2);
+  pool.deallocate(&hit);
+}
+
+TEST_F(BlockManagerPoolTest, PdDecodeCannotPublishUnconfirmedRemoteKv) {
+  BlockManagerPool::Options options;
+  options.num_blocks(16)
+      .block_size(4)
+      .enable_prefix_cache(true)
+      .enable_disagg_pd(true)
+      .instance_is_decode(true)
+      .event_journal(std::make_shared<KVCacheEventJournal>());
+  EXPECT_DEATH(BlockManagerPool(options, /*dp_size=*/1),
+               "KV events in disaggregated PD require a PREFILL instance");
+}
+
 TEST_F(BlockManagerPoolTest,
        LinearStateBlockManagerMatchesOnlyCheckpointHashes) {
   ScopedValue<int32_t> max_seqs_guard(&FLAGS_max_seqs_per_batch, 4);

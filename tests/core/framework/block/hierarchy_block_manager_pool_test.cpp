@@ -446,33 +446,36 @@ TEST(HierarchyBlockManagerPoolTest, FlatKvHasSingleHostKvLeaf) {
 
 TEST(HierarchyBlockManagerPoolTest,
      KvEventsPublishHostOnlyAfterSuccessfulCopy) {
-  for (bool success : {false, true}) {
-    auto journal = std::make_shared<KVCacheEventJournal>();
-    auto coordinator = std::make_shared<DeferredOffloadCoordinator>();
-    BlockManagerPool::Options options = make_flat_kv_options();
-    options.event_journal(journal);
-    HierarchyBlockManagerPool pool(options, coordinator, /*dp_size=*/1);
-    std::vector<int32_t> tokens(512, 17);
-    Sequence sequence = make_test_sequence(/*index=*/0, tokens);
-    ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
-    sequence.kv_state().set_kv_cache_tokens_num(tokens.size());
-    pool.deallocate(&sequence);
-    auto host_count = [&]() {
-      const nlohmann::json state = journal->read("", 0);
-      return static_cast<size_t>(std::count_if(
-          state["events"].begin(),
-          state["events"].end(),
-          [](const auto& event) { return event["medium"] == "cpu"; }));
-    };
-    EXPECT_EQ(host_count(), 0);
-    EXPECT_EQ(journal->read("", 0)["events"].size(), 4);
-    pool.transfer_blocks();
-    EXPECT_EQ(host_count(), 0);
-    coordinator->complete(success);
-    EXPECT_EQ(host_count(), success ? 4 : 0);
-    EXPECT_FALSE(pool.has_pending_async_block_release());
-    evict_device_prefix_cache(pool);
-    EXPECT_EQ(journal->read("", 0)["events"].size(), success ? 4 : 0);
+  for (bool disagg_pd : {false, true}) {
+    SCOPED_TRACE(disagg_pd);
+    for (bool success : {false, true}) {
+      auto journal = std::make_shared<KVCacheEventJournal>();
+      auto coordinator = std::make_shared<DeferredOffloadCoordinator>();
+      BlockManagerPool::Options options = make_flat_kv_options();
+      options.event_journal(journal).enable_disagg_pd(disagg_pd);
+      HierarchyBlockManagerPool pool(options, coordinator, /*dp_size=*/1);
+      std::vector<int32_t> tokens(512, 17);
+      Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+      ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+      sequence.kv_state().set_kv_cache_tokens_num(tokens.size());
+      pool.deallocate(&sequence);
+      auto host_count = [&]() {
+        const nlohmann::json state = journal->read("", 0);
+        return static_cast<size_t>(std::count_if(
+            state["events"].begin(),
+            state["events"].end(),
+            [](const auto& event) { return event["medium"] == "cpu"; }));
+      };
+      EXPECT_EQ(host_count(), 0);
+      EXPECT_EQ(journal->read("", 0)["events"].size(), 4);
+      pool.transfer_blocks();
+      EXPECT_EQ(host_count(), 0);
+      coordinator->complete(success);
+      EXPECT_EQ(host_count(), success ? 4 : 0);
+      EXPECT_FALSE(pool.has_pending_async_block_release());
+      evict_device_prefix_cache(pool);
+      EXPECT_EQ(journal->read("", 0)["events"].size(), success ? 4 : 0);
+    }
   }
 }
 

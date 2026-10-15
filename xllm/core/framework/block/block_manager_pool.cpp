@@ -52,12 +52,17 @@ BlockManagerPool::BlockManagerPool(const Options& options,
   block_managers_.reserve(dp_size);
   const std::string& event_config = options_.kv_events_config();
   if (!event_config.empty() || options_.event_journal()) {
+    // Prefill publishes the same computed prefix and confirmed Host copies as
+    // a colocated engine. Decode reserves blocks before remote KV arrives, so
+    // its residency needs a separate observer at PD transfer completion.
+    CHECK(!options_.enable_disagg_pd() || !options_.instance_is_decode())
+        << "KV events in disaggregated PD require a PREFILL instance";
     CHECK(options_.enable_prefix_cache() && !options_.enable_virtual_memory() &&
           !options_.enable_linear_state() && options_.manager_types().empty() &&
           options_.hasher_type() == BlockHasherType::TEXT &&
-          !options_.enable_disagg_pd() && !options_.enable_kvcache_store())
+          !options_.enable_kvcache_store())
         << "KV events currently support text, flat KV prefix caches with local "
-           "Host offload; composite/MM/virtual-memory/PD/external stores "
+           "Host offload; composite/MM/virtual-memory/external stores "
            "need logical residency observers";
     if (!event_config.empty()) {
       options_.event_journal(KVCacheEventJournal::get_instance());

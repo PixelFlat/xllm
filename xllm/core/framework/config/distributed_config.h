@@ -49,6 +49,8 @@ class DistributedConfig final {
          "etcd_addr",
          "etcd_namespace",
          "enable_service_routing",
+         "xservice_rpc_protocol",
+         "xservice_address",
          "heart_beat_interval",
          "etcd_ttl"}};
     return kOptionCategory;
@@ -67,6 +69,10 @@ class DistributedConfig final {
   PROPERTY(std::string, etcd_namespace);
 
   PROPERTY(bool, enable_service_routing) = false;
+
+  PROPERTY(std::string, xservice_rpc_protocol) = "baidu_std";
+
+  PROPERTY(std::string, xservice_address);
 
   PROPERTY(double, heart_beat_interval) = 0.5;
 

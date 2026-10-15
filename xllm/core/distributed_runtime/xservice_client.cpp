@@ -155,19 +155,55 @@ bool XServiceClient::init(const std::string& etcd_addr,
     return true;
   }
 
-  if (etcd_addr.empty()) {
-    LOG(ERROR) << "etcd_addr address is empty.";
+  const std::string& direct_address =
+      DistributedConfig::get_instance().xservice_address();
+  if (etcd_addr.empty() && direct_address.empty()) {
+    LOG(ERROR) << "Either etcd_addr or xservice_address must be configured.";
     return false;
   }
+  if (!etcd_addr.empty() && !direct_address.empty()) {
+    LOG(ERROR) << "etcd_addr and xservice_address are mutually exclusive.";
+    return false;
+  }
+  direct_service_ = !direct_address.empty();
 
   instance_name_ = instance_name;
   if (incarnation_id_.empty()) {
     ShortUUID uuid;
     incarnation_id_ = uuid.random();
   }
-  chan_options_.max_retry = 3;
+  const std::string& service_protocol =
+      DistributedConfig::get_instance().xservice_rpc_protocol();
+  if (service_protocol != "baidu_std" && service_protocol != "http") {
+    LOG(ERROR) << "Unsupported xservice_rpc_protocol: " << service_protocol;
+    return false;
+  }
+  chan_options_.protocol = service_protocol;
+  // Generations contains deltas without sequence numbers. An ambiguous HTTP
+  // ACK must fail the request, rather than transparently replaying a delta.
+  chan_options_.max_retry = service_protocol == "http" ? 0 : 3;
   chan_options_.timeout_ms =
       ::xllm::ServiceConfig::get_instance().rpc_channel_timeout_ms();
+  if (service_protocol == "http" && chan_options_.timeout_ms <= 0) {
+    LOG(ERROR) << "HTTP service RPC requires rpc_channel_timeout_ms > 0.";
+    return false;
+  }
+
+  if (direct_service_) {
+    if (service_protocol != "http" || !check_instance_name(direct_address)) {
+      LOG(ERROR) << "Direct service mode requires HTTP and a host:port "
+                    "xservice_address.";
+      return false;
+    }
+    master_xservice_addr_ = direct_address;
+    if (!connect_to_xservice(master_xservice_addr_)) {
+      return false;
+    }
+    heartbeat_thread_ =
+        std::make_unique<std::thread>(&XServiceClient::heartbeat, this);
+    initialize_done_ = true;
+    return true;
+  }
 
   const std::string etcd_username =
       util::get_optional_string_env(kEtcdUsernameEnvVar).value_or("");
@@ -327,6 +363,40 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
         static_cast<uint64_t>(absl::ToUnixMillis(absl::Now()));
   }
 
+  if (direct_service_) {
+    xllm_service::proto::InstanceMetaInfo registration;
+    registration.set_name(registered_info.name);
+    registration.set_rpc_address(registered_info.rpc_address);
+    registration.set_incarnation_id(registered_info.incarnation_id);
+    registration.set_register_ts_ms(registered_info.register_ts_ms);
+    if (InstanceRole(registered_info.type) == InstanceRole::PREFILL) {
+      registration.set_type(xllm_service::proto::PREFILL);
+    } else if (InstanceRole(registered_info.type) == InstanceRole::DECODE) {
+      registration.set_type(xllm_service::proto::DECODE);
+    } else {
+      LOG(FATAL) << "Direct service mode supports PREFILL or DECODE only.";
+    }
+    registration.set_dp_size(registered_info.dp_size);
+    registration.set_kv_split_size(registered_info.kv_split_size);
+    for (uint64_t cluster_id : registered_info.cluster_ids) {
+      registration.add_cluster_ids(cluster_id);
+    }
+    for (const std::string& address : registered_info.addrs) {
+      registration.add_addrs(address);
+    }
+    for (uint16_t port : registered_info.ports) {
+      registration.add_ports(port);
+    }
+    {
+      std::lock_guard<std::mutex> lock(registration_mutex_);
+      instance_name_ = registered_info.name;
+      direct_registration_ = std::move(registration);
+    }
+    CHECK(register_direct_instance()) << "Direct service registration failed.";
+    register_done_.store(true);
+    return;
+  }
+
   std::string key_prefix = "";
   if (InstanceRole(registered_info.type) == InstanceRole::DEFAULT) {
     key_prefix =
@@ -360,6 +430,31 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
 
   register_done_.store(true);
   LOG(INFO) << "Success register instance to etcd.";
+}
+
+bool XServiceClient::register_direct_instance() {
+  xllm_service::proto::InstanceMetaInfo request;
+  {
+    std::lock_guard<std::mutex> lock(registration_mutex_);
+    request = direct_registration_;
+  }
+  brpc::Controller cntl;
+  xllm_service::proto::StatusCode response;
+  std::string master_address;
+  if (!with_master_stub(
+          [&](xllm_service::proto::XllmRpcService_Stub* stub) {
+            stub->RegisterInstance(&cntl, &request, &response, nullptr);
+          },
+          &master_address)) {
+    return false;
+  }
+  if (cntl.Failed() || response.status_code() != 0) {
+    LOG(ERROR) << "Direct service registration failed: " << master_address
+               << ", RPC error: " << cntl.ErrorText()
+               << ", status: " << response.status_code();
+    return false;
+  }
+  return true;
 }
 
 InstanceInfo XServiceClient::get_instance_info(
@@ -445,6 +540,9 @@ void XServiceClient::heartbeat() {
     } else if (!resp.ok()) {
       LOG(ERROR) << "Failed to send heartbeat to master xservice "
                  << master_addr;
+      if (direct_service_ && !register_direct_instance()) {
+        LOG(ERROR) << "Failed to renew direct service registration.";
+      }
     }
   }
 }
@@ -629,10 +727,12 @@ std::vector<bool> XServiceClient::send_generations(
       continue;
     }
 
-    CHECK_EQ(ctx.resp.all_status_size(), static_cast<int>(indices.size()))
-        << "The size of status set is not equal to the size of outputs for "
-           "service: "
-        << service_addr;
+    if (ctx.resp.all_status_size() != static_cast<int32_t>(indices.size())) {
+      LOG(ERROR) << "Invalid generation ACK count from service: "
+                 << service_addr;
+      mark_service_failed(service_addr);
+      continue;
+    }
 
     for (size_t j = 0; j < indices.size(); ++j) {
       size_t original_idx = indices[j];

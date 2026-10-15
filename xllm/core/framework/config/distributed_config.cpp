@@ -43,6 +43,17 @@ DEFINE_bool(enable_service_routing,
             false,
             "Whether to use xllm service routing.");
 
+DEFINE_string(xservice_rpc_protocol,
+              "baidu_std",
+              "Protocol for service-side RPCs: baidu_std or http. Does not "
+              "change P/D engine RPC or KV transfer protocols.");
+
+DEFINE_string(xservice_address,
+              "",
+              "Direct third-party HTTP service control address (host:port). "
+              "Mutually exclusive with etcd_addr; requires "
+              "xservice_rpc_protocol=http.");
+
 DEFINE_double(heart_beat_interval, 0.5, "Heart beat interval.");
 
 DEFINE_int32(etcd_ttl, 3, "Time to live for etcd.");
@@ -57,6 +68,8 @@ void DistributedConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_addr);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_namespace);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_service_routing);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(xservice_rpc_protocol);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(xservice_address);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(heart_beat_interval);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(etcd_ttl);
 }
@@ -70,6 +83,8 @@ void DistributedConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_addr);
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_namespace);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_service_routing);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(xservice_rpc_protocol);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(xservice_address);
   XLLM_CONFIG_ASSIGN_FROM_JSON(heart_beat_interval);
   XLLM_CONFIG_ASSIGN_FROM_JSON(etcd_ttl);
 }
@@ -91,6 +106,10 @@ void DistributedConfig::append_config_json(
       config_json, default_config, etcd_namespace);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_service_routing);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, xservice_rpc_protocol);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, xservice_address);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, heart_beat_interval);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
