@@ -46,6 +46,10 @@ class MooncakeTransferEngineCore final {
   // Initialize the shared core. Only the first call takes effect.
   bool initialize(uint16_t listen_port, const torch::Device& device);
 
+  // Call after all transfer users have stopped, before device runtime teardown.
+  // Repeated shutdown is safe, including before initialization.
+  void shutdown();
+
   TransferEngine* engine() { return engine_.get(); }
 
   const std::string& addr() const { return addr_; }

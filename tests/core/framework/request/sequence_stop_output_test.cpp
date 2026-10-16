@@ -47,6 +47,25 @@ class StopAwareTokenizer final : public Tokenizer {
   static constexpr int32_t kStopTokenId = 1000;
 };
 
+class ByteFallbackTokenizer final : public Tokenizer {
+ public:
+  std::string decode(const Slice<int32_t>& ids,
+                     bool skip_special_tokens) const override {
+    if (ids.size() == 2 && ids[0] == kFirstByteTokenId &&
+        ids[1] == kLastByteTokenId) {
+      return "\xE4\xBD\xA0";
+    }
+    if (ids.size() == 1 &&
+        (ids[0] == kFirstByteTokenId || ids[0] == kLastByteTokenId)) {
+      return "\xEF\xBF\xBD";
+    }
+    return StopAwareTokenizer().decode(ids, skip_special_tokens);
+  }
+
+  static constexpr int32_t kFirstByteTokenId = 1001;
+  static constexpr int32_t kLastByteTokenId = 1002;
+};
+
 class SequenceStopOutputTest : public ::testing::Test {
  protected:
   void initialize(size_t max_generated_tokens,
@@ -108,6 +127,67 @@ class SequenceStopOutputTest : public ::testing::Test {
   std::unique_ptr<Sequence> sequence_;
   StopAwareTokenizer tokenizer_;
 };
+
+TEST_F(SequenceStopOutputTest, DecodeStreamDoesNotRepeatPrefillTokenMetadata) {
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/true);
+  sequence_->enable_checking_prefill_token();
+  EXPECT_FALSE(
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_)
+          .has_value());
+  append_token('A', -0.1f);
+  EXPECT_FALSE(sequence_->has_new_tokens_generated());
+  append_token('B', -0.2f);
+
+  auto output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+  ASSERT_TRUE(output.has_value());
+  EXPECT_EQ(output->text, "B");
+  ASSERT_EQ(output->token_ids.size(), 1);
+  EXPECT_EQ(output->token_ids[0], 'B');
+  ASSERT_TRUE(output->logprobs.has_value());
+  ASSERT_EQ(output->logprobs->size(), 1);
+  EXPECT_EQ(output->logprobs->front().token_id, 'B');
+  EXPECT_FLOAT_EQ(output->logprobs->front().logprob, -0.2f);
+  EXPECT_EQ(sequence_->num_valid_generated_tokens(), 2);
+  EXPECT_FALSE(
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_)
+          .has_value());
+}
+
+TEST_F(SequenceStopOutputTest,
+       DecodeStreamCompletesPrefillBytesWithoutRepeatingMetadata) {
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/true);
+  ByteFallbackTokenizer tokenizer;
+  sequence_->enable_checking_prefill_token();
+  append_token(ByteFallbackTokenizer::kFirstByteTokenId, -0.1f);
+  append_token(ByteFallbackTokenizer::kLastByteTokenId, -0.2f);
+
+  auto output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer);
+  ASSERT_TRUE(output.has_value());
+  EXPECT_EQ(output->text, "\xE4\xBD\xA0");
+  ASSERT_EQ(output->token_ids.size(), 1);
+  EXPECT_EQ(output->token_ids[0], ByteFallbackTokenizer::kLastByteTokenId);
+  ASSERT_TRUE(output->logprobs.has_value());
+  ASSERT_EQ(output->logprobs->size(), 1);
+  EXPECT_EQ(output->logprobs->front().token_id,
+            ByteFallbackTokenizer::kLastByteTokenId);
+  EXPECT_EQ(sequence_->num_valid_generated_tokens(), 2);
+}
 
 TEST_F(SequenceStopOutputTest, ExplicitStopTokenPropagatesToBothOutputModes) {
   initialize(/*max_generated_tokens=*/8, /*stop_tokens=*/{1000});

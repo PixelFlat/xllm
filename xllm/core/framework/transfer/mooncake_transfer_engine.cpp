@@ -81,16 +81,21 @@ bool wait_batch(TransferEngine* engine, BatchID batch_id) {
 
 }  // namespace
 
-MooncakeTransferEngineCore::~MooncakeTransferEngineCore() {
+MooncakeTransferEngineCore::~MooncakeTransferEngineCore() { shutdown(); }
+
+void MooncakeTransferEngineCore::shutdown() {
   if (initialized_) {
     server_.Stop(0);
     server_.Join();
   }
+  server_.ClearServices();
   service_.reset();
   channels_.clear();
+  handles_.clear();
   // Destroy registrations in the backend before releasing their memory leases.
   engine_.reset();
   memory_registrations_.clear();
+  initialized_ = false;
 }
 
 bool MooncakeTransferEngineCore::initialize(uint16_t listen_port,

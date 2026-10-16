@@ -419,6 +419,10 @@ class Sequence {
 
   void enable_checking_prefill_token() {
     decoder_.enable_checking_prefill_token();
+    // Prefill already emitted this token's metadata. Keep the text decoder
+    // independent so it can still complete an unfinished byte sequence.
+    stream_output_token_offset_ =
+        std::max(stream_output_token_offset_, num_prompt_tokens_ + 1);
   }
 
   std::queue<bool>& pre_scheduled_step_prefill_queue() {

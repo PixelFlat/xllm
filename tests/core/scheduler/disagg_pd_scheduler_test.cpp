@@ -19,6 +19,7 @@ limitations under the License.
 #include <brpc/server.h>
 #include <gtest/gtest.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <barrier>
@@ -204,6 +205,17 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
                           /*distributed_worker_manager=*/nullptr,
                           /*model_residency_coordinator=*/nullptr,
                           std::move(transfer_coordinator)) {}
+
+  void start_idle_runtime() {
+    server_name_ = "DisaggPDShutdownTest";
+    auto server = ServerRegistry::get_instance().register_server(server_name_);
+    auto service = std::make_shared<DisaggPDService>();
+    CHECK(server->start(service, "127.0.0.1:0", "DisaggPDShutdownTest"));
+    rpc_server_thread_ = std::make_unique<std::thread>(
+        [server, service = std::move(service)] { server->run(); });
+    dispatch_thread_ = std::make_unique<std::thread>(
+        &TestDisaggPDScheduler::dispatch_requests, this);
+  }
 
   void admit_prefill(std::shared_ptr<Request> request,
                      proto::DisaggPDService_Stub* stub = nullptr) {
@@ -516,6 +528,26 @@ bool recv_first_generation(DisaggPDScheduler* scheduler,
 }
 
 }  // namespace
+
+TEST(DisaggPDSchedulerShutdownTest,
+     StopsListenerAndWakesIdleDispatchBeforeJoining) {
+  // Execute in a fresh process and bound the wait so the old join-before-stop
+  // ordering fails instead of hanging the whole scheduler test binary.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        alarm(5);
+        FakeEngine engine(/*num_blocks=*/32, /*block_size=*/16);
+        DisaggPDScheduler::Options options = make_options();
+        {
+          TestDisaggPDScheduler scheduler(&engine, options);
+          scheduler.start_idle_runtime();
+        }
+        _exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
 
 TEST(DisaggPDSchedulerTest, AdmissionRetainsCapacityUntilDispatchCompletes) {
   for (const bool storage_prefetch : {false, true}) {

@@ -61,6 +61,9 @@ namespace py = pybind11;
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+#include "core/framework/transfer/mooncake_transfer_engine.h"
+#endif
 #include "core/platform/device_name_utils.h"
 #include "core/runtime/worker_memory_resources.h"
 #if defined(USE_NPU)
@@ -570,5 +573,11 @@ int main(int argc, char** argv) {
   py::gil_scoped_release release;
 #endif
 
-  return run();
+  const int32_t exit_code = run();
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
+  // Master and workers have stopped. Release the shared transport before
+  // Python/device finalization and its dependencies' static destructors.
+  MooncakeTransferEngineCore::get_instance().shutdown();
+#endif
+  return exit_code;
 }

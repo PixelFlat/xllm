@@ -515,6 +515,9 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   // The requested size has always been superseded by the scan for the last
   // real token (placeholders under schedule overlap); keep that behavior.
   const size_t size = num_valid_tokens();
+  if (size < stream_output_token_offset_) {
+    return std::nullopt;
+  }
   AUTO_COUNTER(detokenization_latency_seconds_stream);
   const auto ids = Slice<int32_t>(tokens_, size);
 

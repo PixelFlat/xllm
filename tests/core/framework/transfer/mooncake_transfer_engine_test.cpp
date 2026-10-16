@@ -228,4 +228,22 @@ TEST(MooncakeTransferEngineTest, FailedRegistrationDoesNotRetainMappingLease) {
   EXPECT_TRUE(core.unregister_memory(nullptr));
 }
 
+TEST(MooncakeTransferEngineTest,
+     ShutdownReleasesRpcExtensionsAndAllowsRepeatedCleanup) {
+  MooncakeTransferEngineCore& core = MooncakeTransferEngineCore::get_instance();
+  auto extension = std::make_shared<RecordingExtension>();
+  const std::weak_ptr<RecordingExtension> weak_extension = extension;
+  core.register_rpc_service(std::move(extension));
+  ASSERT_FALSE(weak_extension.expired());
+
+  core.shutdown();
+
+  EXPECT_TRUE(weak_extension.expired());
+  EXPECT_FALSE(core.is_initialized());
+  EXPECT_EQ(core.engine(), nullptr);
+  core.shutdown();
+  EXPECT_TRUE(core.close_session("", "127.0.0.1:5001"));
+  EXPECT_EQ(core.get_handle("127.0.0.1:5001"), static_cast<SegmentHandle>(-1));
+}
+
 }  // namespace xllm

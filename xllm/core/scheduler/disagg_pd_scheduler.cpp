@@ -180,18 +180,23 @@ DisaggPDScheduler::~DisaggPDScheduler() {
         heartbeat_callback_registration_);
   }
 
+  // start_rpc_server blocks in Server::Join(). Stop its listener before
+  // joining the owner thread, while the scheduler and engine are still alive.
+  auto rpc_server = ServerRegistry::get_instance().try_get_server(server_name_);
+  if (rpc_server != nullptr) {
+    rpc_server->stop();
+  }
+
   if (rpc_server_thread_ && rpc_server_thread_->joinable()) {
     rpc_server_thread_->join();
   }
 
   if (dispatch_thread_ && dispatch_thread_->joinable()) {
+    CHECK(prefill_request_queue_.enqueue(nullptr));
     dispatch_thread_->join();
   }
 
-  auto rpc_server = ServerRegistry::get_instance().get_server(server_name_);
   if (rpc_server != nullptr) {
-    rpc_server->stop();
-
     ServerRegistry::get_instance().unregister_server(server_name_);
   }
 }

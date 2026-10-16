@@ -344,6 +344,11 @@ void SchedulerPolicy::schedule_prefill_from_queue(
           break;
         }
         prefill_sequence->set_dp_rank(dp_rank);
+      } else if (!budget.dp_group_token_caps.empty() &&
+                 prefill_sequence->dp_rank() < 0) {
+        // Non-chunked requests need a rank before allocation so the fair
+        // budget is charged to the same DP that will allocate their blocks.
+        prefill_sequence->set_dp_rank(state.kv_cache_manager->select_dp_rank());
       }
 
       size_t num_tokens = compute_prefill_tokens(
