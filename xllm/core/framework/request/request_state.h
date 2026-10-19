@@ -25,6 +25,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "common.pb.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -170,6 +171,14 @@ class RequestState final {
   // decode address.
   std::string decode_address;
   std::string pd_reservation_id;
+  std::shared_ptr<ServiceOutputFormatter> response_formatter;
+  // P forwards these explicit API options; D owns parsing and result delivery.
+  proto::CompletionResponseType response_type = proto::CHAT_COMPLETION;
+  std::string response_model;
+  std::vector<proto::Tool> response_tools;
+  std::string response_tool_choice;
+  google::protobuf::Struct response_chat_template_kwargs;
+  proto::StreamOptions response_stream_options;
   std::string decode_rpc_address;
 
   torch::Tensor input_embedding;

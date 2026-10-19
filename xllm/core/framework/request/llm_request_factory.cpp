@@ -355,6 +355,16 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   xllm::ScopeGuard rate_limit_guard(
       [this] { rate_limiter_->decrease_one_request(); });
 
+  // PD transfers a single sampled token, not the beam candidates and scores.
+  if (options_->enable_disagg_pd() && sp.beam_width > 1) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "beam_width > 1 is not supported in disaggregated PD "
+                        "mode",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
+    return nullptr;
+  }
+
   std::optional<std::vector<int>> encoded = encode_and_validate_prompt(
       prompt, std::move(prompt_tokens), sp, callback);
   if (!encoded.has_value()) {
@@ -365,9 +375,10 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   const int64_t remaining = static_cast<int64_t>(max_generated_context_len_) -
                             static_cast<int64_t>(local_prompt_tokens.size());
   if (remaining <= 0 || sp.min_tokens > static_cast<uint64_t>(remaining)) {
-    CALLBACK_WITH_ERROR(
-        StatusCode::INVALID_ARGUMENT,
-        "The remaining model context cannot satisfy min_tokens");
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "The remaining model context cannot satisfy min_tokens",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
   const uint32_t max_tokens =
@@ -397,19 +408,25 @@ std::shared_ptr<Request> LLMRequestFactory::create(
       (has_constraints || sp.seed.has_value() || sp.top_logprobs == -1)) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
-        "The requested sampling controls require enable_task_pipeline=false");
+        "The requested sampling controls require enable_task_pipeline=false",
+        sp.service_request_id,
+        sp.source_xservice_addr);
     return nullptr;
   }
   if (options_->num_speculative_tokens() > 0 &&
       (sp.seed.has_value() || sp.min_tokens > 0 || !sp.bad_words.empty())) {
     CALLBACK_WITH_ERROR(
         StatusCode::INVALID_ARGUMENT,
-        "seed, min_tokens and bad_words require num_speculative_tokens=0");
+        "seed, min_tokens and bad_words require num_speculative_tokens=0",
+        sp.service_request_id,
+        sp.source_xservice_addr);
     return nullptr;
   }
   if (options_->enable_schedule_overlap() && !sp.bad_words.empty()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
-                        "bad_words requires enable_schedule_overlap=false");
+                        "bad_words requires enable_schedule_overlap=false",
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
   if (const auto error =
@@ -418,14 +435,20 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                                           model_args_->vocab_size(),
                                           model_args_->eos_token_id(),
                                           model_args_->stop_token_ids())) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, *error);
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        *error,
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
   // Model-aware complement to verify_params' 2000 cap: an oversized top-k
   // would throw inside the sampler and take the whole batch down with it.
   if (const auto error =
           sampling_param.top_logprobs_vocab_error(model_args_->vocab_size())) {
-    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT, *error);
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        *error,
+                        sp.service_request_id,
+                        sp.source_xservice_addr);
     return nullptr;
   }
   const bool json_object = sampling_param.json_object;
@@ -485,6 +508,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                          batch_callback_,
                          sp.decode_address,
                          call);
+  if (!sp.source_xservice_addr.empty()) {
+    req_state.response_type = sp.response_type;
+    req_state.response_model = sp.response_model;
+    req_state.response_tools = sp.response_tools;
+    req_state.response_tool_choice = sp.response_tool_choice;
+    req_state.response_chat_template_kwargs = sp.response_chat_template_kwargs;
+    req_state.response_stream_options = sp.response_stream_options;
+  }
   req_state.include_stop_str_in_output = sp.include_stop_str_in_output;
   if (json_object &&
       !apply_json_object_grammar(req_state, sp, generation_mode, callback)) {

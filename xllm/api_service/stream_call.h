@@ -22,11 +22,12 @@ limitations under the License.
 #include <json2pb/pb_to_json.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 #include "anthropic.pb.h"
 #include "api_service/anthropic_json.h"
@@ -80,13 +81,27 @@ class StreamCall : public Call {
     }
   }
 
+  void accept_async() {
+    CHECK(controller_ != nullptr);
+    CHECK(!stream_started_);
+    controller_->http_response().set_status_code(202);
+    controller_->http_response().set_content_type("application/json");
+    controller_->response_attachment().append("{\"accepted\":true}");
+    stream_finished_.store(true, std::memory_order_release);
+  }
+
   bool write_and_finish(Response& response) {
     if constexpr (std::is_same_v<Response, proto::ChatResponse> ||
                   std::is_same_v<Response, proto::CompletionResponse>) {
       if (openai_http_ && use_openai_json(response)) {
+        std::string payload =
+            api_service::serialize_openai_response(*request_,
+                                                   response,
+                                                   stream_usage_,
+                                                   system_fingerprint_,
+                                                   /*delta=*/false);
         controller_->http_response().set_content_type("application/json");
-        controller_->response_attachment().append(response_json(response).dump(
-            -1, ' ', false, nlohmann::json::error_handler_t::replace));
+        controller_->response_attachment().append(payload);
         return true;
       }
     }
@@ -155,14 +170,12 @@ class StreamCall : public Call {
     if constexpr (std::is_same_v<Response, proto::ChatResponse> ||
                   std::is_same_v<Response, proto::CompletionResponse>) {
       if (openai_http_ && use_openai_json(response)) {
-        auto json = response_json(response);
-        const auto& options = request_->stream_options();
-        if (options.include_usage() && options.continuous_usage_stats() &&
-            !response.has_usage()) {
-          json["usage"] = api_service::openai_usage_json(stream_usage_);
-        }
-        io_buf_.append(json.dump(
-            -1, ' ', false, nlohmann::json::error_handler_t::replace));
+        io_buf_.append(
+            api_service::serialize_openai_response(*request_,
+                                                   response,
+                                                   stream_usage_,
+                                                   system_fingerprint_,
+                                                   /*delta=*/true));
         io_buf_.append("\n\n");
         connection_status_ |= pa_->Write(io_buf_);
         return connection_status_ == 0;
@@ -233,25 +246,6 @@ class StreamCall : public Call {
   ::google::protobuf::Closure* done() { return done_; }
 
  private:
-  nlohmann::json response_json(const Response& response) const {
-    nlohmann::json json;
-    if constexpr (std::is_same_v<Response, proto::ChatResponse>) {
-      const std::string& choice = request_->tool_choice();
-      const bool named = !choice.empty() && choice != "none" &&
-                         choice != "auto" && choice != "required";
-      json = api_service::openai_response_json(
-          response, named, choice == "required");
-    } else {
-      json = api_service::openai_response_json(response, stream_);
-    }
-    api_service::set_openai_system_fingerprint(
-        json,
-        system_fingerprint_,
-        stream_,
-        request_->stream_options().include_usage());
-    return json;
-  }
-
   static bool use_openai_json(const Response& response) {
     if constexpr (std::is_same_v<Response, proto::CompletionResponse>) {
       return response.output_tensors().empty();

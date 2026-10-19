@@ -21,8 +21,10 @@ cc_library(
     json_fast_path.h
     json_scan.h
     completion_service_impl.h
+    completion_response_builder.h
     rec_completion_service_impl.h
     chat_service_impl.h
+    chat_response_builder.h
     anthropic_request_utils.h
     anthropic_service_impl.h
     anthropic_stream_utils.h

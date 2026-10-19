@@ -25,6 +25,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/distributed_runtime/disagg_pd_kv_response.h"
 #include "core/distributed_runtime/disagg_pd_request_converter.h"
+#include "core/distributed_runtime/disagg_pd_response.h"
 #include "core/distributed_runtime/distributed_virtual_memory_coordinator.h"
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/block/block_manager_pool.h"
@@ -36,11 +37,14 @@ limitations under the License.
 
 namespace xllm {
 
-DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
-                                         Engine* engine,
-                                         int32_t /*kv_cache_block_tokens*/)
+DisaggPDServiceImpl::DisaggPDServiceImpl(
+    DisaggPDScheduler* scheduler,
+    Engine* engine,
+    int32_t /*kv_cache_block_tokens*/,
+    DisaggPDServiceOptions response_options)
     : scheduler_(scheduler),
       engine_(engine),
+      response_options_(std::move(response_options)),
       block_manager_(engine->block_manager_pool()) {
   xservice_client_ = XServiceClient::get_instance();
   if (!xservice_client_->initialize_done()) {
@@ -91,7 +95,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   SchedulerParam scheduler_param = make_disagg_scheduler_param(req);
   StoppingChecker stopping_checker = make_disagg_stopping_checker(req);
 
-  auto output_callback = [this](const RequestOutput& output) -> bool {
+  OutputCallback output_callback = [this](const RequestOutput& output) -> bool {
     // response to xllm service to avoid the redirect cost.
     if (xservice_client_ == nullptr) {
       return false;
@@ -99,7 +103,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
     return xservice_client_->generation(output);
   };
 
-  auto batch_output_callback =
+  OutputsFunc batch_output_callback =
       [this](const std::vector<RequestOutput>& outputs) {
         // response to xllm service to avoid the redirect cost.
         if (xservice_client_ == nullptr) {
@@ -107,6 +111,18 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
         }
         return xservice_client_->generations(outputs);
       };
+
+  std::shared_ptr<ServiceOutputFormatter> response_formatter;
+  if (response_options_.enable_response_formatting) {
+    response_formatter =
+        make_decode_output_formatter(req,
+                                     response_options_.tool_parser_format,
+                                     response_options_.reasoning_parser_format,
+                                     response_options_.system_fingerprint);
+    if (!response_formatter) {
+      return nullptr;
+    }
+  }
 
   RequestState req_state(std::move(prompt),
                          std::move(prompt_tokens),
@@ -138,6 +154,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
   }
 
   req_state.pd_reservation_id = req.reservation_id();
+  req_state.response_formatter = std::move(response_formatter);
   auto new_request = std::make_shared<Request>(req.req_id(),
                                                req.x_request_id(),
                                                req.x_request_time(),

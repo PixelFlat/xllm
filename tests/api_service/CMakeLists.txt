@@ -280,3 +280,10 @@ cc_test(
   SRCS sampling_protocol_test.cpp
   DEPS api_service GTest::gtest_main nlohmann_json::nlohmann_json
 )
+
+cc_test(
+  NAME pd_http_response_test
+  NO_NPU_RUNTIME
+  SRCS pd_http_response_test.cpp
+  DEPS distributed_runtime api_service GTest::gtest_main nlohmann_json::nlohmann_json
+)

@@ -22,8 +22,11 @@ limitations under the License.
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <sstream>
 
+#include "core/common/options.h"
 #include "core/common/xllm_build_info.h"
+#include "core/framework/model/model_args.h"
 #include "core/util/uuid.h"
 
 namespace xllm::api_service {
@@ -345,6 +348,16 @@ std::string openai_system_fingerprint(const std::string& configuration) {
       "-",
       absl::Hex(XXH3_64bits(configuration.data(), configuration.size()),
                 absl::kZeroPad16));
+}
+
+std::string openai_system_fingerprint(const Options& options,
+                                      const ModelArgs* model_args) {
+  std::ostringstream configuration;
+  configuration << options.to_string();
+  if (model_args != nullptr) {
+    configuration << *model_args;
+  }
+  return openai_system_fingerprint(configuration.str());
 }
 
 void set_openai_system_fingerprint(nlohmann::json& response,

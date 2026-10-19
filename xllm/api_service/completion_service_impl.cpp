@@ -24,8 +24,10 @@ limitations under the License.
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
+#include "api_service/completion_response_builder.h"
 #include "api_service/openai_batch.h"
 #include "api_service/utils.h"
 #include "common/instance_name.h"
@@ -48,151 +50,48 @@ limitations under the License.
 
 namespace xllm {
 namespace {
-void set_logprobs(proto::Choice* choice,
-                  const std::optional<std::vector<LogProb>>& logprobs,
-                  int32_t offset = 0) {
-  if (!logprobs.has_value() || logprobs.value().empty()) {
-    return;
-  }
-
-  auto* proto_logprobs = choice->mutable_logprobs();
-  // One entry per generated token, so the three parallel fields would otherwise
-  // grow from empty and re-copy themselves O(log n) times per response.
-  const int num_logprobs = static_cast<int>(logprobs.value().size());
-  proto_logprobs->mutable_tokens()->Reserve(num_logprobs);
-  proto_logprobs->mutable_token_ids()->Reserve(num_logprobs);
-  proto_logprobs->mutable_token_logprobs()->Reserve(num_logprobs);
-  for (const auto& logprob : logprobs.value()) {
-    proto_logprobs->add_tokens(logprob.token);
-    proto_logprobs->add_token_ids(logprob.token_id);
-    proto_logprobs->add_token_logprobs(std::max(-9999.0f, logprob.logprob));
-    proto_logprobs->add_text_offset(offset);
-    offset += static_cast<int32_t>(std::count_if(
-        logprob.token.begin(), logprob.token.end(), [](unsigned char byte) {
-          return (byte & 0xc0) != 0x80;
-        }));
-    auto* top = proto_logprobs->add_top_logprobs()->mutable_values();
-    if (logprob.top_logprobs.has_value()) {
-      for (const auto& candidate : logprob.top_logprobs.value()) {
-        (*top)[candidate.token] = std::max(-9999.0f, candidate.logprob);
-      }
-    }
-  }
-}
-
-bool send_delta_to_client_brpc(std::shared_ptr<CompletionCall> call,
-                               bool include_usage,
-                               const std::string& request_id,
-                               int64_t created_time,
-                               const std::string& model,
-                               const RequestOutput& output,
-                               std::unordered_map<size_t, int32_t>* offsets) {
-  auto& response = call->response();
+bool send_completion_delta_to_client(
+    const std::shared_ptr<CompletionCall>& call,
+    bool include_usage,
+    const std::string& request_id,
+    int64_t created_time,
+    const std::string& model,
+    const RequestOutput& output,
+    std::unordered_map<size_t, int32_t>* offsets) {
   if (output.usage.has_value()) {
     proto::Usage usage;
     api_service::set_proto_usage(&usage, output.usage.value());
     call->set_stream_usage(usage);
   }
-
-  for (const auto& seq_output : output.outputs) {
-    if (!seq_output.text.empty()) {
-      response.Clear();
-      response.set_object("text_completion");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(seq_output.index);
-      choice->set_text(seq_output.text);
-      int32_t& offset = (*offsets)[seq_output.index];
-      set_logprobs(choice, seq_output.logprobs, offset);
-      offset += static_cast<int32_t>(std::count_if(
-          seq_output.text.begin(),
-          seq_output.text.end(),
-          [](unsigned char byte) { return (byte & 0xc0) != 0x80; }));
-      if (!call->write(response)) {
-        return false;
-      }
-    }
-
-    if (seq_output.finish_reason.has_value()) {
-      response.Clear();
-      response.set_object("text_completion");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(seq_output.index);
-      choice->set_text("");
-      choice->set_finish_reason(seq_output.finish_reason.value());
-      api_service::set_proto_stop_reason(seq_output.stop_reason,
-                                         choice->mutable_stop_reason());
-      if (!call->write(response)) {
-        return false;
-      }
-    }
+  const bool written = api_service::build_completion_delta(
+      call->response(),
+      include_usage,
+      request_id,
+      created_time,
+      model,
+      output,
+      offsets,
+      [&call](proto::CompletionResponse& frame) { return call->write(frame); });
+  if (!written) {
+    return false;
   }
-
-  if (include_usage && output.usage.has_value() &&
-      (output.finished || output.cancelled)) {
-    const auto& usage = output.usage.value();
-    response.Clear();
-    response.set_object("text_completion");
-    response.set_id(request_id);
-    response.set_created(created_time);
-    response.set_model(model);
-    response.mutable_choices();
-    auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
-    if (!call->write(response)) {
-      return false;
-    }
-  }
-
   if (output.finished || output.cancelled) {
-    response.Clear();
+    call->response().Clear();
     return call->finish();
   }
   return true;
 }
 
-bool send_result_to_client_brpc(std::shared_ptr<CompletionCall> call,
-                                const std::string& request_id,
-                                int64_t created_time,
-                                const std::string& model,
-                                const RequestOutput& req_output) {
-  auto& response = call->response();
-  response.set_object("text_completion");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  response.mutable_choices()->Reserve(req_output.outputs.size());
-  for (const auto& output : req_output.outputs) {
-    auto* choice = response.add_choices();
-    choice->set_index(output.index);
-    api_service::set_proto_stop_reason(output.stop_reason,
-                                       choice->mutable_stop_reason());
-    choice->set_text(output.text);
-    set_logprobs(choice, output.logprobs);
-    if (output.finish_reason.has_value()) {
-      choice->set_finish_reason(output.finish_reason.value());
-    }
-  }
-
-  if (req_output.usage.has_value()) {
-    const auto& usage = req_output.usage.value();
-    auto* proto_usage = response.mutable_usage();
-    proto_usage->set_prompt_tokens(usage.num_prompt_tokens);
-    proto_usage->set_completion_tokens(usage.num_generated_tokens);
-    proto_usage->set_total_tokens(usage.num_total_tokens);
-  }
-
-  return call->write_and_finish(response);
+bool send_completion_result_to_client(
+    const std::shared_ptr<CompletionCall>& call,
+    const std::string& request_id,
+    int64_t created_time,
+    const std::string& model,
+    const RequestOutput& output) {
+  api_service::build_completion_result(
+      call->response(), request_id, created_time, model, output);
+  return call->write_and_finish(call->response());
 }
-
 }  // namespace
 
 CompletionServiceImpl::CompletionServiceImpl(
@@ -213,13 +112,27 @@ std::shared_ptr<LLMMaster> CompletionServiceImpl::get_model_master(
 // complete_async for brpc from xllm_service
 void CompletionServiceImpl::process_async_rpc_impl(
     const proto::CompletionRequest* request) {
-  const auto& service_request_id = request->service_request_id();
-  const auto& target_xservice_addr = request->source_xservice_addr();
-  OutputCallback callback = [](RequestOutput output) {
+  process_request_from_service(*request);
+}
+
+void CompletionServiceImpl::process_request_from_service(
+    const proto::CompletionRequest& rpc_request,
+    const std::string& x_request_id,
+    const std::string& x_request_time) {
+  const auto& service_request_id = rpc_request.service_request_id();
+  const auto& target_xservice_addr = rpc_request.source_xservice_addr();
+  OutputCallback callback = [service_request_id,
+                             target_xservice_addr,
+                             stream =
+                                 rpc_request.stream()](RequestOutput output) {
+    // Validation failures may contain only a Status. Bind their owner here too.
+    output.service_request_id = service_request_id;
+    output.target_xservice_addr = target_xservice_addr;
+    output.log_request_status();
+    output.stream = stream;
     const auto results = XServiceClient::get_instance()->generations({output});
     return results.size() == 1 && results.front();
   };
-  const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
   auto master = get_model_master(model);
   if (unlikely(master == nullptr)) {
@@ -229,15 +142,24 @@ void CompletionServiceImpl::process_async_rpc_impl(
                         target_xservice_addr);
     return;
   }
-  const std::weak_ptr<LLMMaster> weak_master = master;
-  callback = [weak_master](const RequestOutput& req_output) -> bool {
-    const auto master = weak_master.lock();
-    if (master == nullptr) {
-      return false;
-    }
-    req_output.log_request_status();
-    return master->handle_rpc_response(req_output);
-  };
+  if (rpc_request.has_routing() &&
+      (!master->options().enable_disagg_pd() ||
+       rpc_request.routing().decode_name().empty() ||
+       rpc_request.token_ids().empty())) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "PD service requests require PD mode, a Decode route "
+                        "and prompt token IDs",
+                        service_request_id,
+                        target_xservice_addr);
+    return;
+  }
+  if (!rpc_request.prompts().empty()) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Service completion requests require a single prompt",
+                        service_request_id,
+                        target_xservice_addr);
+    return;
+  }
 
   // Check if the request is being rate-limited.
   const Status admission = master->get_rate_limiter()->acquire();
@@ -250,7 +172,7 @@ void CompletionServiceImpl::process_async_rpc_impl(
   }
 
   // check if model is supported
-  RequestParams request_params(rpc_request, "", "");
+  RequestParams request_params(rpc_request, x_request_id, x_request_time);
 
   std::optional<std::vector<int>> prompt_tokens = std::nullopt;
   if (rpc_request.token_ids_size() > 0) {
@@ -266,13 +188,26 @@ void CompletionServiceImpl::process_async_rpc_impl(
                          std::move(prompt_tokens),
                          std::move(request_params),
                          std::nullopt,
-                         callback);
+                         std::move(callback));
 }
 
 // complete_async for brpc
 void CompletionServiceImpl::process_async_impl(
     std::shared_ptr<CompletionCall> call) {
   const auto& rpc_request = call->request();
+  if (!rpc_request.source_xservice_addr().empty() &&
+      rpc_request.has_routing()) {
+    if (rpc_request.service_request_id().empty()) {
+      call->finish_with_error(StatusCode::INVALID_ARGUMENT,
+                              "Missing service callback request ID",
+                              "service_request_id");
+      return;
+    }
+    process_request_from_service(
+        rpc_request, call->get_x_request_id(), call->get_x_request_time());
+    call->accept_async();
+    return;
+  }
   const auto& model = rpc_request.model();
   std::shared_ptr<LLMMaster> master = get_model_master(model);
   if (unlikely(master == nullptr)) {
@@ -317,15 +252,15 @@ void CompletionServiceImpl::process_async_impl(
                                          output.status->message());
         }
         if (stream) {
-          return send_delta_to_client_brpc(call,
-                                           include_usage,
-                                           request_id,
-                                           created_time,
-                                           model,
-                                           output,
-                                           offsets.get());
+          return send_completion_delta_to_client(call,
+                                                 include_usage,
+                                                 request_id,
+                                                 created_time,
+                                                 model,
+                                                 output,
+                                                 offsets.get());
         }
-        return send_result_to_client_brpc(
+        return send_completion_result_to_client(
             call, request_id, created_time, model, output);
       };
   if (rpc_request.prompts().empty()) {

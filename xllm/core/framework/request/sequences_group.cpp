@@ -140,8 +140,18 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
   }
 
   if (sequence_params_.streaming) {
+    outputs.reserve(sequences_.size());
     for (auto& seq : sequences_) {
-      outputs.push_back(std::move(seq->generate_output()));
+      SequenceOutput output = seq->generate_output();
+      // A received PD token can finish the request before any Decode step.
+      // Drain text and metadata not consumed by earlier stream callbacks.
+      auto delta = seq->generate_streaming_output(seq->num_tokens(), tokenizer);
+      if (delta.has_value()) {
+        output.text = std::move(delta->text);
+        output.token_ids = std::move(delta->token_ids);
+        output.logprobs = std::move(delta->logprobs);
+      }
+      outputs.emplace_back(std::move(output));
     }
     return;
   }

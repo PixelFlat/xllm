@@ -379,9 +379,13 @@ proto::DisaggPDService_Stub* DisaggPDScheduler::create_rpc_channel(
   return it->second;
 }
 
-void DisaggPDScheduler::start_rpc_server() {
+void DisaggPDScheduler::start_rpc_server(
+    DisaggPDServiceOptions response_options) {
   std::unique_ptr<DisaggPDService> service = std::make_unique<DisaggPDService>(
-      this, engine_, KVCacheConfig::get_instance().block_size());
+      this,
+      engine_,
+      KVCacheConfig::get_instance().block_size(),
+      std::move(response_options));
   auto rpc_server =
       ServerRegistry::get_instance().register_server(server_name_);
   if (!rpc_server->start(std::move(service))) {
@@ -568,6 +572,15 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_source_xservice_addr(requests[i]->source_xservice_addr());
       req->set_tokens_num(requests[i]->state().prompt_tokens.size());
       req->set_prompt(requests[i]->state().prompt);
+      const auto& state = requests[i]->state();
+      req->set_response_type(state.response_type);
+      req->set_model(state.response_model);
+      req->mutable_tools()->Assign(state.response_tools.begin(),
+                                   state.response_tools.end());
+      req->set_tool_choice(state.response_tool_choice);
+      *req->mutable_chat_template_kwargs() =
+          state.response_chat_template_kwargs;
+      *req->mutable_stream_options() = state.response_stream_options;
       ADD_VECTOR_TO_PROTO(req->mutable_prompt_tokens(),
                           requests[i]->state().prompt_tokens);
       req->set_stream(requests[i]->state().stream);
@@ -795,9 +808,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
   }
 
   std::vector<std::shared_ptr<Request>> requests;
-  std::vector<std::shared_ptr<Request>> non_stream_requests;
   requests.reserve(running_requests_.size());
-  non_stream_requests.reserve(running_requests_.size());
   for (size_t i = 0; i < running_requests_.size(); ++i) {
     auto request = running_requests_[i];
     // Check if the request is a recently completed prefill request
@@ -808,17 +819,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
       // Retain the accepting peer until FirstGeneration succeeds so a failed
       // handoff can release the matching decode reservation.
       requests.emplace_back(request);
-      if (!request->state().stream) {
-        non_stream_requests.emplace_back(request);
-      }
       running_requests_[i] = nullptr;
     }
   }
-  // call non_stream_request's callback in P instance when its prefill ends
-  if (!non_stream_requests.empty()) {
-    output_dispatcher_->process_completed_requests(non_stream_requests);
-  }
-
   // No prefill request needs to be transferred to decode.
   if (requests.size() == 0) {
     return;
@@ -831,11 +834,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
     auto fail_request = [this](const std::shared_ptr<Request>& request,
                                Status status) {
       release_failed_request(request);
-      // Non-stream requests were already answered by
-      // process_completed_requests.
-      if (request->state().stream) {
-        output_dispatcher_->process_failed_request(request, status);
-      }
+      output_dispatcher_->process_failed_request(request, status);
       output_dispatcher_->wait_completion();
       kv_cache_manager_->deallocate(request.get());
     };
@@ -1217,10 +1216,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
       first_token.top_logprobs = top_logprobs;
     }
   }
-  // Enable checking whether to skip the prefill token
-  if (request->state().stream) {
-    sequence->enable_checking_prefill_token();
-  }
+  // Decode owns the complete stream for both HTTP and brpc, including the
+  // received first token and its logprobs.
 
   // update latency metrics
   restore_disaggregated_latency(request.get(),
@@ -1309,9 +1306,22 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
 
   kv_restored = true;
+  // Publish first-token output before making the request visible to Decode.
+  // The dispatcher prepares output on the response thread and queues service
+  // delivery in order. The client chooses the response format on that sender.
+  if (request->finished()) {
+    output_dispatcher_->process_completed_request(request);
+    return true;
+  }
+  if (request->state().stream) {
+    output_dispatcher_->process_stream_request(request);
+  }
   Timer enqueue_timer;
   if (!request_queue_.write(request)) {
     LOG(ERROR) << "Failed to enqueue decode request, request_id: " << req_id;
+    output_dispatcher_->process_failed_request(
+        request,
+        {StatusCode::RESOURCE_EXHAUSTED, "Decode request queue is full"});
     return false;
   }
   notifier_->notify();

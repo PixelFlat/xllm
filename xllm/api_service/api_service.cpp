@@ -26,7 +26,6 @@ limitations under the License.
 
 #include <charconv>
 #include <limits>
-#include <sstream>
 #include <utility>
 
 #include "api_service/anthropic_request_utils.h"
@@ -161,13 +160,8 @@ APIService::APIService(Master* master,
   if (::xllm::DistributedConfig::get_instance().node_rank() != 0) {
     return;
   }
-  std::ostringstream configuration;
-  configuration << master->options().to_string();
-  if (const auto* args = master->model_args()) {
-    configuration << *args;
-  }
-  system_fingerprint_ =
-      api_service::openai_system_fingerprint(configuration.str());
+  system_fingerprint_ = api_service::openai_system_fingerprint(
+      master->options(), master->model_args());
   ServiceImplFactory::create(
       this, master, model_names, model_repository_names, model_versions);
   register_chat_completions_handler();

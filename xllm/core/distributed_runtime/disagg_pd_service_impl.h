@@ -33,12 +33,21 @@ class Request;
 class Sequence;
 class DisaggPDScheduler;
 
+// Immutable response configuration supplied when the PD RPC service starts.
+struct DisaggPDServiceOptions {
+  bool enable_response_formatting = false;
+  std::string tool_parser_format;
+  std::string reasoning_parser_format;
+  std::string system_fingerprint;
+};
+
 // a class to handle disagg_pd requests
 class DisaggPDServiceImpl {
  public:
   explicit DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
                                Engine* engine,
-                               int32_t kv_cache_block_tokens);
+                               int32_t kv_cache_block_tokens,
+                               DisaggPDServiceOptions response_options = {});
   ~DisaggPDServiceImpl() = default;
 
   virtual void decode_recv_new_requests(const proto::DisaggRequests* request,
@@ -66,6 +75,7 @@ class DisaggPDServiceImpl {
 
   DisaggPDScheduler* scheduler_;  // not owned
   Engine* engine_;                // not owned
+  const DisaggPDServiceOptions response_options_;
   XServiceClient* xservice_client_ = nullptr;
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;

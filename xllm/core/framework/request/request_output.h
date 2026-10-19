@@ -19,6 +19,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/types.h>
 
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,6 +32,30 @@ limitations under the License.
 #include "core/framework/request/usage.h"
 
 namespace xllm {
+
+namespace proto {
+class StructuredChatOutput;
+}  // namespace proto
+
+struct RequestOutput;
+
+// Parsed response frames for RPC, or encoded JSON/SSE for HTTP.
+struct ServiceGenerationOutput {
+  std::string service_request_id;
+  std::string target_xservice_addr;
+  std::string payload;
+  std::shared_ptr<proto::StructuredChatOutput> chat_output;
+  uint64_t sequence = 0;
+  bool stream = false;
+  bool finished = false;
+  int32_t status_code = 200;
+};
+
+// Formatting can buffer a partial parser token and produce no wire output.
+using ServiceOutputFormatter =
+    std::function<bool(const RequestOutput&,
+                       bool /*http*/,
+                       std::optional<ServiceGenerationOutput>*)>;
 
 struct LogProbData {
   // the text of the token.
@@ -131,6 +158,11 @@ struct RequestOutput {
 
   // whether the request is cancelled.
   bool cancelled = false;
+
+  bool stream = false;
+  // Shared with the request and queued outputs; interpreted only by the service
+  // client. Both transports share the same per-request parser state.
+  std::shared_ptr<ServiceOutputFormatter> response_formatter;
 };
 
 // callback function for output, return true to continue, false to stop/cancel

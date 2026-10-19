@@ -280,6 +280,63 @@ TEST_F(LLMRequestFactoryTest, FailsWhenStopSequenceEncodingFails) {
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
+TEST_F(LLMRequestFactoryTest, ContextErrorRetainsServiceCallbackOwnership) {
+  auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/8);
+  RequestParams params;
+  params.service_request_id = "attempt-context";
+  params.source_xservice_addr = "127.0.0.1:9000";
+  params.min_tokens = 7;
+  bool called = false;
+  auto request = factory->create(
+      /*prompt=*/"",
+      /*prompt_tokens=*/std::vector<int>{1, 2},
+      params,
+      /*call=*/std::nullopt,
+      [&called, &params](RequestOutput output) {
+        called = true;
+        EXPECT_EQ(output.service_request_id, params.service_request_id);
+        EXPECT_EQ(output.target_xservice_addr, params.source_xservice_addr);
+        EXPECT_TRUE(output.status.has_value());
+        if (output.status.has_value()) {
+          EXPECT_EQ(output.status->message(),
+                    "The remaining model context cannot satisfy min_tokens");
+        }
+        return false;
+      });
+  EXPECT_EQ(request, nullptr);
+  EXPECT_TRUE(called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, OverlapErrorRetainsServiceCallbackOwnership) {
+  options_.enable_schedule_overlap(true);
+  auto factory = make_factory();
+  RequestParams params;
+  params.service_request_id = "attempt-overlap";
+  params.source_xservice_addr = "127.0.0.1:9000";
+  params.bad_words = {"bad"};
+  bool called = false;
+  auto request = factory->create(
+      /*prompt=*/"hello",
+      /*prompt_tokens=*/std::nullopt,
+      params,
+      /*call=*/std::nullopt,
+      [&called, &params](RequestOutput output) {
+        called = true;
+        EXPECT_EQ(output.service_request_id, params.service_request_id);
+        EXPECT_EQ(output.target_xservice_addr, params.source_xservice_addr);
+        EXPECT_TRUE(output.status.has_value());
+        if (output.status.has_value()) {
+          EXPECT_EQ(output.status->message(),
+                    "bad_words requires enable_schedule_overlap=false");
+        }
+        return false;
+      });
+  EXPECT_EQ(request, nullptr);
+  EXPECT_TRUE(called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
 TEST_F(LLMRequestFactoryTest,
        CreatesRequestForValidPromptAndKeepsRateLimitSlot) {
   auto factory = make_factory();
@@ -508,6 +565,126 @@ TEST_F(LLMRequestFactoryTest, RejectsTopLogprobsAboveVocabulary) {
   EXPECT_NE(capture.status->message().find("top_logprobs (1500)"),
             std::string::npos);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest,
+       DisaggregatedPdRejectsBeamSearchAndReleasesRateLimitSlot) {
+  options_.enable_disagg_pd(true);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.beam_width = 2;
+  sp.max_tokens = 16;
+
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_NE(capture.status->message().find("beam_width > 1"),
+            std::string::npos);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+}
+
+TEST_F(LLMRequestFactoryTest, DisaggregatedPdAcceptsSingleBeamRequest) {
+  options_.enable_disagg_pd(true);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.beam_width = 1;
+  sp.max_tokens = 16;
+
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest, NonDisaggregatedBeamSearchRemainsSupported) {
+  options_.enable_disagg_pd(false);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.beam_width = 2;
+  sp.max_tokens = 16;
+
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(request->state().sampling_param.beam_width, 2);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+TEST_F(LLMRequestFactoryTest, RetainsHttpResponseOptionsForDecodeDispatch) {
+  options_.enable_disagg_pd(true);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.max_tokens = 16;
+  sp.source_xservice_addr = "worker:1234";
+  sp.response_model = "response-model";
+  sp.response_tools.emplace_back().mutable_function()->set_name("weather");
+  sp.response_tool_choice = "auto";
+  (*sp.response_chat_template_kwargs.mutable_fields())["enable_thinking"]
+      .set_bool_value(false);
+  sp.response_stream_options.set_include_usage(true);
+  sp.response_stream_options.set_continuous_usage_stats(true);
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  const auto& state = request->state();
+  EXPECT_FALSE(state.response_formatter);
+  EXPECT_EQ(state.response_type, proto::CHAT_COMPLETION);
+  EXPECT_EQ(state.response_model, "response-model");
+  ASSERT_EQ(state.response_tools.size(), 1U);
+  EXPECT_EQ(state.response_tools.front().function().name(), "weather");
+  EXPECT_EQ(state.response_tool_choice, "auto");
+  EXPECT_FALSE(state.response_chat_template_kwargs.fields()
+                   .at("enable_thinking")
+                   .bool_value());
+  EXPECT_TRUE(state.response_stream_options.include_usage());
+  EXPECT_TRUE(state.response_stream_options.continuous_usage_stats());
+  EXPECT_FALSE(capture.called);
+}
+
+TEST_F(LLMRequestFactoryTest, RetainsCompletionResponseShapeForDecodeDispatch) {
+  options_.enable_disagg_pd(true);
+  auto factory = make_factory();
+  CallbackCapture capture;
+  RequestParams params;
+  params.source_xservice_addr = "worker:1234";
+  params.response_type = proto::TEXT_COMPLETION;
+  params.response_model = "completion-model";
+  params.response_stream_options.set_include_usage(true);
+  params.echo = true;
+  auto request = factory->create(/*prompt=*/"hello",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 params,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+  ASSERT_NE(request, nullptr);
+  EXPECT_EQ(request->state().response_type, proto::TEXT_COMPLETION);
+  EXPECT_EQ(request->state().response_model, "completion-model");
+  EXPECT_TRUE(request->state().response_stream_options.include_usage());
+  EXPECT_TRUE(request->state().echo);
+  EXPECT_FALSE(capture.called);
 }
 
 TEST_F(LLMRequestFactoryTest, MessageOverloadFailsWhenTemplateRejects) {

@@ -52,7 +52,8 @@ std::unique_ptr<Scheduler> create_continuous_scheduler(
     std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator =
         nullptr,
     std::shared_ptr<KVCacheTransferCoordinator> kv_transfer_coordinator =
-        nullptr) {
+        nullptr,
+    DisaggPDServiceOptions response_options = {}) {
   switch (select_scheduler_kind(options)) {
     case SchedulerKind::DISAGG_PD:
       return std::make_unique<DisaggPDScheduler>(
@@ -60,7 +61,8 @@ std::unique_ptr<Scheduler> create_continuous_scheduler(
           options,
           std::move(distributed_worker_manager),
           std::move(model_residency_coordinator),
-          std::move(kv_transfer_coordinator));
+          std::move(kv_transfer_coordinator),
+          std::move(response_options));
     case SchedulerKind::ZERO_EVICTION:
       return std::make_unique<ZeroEvictionScheduler>(
           engine,

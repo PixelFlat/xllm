@@ -570,3 +570,63 @@ TEST(RequestParamsTest, ResolvesVocabularyDependentConstraints) {
 
 }  // namespace
 }  // namespace xllm
+
+namespace xllm {
+namespace {
+TEST(RequestParamsTest, ServiceOwnershipPreservesExplicitParserOptions) {
+  proto::ChatRequest request;
+  request.set_model("model");
+  request.set_source_xservice_addr("worker:1234");
+  request.add_token_ids(42);
+  request.add_messages()->set_content("large prompt");
+  request.mutable_routing()->set_decode_name("decode");
+  request.mutable_stream_options()->set_include_usage(true);
+  request.mutable_stream_options()->set_continuous_usage_stats(true);
+  request.set_tool_choice("auto");
+  request.add_tools()->mutable_function()->set_name("weather");
+  (*request.mutable_chat_template_kwargs()->mutable_fields())["enable_thinking"]
+      .set_bool_value(true);
+  RequestParams params(request, "", "");
+  EXPECT_EQ(params.response_type, proto::CHAT_COMPLETION);
+  EXPECT_EQ(params.response_model, "model");
+  ASSERT_EQ(params.response_tools.size(), 1U);
+  EXPECT_EQ(params.response_tools.front().function().name(), "weather");
+  EXPECT_EQ(params.response_tool_choice, "auto");
+  EXPECT_TRUE(params.response_stream_options.include_usage());
+  EXPECT_TRUE(params.response_stream_options.continuous_usage_stats());
+  EXPECT_TRUE(params.response_chat_template_kwargs.fields()
+                  .at("enable_thinking")
+                  .bool_value());
+  request.clear_source_xservice_addr();
+  const RequestParams native(request, "", "");
+  EXPECT_TRUE(native.response_model.empty());
+  EXPECT_TRUE(native.response_tools.empty());
+}
+
+TEST(RequestParamsTest, ServiceCompletionPreservesResponseShapeAndOptions) {
+  proto::CompletionRequest request;
+  request.set_model("completion-model");
+  request.set_source_xservice_addr("worker:1234");
+  request.set_service_request_id("attempt");
+  request.set_prompt("prompt");
+  request.set_echo(true);
+  request.set_logprobs(2);
+  request.set_stream(true);
+  request.mutable_stream_options()->set_include_usage(true);
+  request.mutable_stream_options()->set_continuous_usage_stats(true);
+  const RequestParams params(request, "trace", "time");
+  EXPECT_EQ(params.response_type, proto::TEXT_COMPLETION);
+  EXPECT_EQ(params.response_model, "completion-model");
+  EXPECT_TRUE(params.response_stream_options.include_usage());
+  EXPECT_TRUE(params.response_stream_options.continuous_usage_stats());
+  EXPECT_TRUE(params.echo);
+  EXPECT_TRUE(params.logprobs);
+  EXPECT_EQ(params.top_logprobs, 2);
+  EXPECT_TRUE(params.streaming);
+  EXPECT_EQ(params.x_request_id, "trace");
+  request.clear_source_xservice_addr();
+  const RequestParams ordinary(request, "", "");
+  EXPECT_TRUE(ordinary.response_model.empty());
+}
+}  // namespace
+}  // namespace xllm

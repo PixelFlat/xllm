@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "api_service/api_service_impl.h"
 #include "api_service/stream_call.h"
@@ -42,11 +43,15 @@ class ChatServiceImpl final : public APIServiceImpl<ChatCall> {
   ChatServiceImpl(RecMaster* master, const std::vector<std::string>& models);
 
   // brpc call_data needs to use shared_ptr
-  void process_async_impl(std::shared_ptr<ChatCall> call);
+  void process_async_impl(std::shared_ptr<ChatCall> call) override;
 
-  void process_async_rpc_impl(const proto::ChatRequest* request);
+  void process_async_rpc_impl(const proto::ChatRequest* request) override;
 
  private:
+  // Service-owned requests return output through XServiceClient.
+  void process_request_from_service(const proto::ChatRequest& request,
+                                    const std::string& x_request_id = "",
+                                    const std::string& x_request_time = "");
   void process_rec_chat_request(std::shared_ptr<ChatCall> call);
   std::shared_ptr<LLMMaster> get_model_master(const std::string& model) const;
 

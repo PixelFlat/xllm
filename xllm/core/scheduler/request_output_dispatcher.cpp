@@ -115,31 +115,26 @@ void RequestOutputDispatcher::process_failed_request(
     output.request_id = request->request_id();
     output.service_request_id = request->service_request_id();
     output.target_xservice_addr = request->source_xservice_addr();
+    output.stream = request->state().stream;
+    output.response_formatter = request->state().response_formatter;
     output.status = status;
     request->state().output_func(output);
   };
-  schedule_response(request, std::move(runnable));
+  if (enable_batch_response_) {
+    rpc_threadpool_.schedule(std::move(runnable));
+  } else {
+    schedule_response(request, std::move(runnable));
+  }
 }
 
 void RequestOutputDispatcher::process_completed_request(
     std::shared_ptr<Request> request) {
-  // schedule the response handling
-
-  // NOTE: Maybe refactor later.
-  // For prefill instance in 'ENABLE_SERVICE_DISPATCH_REQUEST' scenario,
-  // Currently, the xLLM service uses the BRPC HTTP interface to forward
-  // requests. When the prefill process returns the first token to the xLLM
-  // service, the result is only returned after the OutputFunc callback function
-  // is destructed. Therefore, to ensure the TTFT, the Output callback function
-  // needs to be recycled once its execution is complete, allowing the first
-  // token to be returned immediately. Additionally, the processing here runs in
-  // parallel with the subsequent step where the prefill sends the first token
-  // to the decode instance.
-  //  When this completes, it destructs the request, which in turn causes the
-  //  Output object
-  // to be destructed. To prevent the scenario where the request is recycled
-  // before the response is fully returned to the xLLM service, the Output
-  // object must be detached to avoid premature destruction.
+  if (enable_batch_response_) {
+    std::vector<std::shared_ptr<Request>> requests{std::move(request)};
+    batch_process_completed_requests(requests);
+    return;
+  }
+  // Keep terminal output behind earlier stream work on the response thread.
   auto runnable = [this, request = request]() mutable {
     AUTO_COUNTER(responsing_latency_seconds_non_stream);
 
@@ -191,44 +186,56 @@ void RequestOutputDispatcher::batch_process_completed_requests(
           request->log_statistic(end_2_end_latency_seconds);
         }
       }
-      if (request->sequences()[0]->num_generated_tokens() == 1) {
-        // currently only support one sequence when enable_service_routing
-        request_output->finished_on_prefill_instance = true;
-      }
       counter->decrement_count();
     };
     schedule_response(request, std::move(runnable));
   }
 
-  rpc_threadpool_.schedule(
-      [counter = std::unique_ptr<BlockingCounter>(counter),
-       requests = std::move(requests),
-       request_outputs = std::move(request_outputs)]() mutable {
-        counter->wait();
-        auto& resp_callback = requests[0]->state().outputs_func;
-        resp_callback(request_outputs);
-      });
+  rpc_threadpool_.schedule([counter = std::unique_ptr<BlockingCounter>(counter),
+                            requests = std::move(requests),
+                            request_outputs = std::move(request_outputs),
+                            cancel_request = cancel_request_]() mutable {
+    counter->wait();
+    auto& resp_callback = requests[0]->state().outputs_func;
+    const auto accepted = resp_callback(request_outputs);
+    CHECK_EQ(accepted.size(), requests.size());
+    for (size_t index = 0; index < accepted.size(); ++index) {
+      if (!accepted[index]) {
+        cancel_request(requests[index]);
+      }
+    }
+  });
 }
 
 // process non-stream requests
 void RequestOutputDispatcher::process_completed_requests(
     std::vector<std::shared_ptr<Request>>& requests) {
-  if (requests.empty()) {
-    return;
-  }
-  if (!enable_batch_response_) {
-    for (size_t i = 0; i < requests.size(); ++i) {
-      process_completed_request(std::move(requests[i]));
+  std::vector<std::shared_ptr<Request>> output_requests;
+  output_requests.reserve(requests.size());
+  for (const auto& request : requests) {
+    // P owns computation and handoff; D owns every successful response.
+    if (!request->state().decode_address.empty()) {
+      continue;
     }
+    output_requests.emplace_back(request);
+  }
+  if (enable_batch_response_) {
+    batch_process_completed_requests(output_requests);
   } else {
-    // send request response to xllm service in batch through rpc
-    batch_process_completed_requests(requests);
+    for (auto& request : output_requests) {
+      process_completed_request(std::move(request));
+    }
   }
 }
 
 void RequestOutputDispatcher::process_stream_request(
     std::shared_ptr<Request> request) {
   CHECK(request->state().stream) << "request is not a streaming request";
+  if (enable_batch_response_) {
+    std::vector<std::shared_ptr<Request>> requests{std::move(request)};
+    batch_process_stream_requests(requests);
+    return;
+  }
 
   StreamOutputWork work = prepare_stream_output(*request);
   if (work.indexes.empty() && !work.has_open_sequences) {
@@ -246,6 +253,10 @@ void RequestOutputDispatcher::process_stream_request(
 
     RequestOutput req_output;
     req_output.request_id = request->request_id();
+    req_output.service_request_id = request->service_request_id();
+    req_output.target_xservice_addr = request->source_xservice_addr();
+    req_output.stream = request->state().stream;
+    req_output.response_formatter = request->state().response_formatter;
     for (size_t i = 0; i < indexes.size(); ++i) {
       const size_t index = indexes[i];
       const size_t size = num_tokens[i];
@@ -285,6 +296,9 @@ void RequestOutputDispatcher::batch_process_stream_requests(
       request_outputs[i].request_id = request->request_id();
       request_outputs[i].service_request_id = request->service_request_id();
       request_outputs[i].target_xservice_addr = request->source_xservice_addr();
+      request_outputs[i].stream = request->state().stream;
+      request_outputs[i].response_formatter =
+          request->state().response_formatter;
       counter->decrement_count();
       continue;
     }
@@ -303,6 +317,8 @@ void RequestOutputDispatcher::batch_process_stream_requests(
       req_output->request_id = request->request_id();
       req_output->service_request_id = request->service_request_id();
       req_output->target_xservice_addr = request->source_xservice_addr();
+      req_output->stream = request->state().stream;
+      req_output->response_formatter = request->state().response_formatter;
       for (size_t i = 0; i < indexes.size(); ++i) {
         const size_t index = indexes[i];
         const size_t size = num_tokens[i];
@@ -311,12 +327,6 @@ void RequestOutputDispatcher::batch_process_stream_requests(
         auto seq_output = seq->generate_streaming_output(size, *tokenizer_);
         if (seq_output.has_value()) {
           req_output->outputs.push_back(std::move(seq_output.value()));
-        }
-        if (seq->num_generated_tokens() == 1) {
-          // currently only support one sequence when enable_service_routing
-          // IMPROVE LATER: support enable_schedule_overlap in Default mode
-          // for stream request
-          req_output->finished_on_prefill_instance = true;
         }
       }
       if (req_output->finished_on_prefill_instance) {
@@ -361,16 +371,21 @@ void RequestOutputDispatcher::batch_process_stream_requests(
 // process stream requests
 void RequestOutputDispatcher::process_stream_requests(
     std::vector<std::shared_ptr<Request>>& requests) {
-  if (requests.empty()) {
-    return;
-  }
-  if (!enable_batch_response_) {
-    for (auto& req : requests) {
-      process_stream_request(req);
+  std::vector<std::shared_ptr<Request>> output_requests;
+  output_requests.reserve(requests.size());
+  for (const auto& request : requests) {
+    // P owns computation and handoff; D owns every successful response.
+    if (!request->state().decode_address.empty()) {
+      continue;
     }
+    output_requests.emplace_back(request);
+  }
+  if (enable_batch_response_) {
+    batch_process_stream_requests(output_requests);
   } else {
-    // send request response to xllm service in batch through rpc
-    batch_process_stream_requests(requests);
+    for (auto& request : output_requests) {
+      process_stream_request(std::move(request));
+    }
   }
 }
 

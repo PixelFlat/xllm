@@ -47,6 +47,7 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/request/request_state.h"
 #include "framework/tokenizer/tokenizer.h"
+#include "scheduler/request_output_dispatcher.h"
 
 namespace xllm {
 
@@ -95,9 +96,13 @@ class FakeTokenizer final : public Tokenizer {
     NOT_IMPLEMENTED();
   }
 
-  std::string decode(const Slice<int32_t>& /*ids*/,
+  std::string decode(const Slice<int32_t>& ids,
                      bool /*skip_special_tokens*/) const override {
-    NOT_IMPLEMENTED();
+    std::string text;
+    for (const int32_t id : ids) {
+      text += static_cast<char>(id);
+    }
+    return text;
   }
 
   std::optional<int32_t> token_to_id(
@@ -183,6 +188,10 @@ class FakeEngine final : public Engine {
     block_manager_->set_storage_prefetch_enabled(enabled);
   }
 
+  void set_tokenizer(std::unique_ptr<Tokenizer> tokenizer) {
+    tokenizer_ = std::move(tokenizer);
+  }
+
  private:
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<PrefetchBlockManagerPool> block_manager_;
@@ -261,6 +270,10 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
     return request_queue_.read(*request);
   }
 
+  bool queue_decode_request_for_test(std::shared_ptr<Request> request) {
+    return request_queue_.write(std::move(request));
+  }
+
   bool pop_prefill_request_for_test(bool offline,
                                     std::shared_ptr<Request>* request) {
     if (offline) {
@@ -276,6 +289,11 @@ class TestDisaggPDScheduler final : public DisaggPDScheduler {
   }
 
   void wait_for_responses() { output_dispatcher_->wait_completion(); }
+
+  void dispatch_stream_for_test(std::shared_ptr<Request> request) {
+    std::vector<std::shared_ptr<Request>> requests{std::move(request)};
+    output_dispatcher_->process_stream_requests(requests);
+  }
 
   void update_metrics(std::vector<Sequence*>& sequences) {
     scheduler_metrics_->update_token_latency_metrics(sequences);
@@ -440,12 +458,16 @@ DisaggPDScheduler::Options make_decode_options() {
 std::shared_ptr<Request> make_request(
     const std::vector<int32_t>& prompt_token_ids,
     const std::string& req_id = "req",
-    bool enable_schedule_overlap = false) {
+    bool enable_schedule_overlap = false,
+    bool stream = false,
+    bool logprobs = false,
+    size_t max_tokens = 4) {
   RequestSamplingParam sampling_param;
+  sampling_param.logprobs = logprobs;
   SchedulerParam scheduler_param;
 
   StoppingChecker stopping_checker;
-  stopping_checker.set_max_generated_tokens(4);
+  stopping_checker.set_max_generated_tokens(max_tokens);
   stopping_checker.set_max_context_len(64);
   stopping_checker.set_ignore_eos(true);
 
@@ -457,9 +479,9 @@ std::shared_ptr<Request> make_request(
                      prompt_token_ids.size() + 8,
                      /*n=*/1,
                      /*best_of=*/1,
-                     /*stream=*/false,
+                     logprobs,
+                     stream,
                      /*echo=*/false,
-                     /*logprobs=*/false,
                      /*skip_special_tokens=*/false,
                      enable_schedule_overlap,
                      /*mm_data=*/nullptr,
@@ -1194,6 +1216,9 @@ TEST(DisaggPDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   ASSERT_TRUE(decode.decode_schedule(remote_failed, "prefill"));
   auto remote_healthy = make_request({11, 12}, "healthy");
   remote_healthy->state().stream = true;
+  remote_healthy->state().output_func = [](const RequestOutput&) {
+    return true;
+  };
   remote_healthy->state().pd_reservation_id = "healthy-reservation";
   ASSERT_TRUE(decode.try_allocate(remote_healthy->sequences()[0].get()));
   ASSERT_TRUE(decode.decode_schedule(remote_healthy, "prefill"));
@@ -1646,4 +1671,357 @@ TEST(DisaggPDSchedulerTest, MtpExhaustionRollsBackKvReservation) {
   EXPECT_TRUE(decode.reservations_empty());
   EXPECT_EQ(pool->num_used_blocks()[0], 0u);
 }
+}  // namespace xllm
+
+namespace xllm {
+namespace {
+
+class OutputTokenizer final : public Tokenizer {
+ public:
+  std::unique_ptr<Tokenizer> clone() const override {
+    return std::make_unique<OutputTokenizer>();
+  }
+  std::string decode(const Slice<int32_t>& ids,
+                     bool /*skip_special_tokens*/) const override {
+    std::string text;
+    for (int32_t id : ids) {
+      text += static_cast<char>(id);
+    }
+    return text;
+  }
+};
+
+TEST(DisaggPDSchedulerTest, PrefillEmitsNoSuccessfulOutputInEitherProtocol) {
+  for (const bool http : {false, true}) {
+    for (const bool stream : {false, true}) {
+      std::atomic<int32_t> callbacks{0};
+      auto request = make_request(
+          {65, 66}, "req", /*enable_schedule_overlap=*/false, stream);
+      request->state().decode_address = "decode";
+      if (http) {
+        request->state().response_formatter =
+            std::make_shared<ServiceOutputFormatter>();
+      }
+      request->state().output_func = [&callbacks](const RequestOutput&) {
+        ++callbacks;
+        return true;
+      };
+      request->state().outputs_func =
+          [&callbacks](const std::vector<RequestOutput>& outputs) {
+            ++callbacks;
+            return std::vector<bool>(outputs.size(), true);
+          };
+      finish_prefill(request->sequences()[0].get());
+      OutputTokenizer tokenizer;
+      RequestOutputDispatcher dispatcher(&tokenizer,
+                                         /*enable_service_routing=*/true,
+                                         /*disable_log_stats=*/true,
+                                         [](std::shared_ptr<Request>) {});
+      std::vector<std::shared_ptr<Request>> requests{request};
+      if (stream) {
+        dispatcher.process_stream_requests(requests);
+      } else {
+        dispatcher.process_completed_requests(requests);
+      }
+      dispatcher.wait_completion();
+      EXPECT_EQ(callbacks.load(), 0);
+    }
+  }
+}
+
+TEST(DisaggPDSchedulerTest,
+     ServiceOutputBatchesRequestsAndMapsPartialAcknowledgements) {
+  for (const bool stream : {false, true}) {
+    OutputTokenizer tokenizer;
+    std::vector<std::string> cancelled;
+    RequestOutputDispatcher dispatcher(
+        &tokenizer,
+        /*enable_service_routing=*/true,
+        /*disable_log_stats=*/true,
+        [&cancelled](std::shared_ptr<Request> request) {
+          cancelled.emplace_back(request->request_id());
+        });
+    std::vector<std::shared_ptr<Request>> requests;
+    requests.reserve(3);
+    std::vector<std::vector<RequestOutput>> batches;
+    for (int32_t index = 0; index < 3; ++index) {
+      auto request = make_request({1, 2},
+                                  std::to_string(index),
+                                  false,
+                                  stream,
+                                  /*logprobs=*/false,
+                                  /*max_tokens=*/1);
+      auto& state = request->state();
+      state.response_formatter =
+          std::make_shared<ServiceOutputFormatter>(
+              [](const RequestOutput&,
+                 bool,
+                 std::optional<ServiceGenerationOutput>*) {
+                ADD_FAILURE()
+                    << "Dispatcher must not select or run a protocol formatter";
+                return false;
+              });
+      state.outputs_func =
+          [&batches](const std::vector<RequestOutput>& outputs) {
+            batches.emplace_back(outputs);
+            return std::vector<bool>{true, true, false};
+          };
+      auto& sequence = request->sequences().front();
+      sequence->kv_state().set_kv_cache_tokens_num(
+          sequence->num_prompt_tokens());
+      sequence->append_token(Token(65 + index));
+      requests.emplace_back(std::move(request));
+    }
+    if (stream) {
+      dispatcher.process_stream_requests(requests);
+    } else {
+      dispatcher.process_completed_requests(requests);
+    }
+    dispatcher.wait_completion();
+    ASSERT_EQ(batches.size(), 1U);
+    ASSERT_EQ(batches.front().size(), 3U);
+    EXPECT_EQ(batches.front()[0].outputs.front().text, "A");
+    EXPECT_TRUE(batches.front()[0].response_formatter);
+    EXPECT_EQ(batches.front()[1].outputs.front().text, "B");
+    EXPECT_EQ(batches.front()[2].outputs.front().text, "C");
+    EXPECT_EQ(cancelled, std::vector<std::string>{"2"});
+  }
+}
+
+TEST(DisaggPDSchedulerTest, ServiceSenderKeepsFirstTokenAheadOfDecodeBatch) {
+  OutputTokenizer tokenizer;
+  RequestOutputDispatcher dispatcher(&tokenizer,
+                                     /*enable_service_routing=*/true,
+                                     /*disable_log_stats=*/true,
+                                     [](std::shared_ptr<Request>) {});
+  auto request = make_request({1, 2}, "req", false, /*stream=*/true);
+  std::promise<void> first_started;
+  auto started = first_started.get_future();
+  std::promise<void> release_first;
+  auto release = release_first.get_future().share();
+  std::vector<RequestOutput> received;
+  request->state().outputs_func =
+      [&received, &first_started, release](
+          const std::vector<RequestOutput>& outputs) {
+        if (received.empty()) {
+          first_started.set_value();
+          release.wait();
+        }
+        received.insert(received.end(), outputs.begin(), outputs.end());
+        return std::vector<bool>(outputs.size(), true);
+      };
+  ScopeGuard cleanup([&] {
+    release_first.set_value();
+    dispatcher.wait_completion();
+  });
+  auto& sequence = request->sequences().front();
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  sequence->append_token(Token(65));
+  dispatcher.process_stream_request(request);
+  ASSERT_EQ(started.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  sequence->append_token(Token(66));
+  std::vector<std::shared_ptr<Request>> batch{request};
+  dispatcher.process_stream_requests(batch);
+  release_first.set_value();
+  cleanup.dismiss();
+  dispatcher.wait_completion();
+  ASSERT_EQ(received.size(), 2U);
+  EXPECT_EQ(received[0].outputs.front().text, "A");
+  EXPECT_EQ(received[1].outputs.front().text, "B");
+}
+
+TEST(DisaggPDSchedulerTest,
+     DecodeEmitsFirstTokenAsynchronouslyBeforeAnyDecodeStep) {
+  for (const bool overlap : {false, true}) {
+    SCOPED_TRACE(overlap ? "overlap" : "no overlap");
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    engine.set_tokenizer(std::make_unique<OutputTokenizer>());
+    auto options = make_decode_options();
+    options.enable_schedule_overlap(overlap);
+    TestDisaggPDScheduler scheduler(&engine, options);
+    auto request = make_request({65, 66},
+                                "req",
+                                overlap,
+                                /*stream=*/true,
+                                /*logprobs=*/true);
+    std::promise<void> first_started;
+    auto started = first_started.get_future();
+    std::promise<void> release_first;
+    auto release = release_first.get_future().share();
+    std::future<bool> received;
+    std::mutex output_mutex;
+    std::vector<RequestOutput> outputs;
+    auto record = [&outputs, &output_mutex, &first_started, release](
+                      const RequestOutput& output) {
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lock(output_mutex);
+        outputs.emplace_back(output);
+        first = outputs.size() == 1;
+      }
+      if (first) {
+        first_started.set_value();
+        release.wait();
+      }
+      return true;
+    };
+    request->state().output_func = record;
+    request->state().outputs_func =
+        [record](const std::vector<RequestOutput>& batch) {
+          std::vector<bool> accepted;
+          accepted.reserve(batch.size());
+          for (const auto& output : batch) {
+            accepted.emplace_back(record(output));
+          }
+          return accepted;
+        };
+    // Unblock and drain even when an assertion fails or reception mistakenly
+    // performs the callback inline. The test must fail instead of hanging.
+    ScopeGuard cleanup([&] {
+      release_first.set_value();
+      if (received.valid()) {
+        received.wait();
+      }
+      scheduler.wait_for_responses();
+    });
+    Sequence* sequence = request->sequences()[0].get();
+    ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+    sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    received = std::async(std::launch::async, [&scheduler] {
+      return scheduler.decode_recv_first_generation(
+          "req",
+          "",
+          /*token_id=*/42,
+          /*has_logprob=*/true,
+          /*logprob=*/-0.25F,
+          /*time_to_first_token_latency_seconds=*/0.1,
+          /*upstream_elapsed_seconds=*/0,
+          /*top_tokens=*/{42},
+          /*top_logprobs=*/{-0.25F},
+          "PUSH",
+          {},
+          {},
+          {},
+          1,
+          0);
+    });
+    // Reception must return while the output callback remains blocked.
+    ASSERT_EQ(received.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    ASSERT_TRUE(received.get());
+    ASSERT_EQ(started.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    std::shared_ptr<Request> queued;
+    ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+    {
+      std::lock_guard<std::mutex> lock(output_mutex);
+      ASSERT_EQ(outputs.size(), 1U);
+      EXPECT_EQ(outputs.front().service_request_id, "service-req");
+      ASSERT_EQ(outputs.front().outputs.size(), 1U);
+      const auto& first = outputs.front().outputs.front();
+      EXPECT_EQ(first.text, "*");
+      EXPECT_EQ(first.token_ids, std::vector<int32_t>({42}));
+      ASSERT_TRUE(first.logprobs.has_value());
+      ASSERT_EQ(first.logprobs->size(), 1U);
+      EXPECT_FLOAT_EQ(first.logprobs->front().logprob, -0.25F);
+    }
+    // Later output must remain behind the first callback, including brpc
+    // batches whose RPC runs on a different thread after detokenization.
+    if (overlap) {
+      sequence->append_token(Token(-1));
+      sequence->update_last_step_token(Token(43));
+    } else {
+      sequence->append_token(Token(43));
+    }
+    scheduler.dispatch_stream_for_test(queued);
+    release_first.set_value();
+    cleanup.dismiss();
+    scheduler.wait_for_responses();
+    ASSERT_EQ(outputs.size(), 2U);
+    ASSERT_EQ(outputs.back().outputs.size(), 1U);
+    EXPECT_EQ(outputs.back().outputs.front().text, "+");
+    EXPECT_EQ(outputs.back().outputs.front().token_ids,
+              std::vector<int32_t>({43}));
+  }
+}
+
+TEST(DisaggPDSchedulerTest,
+     DecodeTerminatesFirstTokenWithoutQueueingDecodeWork) {
+  for (const bool stream : {false, true}) {
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    engine.set_tokenizer(std::make_unique<OutputTokenizer>());
+    TestDisaggPDScheduler scheduler(&engine, make_decode_options());
+    auto request = make_request({65, 66},
+                                "req",
+                                /*enable_schedule_overlap=*/false,
+                                stream,
+                                /*logprobs=*/false,
+                                /*max_tokens=*/1);
+    std::vector<RequestOutput> outputs;
+    request->state().output_func = [&outputs](const RequestOutput& output) {
+      outputs.emplace_back(output);
+      return true;
+    };
+    Sequence* sequence = request->sequences()[0].get();
+    ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+    sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    ASSERT_TRUE(recv_first_generation(&scheduler, torch::Tensor()));
+    scheduler.wait_for_responses();
+    std::shared_ptr<Request> queued;
+    EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+    EXPECT_TRUE(scheduler.reservations_empty());
+    EXPECT_FALSE(sequence->has_any_blocks());
+    ASSERT_EQ(outputs.size(), 1U);
+    const auto& result = outputs.front();
+    EXPECT_TRUE(result.finished);
+    ASSERT_EQ(result.outputs.size(), 1U);
+    EXPECT_EQ(result.outputs.front().text, "*");
+    EXPECT_EQ(result.outputs.front().finish_reason, "length");
+    ASSERT_TRUE(result.usage.has_value());
+    EXPECT_EQ(result.usage->num_generated_tokens, 1);
+    EXPECT_FALSE(result.finished_on_prefill_instance);
+  }
+}
+
+TEST(DisaggPDSchedulerTest, FullDecodeQueueFailsAfterFirstTokenAndReleasesKv) {
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  engine.set_tokenizer(std::make_unique<OutputTokenizer>());
+  auto options = make_decode_options();
+  options.request_queue_size(1);
+  TestDisaggPDScheduler scheduler(&engine, options);
+  auto occupying = make_request({65, 66}, "occupying");
+  ASSERT_TRUE(scheduler.queue_decode_request_for_test(occupying));
+  auto request = make_request({65, 66},
+                              "req",
+                              /*enable_schedule_overlap=*/false,
+                              /*stream=*/true);
+  std::vector<RequestOutput> outputs;
+  request->state().output_func = [&outputs](const RequestOutput& output) {
+    outputs.emplace_back(output);
+    return true;
+  };
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  EXPECT_FALSE(recv_first_generation(&scheduler, torch::Tensor()));
+  scheduler.wait_for_responses();
+  EXPECT_TRUE(scheduler.reservations_empty());
+  EXPECT_FALSE(sequence->has_any_blocks());
+  std::shared_ptr<Request> queued;
+  EXPECT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued, occupying);
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  ASSERT_EQ(outputs.size(), 2U);
+  ASSERT_EQ(outputs.front().outputs.size(), 1U);
+  EXPECT_EQ(outputs.front().outputs.front().token_ids,
+            std::vector<int32_t>({42}));
+  ASSERT_TRUE(outputs.back().status.has_value());
+  EXPECT_EQ(outputs.back().status->code(), StatusCode::RESOURCE_EXHAUSTED);
+}
+
+}  // namespace
 }  // namespace xllm

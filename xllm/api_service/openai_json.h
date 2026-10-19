@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <type_traits>
 
 #include "chat.pb.h"
 #include "completion.pb.h"
@@ -24,6 +25,11 @@ limitations under the License.
 #include "core/framework/request/finish_reason.h"
 #include "embedding.pb.h"
 #include "models.pb.h"
+
+namespace xllm {
+class Options;
+class ModelArgs;
+}  // namespace xllm
 
 namespace xllm::api_service {
 
@@ -42,10 +48,43 @@ nlohmann::json openai_embedding_json(const proto::EmbeddingResponse& response,
 nlohmann::json openai_usage_json(const proto::Usage& usage, bool stream = true);
 nlohmann::json openai_models_json(const proto::ModelListResponse& response);
 std::string openai_system_fingerprint(const std::string& configuration);
+std::string openai_system_fingerprint(const Options& options,
+                                      const ModelArgs* model_args);
 void set_openai_system_fingerprint(nlohmann::json& response,
                                    const std::string& fingerprint,
                                    bool stream,
                                    bool include_usage);
 void set_proto_stop_reason(const StopReason& reason, proto::StopReason* output);
+
+// Shared JSON encoding for connection responses and asynchronous service
+// results.
+template <typename Request, typename Response>
+std::string serialize_openai_response(const Request& request,
+                                      const Response& response,
+                                      const proto::Usage& stream_usage,
+                                      const std::string& fingerprint,
+                                      bool delta) {
+  nlohmann::json json;
+  if constexpr (std::is_same_v<Response, proto::ChatResponse>) {
+    const std::string& choice = request.tool_choice();
+    const bool named = !choice.empty() && choice != "none" &&
+                       choice != "auto" && choice != "required";
+    json = openai_response_json(response, named, choice == "required");
+  } else {
+    static_assert(std::is_same_v<Response, proto::CompletionResponse>);
+    json = openai_response_json(response, request.stream());
+  }
+  const auto& options = request.stream_options();
+  set_openai_system_fingerprint(
+      json, fingerprint, request.stream(), options.include_usage());
+  if (delta && options.include_usage() && options.continuous_usage_stats() &&
+      !response.has_usage()) {
+    json["usage"] = openai_usage_json(stream_usage);
+  }
+  return json.dump(-1,
+                   ' ',
+                   /*ensure_ascii=*/false,
+                   nlohmann::json::error_handler_t::replace);
+}
 
 }  // namespace xllm::api_service

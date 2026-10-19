@@ -46,6 +46,7 @@ cc_library(
     disagg_pd_service_impl.h
     disagg_pd_kv_response.h
     disagg_pd_request_converter.h
+    disagg_pd_response.h
     distributed_worker_manager.h
     remote_worker.h
     worker_server.h
@@ -53,6 +54,7 @@ cc_library(
     comm_channel.h
     shm_channel.h
     heartbeat_callback_registry.h
+    http_callback_channel_cache.h
     kv_transfer_topology.h
     kv_cache_transfer_coordinator.h
     xservice_client.h
@@ -73,6 +75,7 @@ cc_library(
     disagg_pd_service_impl.cpp
     disagg_pd_kv_response.cpp
     disagg_pd_request_converter.cpp
+    disagg_pd_response.cpp
     distributed_worker_manager.cpp
     kv_cache_transfer_coordinator.cpp
     remote_worker.cpp
@@ -91,6 +94,7 @@ cc_library(
     :kv_cache_manager_factory
     :util
     glog::glog
+    nlohmann_json::nlohmann_json
     proto::xllm_proto
     absl::flat_hash_set
     :parallel_state

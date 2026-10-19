@@ -111,6 +111,12 @@ class RequestParams final {
   std::string request_id;
   std::string service_request_id = "";
   std::string source_xservice_addr = "";
+  proto::CompletionResponseType response_type = proto::CHAT_COMPLETION;
+  std::string response_model;
+  std::vector<proto::Tool> response_tools;
+  std::string response_tool_choice;
+  google::protobuf::Struct response_chat_template_kwargs;
+  proto::StreamOptions response_stream_options;
   std::string x_request_id;
   std::string x_request_time;
 

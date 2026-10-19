@@ -18,13 +18,18 @@ limitations under the License.
 #include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
+#include <brpc/controller.h>
 #include <glog/logging.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <nlohmann/json.hpp>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
+#include "api_service/openai_json.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/service_config.h"
 #include "util/env_var.h"
@@ -39,6 +44,10 @@ static std::string ETCD_XSERVICES_KEY_PREFIX =
     "XLLM:SERVICE:";  // all xllm_service registration prefix
 constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
 constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
+constexpr int32_t kDefaultHttpTimeoutMs = 10000;
+constexpr size_t kMaxHttpBatchBytes = 1024 * 1024;
+constexpr size_t kMaxHttpBatchResults = 256;
+constexpr std::string_view kHttpBatchPrefix = "{\"results\":[";
 static std::unordered_map<xllm_service::proto::InstanceType, std::string>
     ETCD_KEYS_PREFIX_MAP = {
         {xllm_service::proto::InstanceType::DEFAULT, "XLLM:DEFAULT:"},
@@ -81,7 +90,7 @@ void fill_generation_request(const RequestOutput& output,
         static_cast<int32_t>(output.status.value().code()));
     gen_status->set_status_msg(output.status.value().message());
   }
-  request->set_finished(output.finished);
+  request->set_finished(output.finished || output.cancelled);
   request->set_finished_on_prefill_instance(
       output.finished_on_prefill_instance);
   if (output.usage.has_value()) {
@@ -145,6 +154,10 @@ void fill_generation_request(const RequestOutput& output,
   }
 }
 
+std::string service_channel_key(const std::string& address, bool http) {
+  return (http ? "http://" : "baidu_std://") + address;
+}
+
 }  // namespace
 
 bool XServiceClient::init(const std::string& etcd_addr,
@@ -179,6 +192,7 @@ bool XServiceClient::init(const std::string& etcd_addr,
     return false;
   }
   chan_options_.protocol = service_protocol;
+  http_service_protocol_ = service_protocol == "http";
   // Generations contains deltas without sequence numbers. An ambiguous HTTP
   // ACK must fail the request, rather than transparently replaying a delta.
   chan_options_.max_retry = service_protocol == "http" ? 0 : 3;
@@ -580,6 +594,14 @@ std::vector<std::string> XServiceClient::get_all_xservice_addrs() {
 }
 
 bool XServiceClient::generation(const RequestOutput& output) {
+  const std::string& protocol =
+      DistributedConfig::get_instance().xservice_rpc_protocol();
+  if (protocol == "http" || output.response_formatter) {
+    auto results = send_generations(std::span<const RequestOutput>(&output, 1));
+    CHECK_EQ(results.size(), 1);
+    return results.front();
+  }
+  CHECK_EQ(protocol, "baidu_std");
   std::string master_addr;
   if (output.target_xservice_addr.empty()) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -602,6 +624,7 @@ bool XServiceClient::generation(const RequestOutput& output) {
   fill_generation_request(output, request.mutable_gens()->Add());
   proto::StatusSet response;
   brpc::Controller cntl;
+  std::shared_ptr<brpc::Channel> channel;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto* service_stub = find_stub_locked(target_service);
@@ -609,6 +632,10 @@ bool XServiceClient::generation(const RequestOutput& output) {
       LOG(ERROR) << "No stub available for xservice: " << target_service;
       return false;
     }
+    const auto channel_it = xservice_channels_.find(
+        service_channel_key(target_service, http_service_protocol_));
+    CHECK(channel_it != xservice_channels_.end());
+    channel = channel_it->second;
     service_stub->Generations(&cntl, &request, &response, brpc::DoNothing());
   }
   brpc::Join(cntl.call_id());
@@ -629,6 +656,17 @@ std::vector<bool> XServiceClient::generations(
 
 std::vector<bool> XServiceClient::send_generations(
     std::span<const RequestOutput> outputs) {
+  const std::string& protocol =
+      DistributedConfig::get_instance().xservice_rpc_protocol();
+  if (protocol == "http") {
+    return generations_http(outputs);
+  }
+  CHECK_EQ(protocol, "baidu_std");
+  return generations_rpc(outputs);
+}
+
+std::vector<bool> XServiceClient::generations_rpc(
+    std::span<const RequestOutput> outputs) {
   std::vector<bool> results(outputs.size(), false);
   if (outputs.empty()) {
     return results;
@@ -648,6 +686,14 @@ std::vector<bool> XServiceClient::send_generations(
   // request together avoids a second address-keyed map and a later lookup.
   std::unordered_map<std::string, ServiceBatch> service_batches;
 
+  auto mark_batch_failed = [&](const ServiceBatch& batch) {
+    for (size_t index : batch.output_indices) {
+      if (outputs[index].response_formatter) {
+        *outputs[index].response_formatter = {};
+      }
+    }
+  };
+
   for (size_t i = 0; i < outputs.size(); ++i) {
     const auto& output = outputs[i];
     const std::string& target_service = output.target_xservice_addr.empty()
@@ -660,11 +706,31 @@ std::vector<bool> XServiceClient::send_generations(
       continue;
     }
 
+    std::optional<ServiceGenerationOutput> formatted;
+    if (output.response_formatter) {
+      auto& formatter = *output.response_formatter;
+      if (!formatter) {
+        continue;
+      }
+      const bool keep_running = formatter(output, /*http=*/false, &formatted);
+      if (!keep_running) {
+        formatter = {};
+      }
+      if (!formatted.has_value()) {
+        results[i] = keep_running;
+        continue;
+      }
+    }
+
     auto& batch = service_batches[target_service];
     batch.output_indices.push_back(i);
 
     // Construct the request to corresponding service.
-    fill_generation_request(output, batch.gens.mutable_gens()->Add());
+    auto* request = batch.gens.mutable_gens()->Add();
+    fill_generation_request(output, request);
+    if (formatted.has_value() && formatted->chat_output) {
+      request->mutable_chat_output()->Swap(formatted->chat_output.get());
+    }
   }
 
   // Use brpc semi-synchronous RPC pattern (DoNothing + Join) instead of
@@ -674,6 +740,7 @@ std::vector<bool> XServiceClient::send_generations(
   struct AsyncCallContext {
     const std::string* service_addr = nullptr;
     const ServiceBatch* batch = nullptr;
+    std::shared_ptr<brpc::Channel> channel;
     brpc::Controller cntl;
     proto::StatusSet resp;
     bool issued = false;
@@ -700,6 +767,10 @@ std::vector<bool> XServiceClient::send_generations(
       LOG(ERROR) << "No stub available for xservice: " << *ctx.service_addr;
       continue;
     }
+    const auto channel_it = xservice_channels_.find(
+        service_channel_key(*ctx.service_addr, http_service_protocol_));
+    CHECK(channel_it != xservice_channels_.end());
+    ctx.channel = channel_it->second;
     ctx.issued = true;
     service_stub->Generations(
         &ctx.cntl, &pair.second.gens, &ctx.resp, brpc::DoNothing());
@@ -724,23 +795,299 @@ std::vector<bool> XServiceClient::send_generations(
         LOG(ERROR) << "Fail to response tokens to xservice server "
                    << service_addr << ", error text: " << ctx.cntl.ErrorText();
       }
+      mark_batch_failed(*ctx.batch);
       continue;
     }
 
     if (ctx.resp.all_status_size() != static_cast<int32_t>(indices.size())) {
       LOG(ERROR) << "Invalid generation ACK count from service: "
                  << service_addr;
-      mark_service_failed(service_addr);
+      mark_batch_failed(*ctx.batch);
       continue;
     }
 
     for (size_t j = 0; j < indices.size(); ++j) {
       size_t original_idx = indices[j];
       results[original_idx] = ctx.resp.all_status(j).ok();
+      if (!results[original_idx] && outputs[original_idx].response_formatter) {
+        *outputs[original_idx].response_formatter = {};
+      }
     }
   }
 
   return results;
+}
+
+std::vector<bool> XServiceClient::generations_http(
+    std::span<const RequestOutput> outputs) {
+  std::vector<bool> results(outputs.size(), false);
+  std::vector<ServiceGenerationOutput> formatted;
+  std::vector<size_t> indices;
+  formatted.reserve(outputs.size());
+  indices.reserve(outputs.size());
+  for (size_t index = 0; index < outputs.size(); ++index) {
+    const auto& output = outputs[index];
+    const bool failed = output.status.has_value() && !output.status->ok();
+    if (output.outputs.empty() && !output.finished && !output.cancelled &&
+        !failed) {
+      results[index] = true;
+      continue;
+    }
+    std::optional<ServiceGenerationOutput> result;
+    if (output.response_formatter) {
+      auto& formatter = *output.response_formatter;
+      if (!formatter) {
+        continue;
+      }
+      const bool keep_running = formatter(output, /*http=*/true, &result);
+      if (!keep_running) {
+        formatter = {};
+      }
+      if (!result.has_value()) {
+        results[index] = keep_running;
+        continue;
+      }
+    } else if (failed) {
+      // Prefill only reports terminal errors and needs no token parser.
+      result.emplace();
+      result->stream = output.stream;
+      result->finished = true;
+      result->status_code =
+          api_service::openai_http_status(output.status->code());
+      result->payload = api_service::openai_error_json(
+          output.status->code(), output.status->message());
+      if (output.stream) {
+        result->payload = "data: " + result->payload + "\n\ndata: [DONE]\n\n";
+      }
+    } else {
+      LOG(ERROR) << "HTTP generation requires a response formatter, request_id="
+                 << output.request_id;
+      continue;
+    }
+    result->service_request_id = output.service_request_id;
+    result->target_xservice_addr = output.target_xservice_addr;
+    formatted.emplace_back(std::move(*result));
+    indices.emplace_back(index);
+  }
+  const auto accepted = send_http_generations(formatted);
+  CHECK_EQ(accepted.size(), indices.size());
+  for (size_t index = 0; index < indices.size(); ++index) {
+    const size_t original = indices[index];
+    results[original] = accepted[index];
+    if (!accepted[index] && outputs[original].response_formatter) {
+      // Pending outputs share this context, so an ambiguous failure cannot
+      // generate and send later deltas after the failed batch.
+      *outputs[original].response_formatter = {};
+    }
+  }
+  return results;
+}
+
+std::vector<bool> XServiceClient::send_http_generations(
+    const std::vector<ServiceGenerationOutput>& outputs) {
+  struct Batch {
+    std::string body{kHttpBatchPrefix};
+    std::vector<size_t> indices;
+  };
+  struct Target {
+    std::shared_ptr<brpc::Channel> channel;
+    std::vector<Batch> batches;
+    size_t next = 0;
+  };
+  std::vector<bool> accepted(outputs.size(), false);
+  std::vector<bool> oversized(outputs.size(), false);
+  std::unordered_map<std::string, Target> targets;
+  targets.reserve(outputs.size());
+  for (size_t index = 0; index < outputs.size(); ++index) {
+    const auto& output = outputs[index];
+    if (output.target_xservice_addr.empty() ||
+        output.service_request_id.empty() || output.payload.empty()) {
+      LOG(ERROR) << "HTTP batch output requires an owner and a payload";
+      continue;
+    }
+    nlohmann::json entry = {
+        {"attempt_id", output.service_request_id},
+        {"sequence", output.sequence},
+        {"finished", output.finished},
+        {"status_code", output.status_code},
+        {"content_type",
+         output.stream ? "text/event-stream" : "application/json"},
+        {"payload", output.payload}};
+    std::string encoded = entry.dump(-1,
+                                     ' ',
+                                     /*ensure_ascii=*/false,
+                                     nlohmann::json::error_handler_t::replace);
+    if (encoded.size() + kHttpBatchPrefix.size() + 2 > kMaxHttpBatchBytes) {
+      LOG(ERROR) << "HTTP batch item exceeds the body limit, attempt_id="
+                 << output.service_request_id;
+      // This is a local rejection before delivery, so a compact terminal
+      // error is safe. Ambiguous transport failures below are never replayed.
+      oversized[index] = true;
+      std::string error = api_service::openai_error_json(
+          StatusCode::RESOURCE_EXHAUSTED,
+          "The generated response exceeds the HTTP callback body limit");
+      entry["finished"] = true;
+      entry["status_code"] = 500;
+      entry["payload"] =
+          output.stream ? "data: " + error + "\n\ndata: [DONE]\n\n" : error;
+      encoded = entry.dump(-1,
+                           ' ',
+                           /*ensure_ascii=*/false,
+                           nlohmann::json::error_handler_t::replace);
+      if (encoded.size() + kHttpBatchPrefix.size() + 2 > kMaxHttpBatchBytes) {
+        LOG(ERROR) << "HTTP callback identity exceeds the body limit";
+        continue;
+      }
+    }
+    auto& target = targets[output.target_xservice_addr];
+    if (target.batches.empty() ||
+        target.batches.back().indices.size() >= kMaxHttpBatchResults ||
+        target.batches.back().body.size() + encoded.size() + 3 >
+            kMaxHttpBatchBytes) {
+      target.batches.emplace_back();
+      target.batches.back().indices.reserve(
+          std::min(outputs.size(), kMaxHttpBatchResults));
+    }
+    auto& batch = target.batches.back();
+    if (!batch.indices.empty()) {
+      batch.body += ',';
+    }
+    batch.body += encoded;
+    batch.indices.emplace_back(index);
+  }
+
+  for (auto& [address, target] : targets) {
+    target.channel = get_http_callback_channel(address);
+    if (target.channel == nullptr) {
+      target.next = target.batches.size();
+    }
+  }
+  // Issue one chunk per owner concurrently. Keep later chunks behind the
+  // previous ACK so splitting a large batch never reorders an attempt.
+  while (true) {
+    struct Call {
+      Target* target;
+      brpc::Controller controller;
+    };
+    std::vector<std::unique_ptr<Call>> calls;
+    calls.reserve(targets.size());
+    for (auto& [address, target] : targets) {
+      if (target.next == target.batches.size()) {
+        continue;
+      }
+      auto call = std::make_unique<Call>();
+      call->target = &target;
+      auto& controller = call->controller;
+      controller.http_request().set_method(brpc::HTTP_METHOD_POST);
+      controller.http_request().uri() = "/xllm/v1/results";
+      controller.http_request().set_content_type("application/json");
+      controller.http_request().SetHeader("Connection", "keep-alive");
+      auto& batch = target.batches[target.next];
+      controller.request_attachment().append(batch.body);
+      controller.request_attachment().append("]}");
+      target.channel->CallMethod(/*method=*/nullptr,
+                                 &controller,
+                                 /*request=*/nullptr,
+                                 /*response=*/nullptr,
+                                 brpc::DoNothing());
+      calls.emplace_back(std::move(call));
+    }
+    if (calls.empty()) {
+      break;
+    }
+    for (auto& call : calls) {
+      auto& controller = call->controller;
+      brpc::Join(controller.call_id());
+      auto& target = *call->target;
+      const auto& indices = target.batches[target.next].indices;
+      const nlohmann::json response =
+          nlohmann::json::parse(controller.response_attachment().to_string(),
+                                /*cb=*/nullptr,
+                                /*allow_exceptions=*/false);
+      const bool valid =
+          !controller.Failed() &&
+          controller.http_response().status_code() == 200 &&
+          response.is_object() && response.contains("accepted") &&
+          response["accepted"].is_array() &&
+          response["accepted"].size() == indices.size() &&
+          std::all_of(response["accepted"].begin(),
+                      response["accepted"].end(),
+                      [](const auto& value) { return value.is_boolean(); });
+      if (!valid) {
+        LOG(ERROR) << "HTTP batch output failed or returned an invalid ACK, "
+                   << "HTTP status=" << controller.http_response().status_code()
+                   << ", error=" << controller.ErrorText();
+        // Delivery may already have happened. Do not replay this batch or
+        // issue its remaining chunks after an ambiguous failure.
+        target.next = target.batches.size();
+        continue;
+      }
+      for (size_t index = 0; index < indices.size(); ++index) {
+        // Stop engine output after a size rejection even if the peer accepted
+        // its terminal error. generations_http also closes the shared parser.
+        accepted[indices[index]] = !oversized[indices[index]] &&
+                                   response["accepted"][index].get<bool>();
+      }
+      ++target.next;
+    }
+  }
+  return accepted;
+}
+
+std::shared_ptr<brpc::Channel> XServiceClient::get_service_channel(
+    const std::string& xservice_addr,
+    bool http) {
+  const std::string key = service_channel_key(xservice_addr, http);
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto it = xservice_channels_.find(key);
+    if (it != xservice_channels_.end()) {
+      return it->second;
+    }
+  }
+
+  auto channel = create_service_channel(xservice_addr, http);
+  if (channel == nullptr) {
+    return nullptr;
+  }
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  return xservice_channels_.try_emplace(key, std::move(channel)).first->second;
+}
+
+std::shared_ptr<brpc::Channel> XServiceClient::get_http_callback_channel(
+    const std::string& address) {
+  auto channel = http_callback_channels_.find(address);
+  if (channel != nullptr) {
+    return channel;
+  }
+  channel = create_service_channel(address, /*http=*/true);
+  return channel == nullptr
+             ? nullptr
+             : http_callback_channels_.insert(address, std::move(channel));
+}
+
+std::shared_ptr<brpc::Channel> XServiceClient::create_service_channel(
+    const std::string& address,
+    bool http) {
+  brpc::ChannelOptions options = chan_options_;
+  if (http) {
+    options.protocol = "http";
+    options.connection_type = brpc::CONNECTION_TYPE_POOLED;
+    // The peer may have applied a delta before its ACK is lost. Never replay
+    // it.
+    options.max_retry = 0;
+    const int32_t timeout_ms =
+        ServiceConfig::get_instance().rpc_channel_timeout_ms();
+    options.timeout_ms = timeout_ms > 0 ? timeout_ms : kDefaultHttpTimeoutMs;
+  }
+  auto channel = std::make_shared<brpc::Channel>();
+  if (channel->Init(address.c_str(), /*load_balancer_name=*/"", &options) !=
+      0) {
+    LOG(ERROR) << "Fail to initialize service channel to " << address;
+    return nullptr;
+  }
+
+  return channel;
 }
 
 bool XServiceClient::connect_to_xservice(const std::string& xservice_addr) {
@@ -749,24 +1096,30 @@ bool XServiceClient::connect_to_xservice(const std::string& xservice_addr) {
     return false;
   }
 
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-
-  // If already connected, directly return true
-  if (xservice_channels_.find(xservice_addr) != xservice_channels_.end()) {
-    return true;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (xservice_stubs_.find(xservice_addr) != xservice_stubs_.end()) {
+      return true;
+    }
   }
 
-  auto channel = std::make_unique<brpc::Channel>();
-  if (channel->Init(xservice_addr.c_str(), "", &chan_options_) != 0) {
-    LOG(ERROR) << "Fail to initialize xservice channel to server "
-               << xservice_addr;
+  auto channel = get_service_channel(xservice_addr, http_service_protocol_);
+  if (channel == nullptr) {
     return false;
   }
 
-  xservice_channels_[xservice_addr] = std::move(channel);
-  xservice_stubs_[xservice_addr] =
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  // Reinsert if discovery removed the cache entry while the channel was built.
+  const auto channel_it =
+      xservice_channels_
+          .try_emplace(
+              service_channel_key(xservice_addr, http_service_protocol_),
+              std::move(channel))
+          .first;
+  xservice_stubs_.try_emplace(
+      xservice_addr,
       std::make_unique<xllm_service::proto::XllmRpcService_Stub>(
-          xservice_channels_[xservice_addr].get());
+          channel_it->second.get()));
 
   LOG(INFO) << "Successfully connected to xservice: " << xservice_addr;
   return true;
@@ -833,10 +1186,13 @@ xllm_service::proto::XllmRpcService_Stub* XServiceClient::find_stub_locked(
 }
 
 void XServiceClient::disconnect_xservice(const std::string& xservice_addr) {
+  http_callback_channels_.erase(xservice_addr);
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
   if (xservice_stubs_.erase(xservice_addr) > 0) {
-    xservice_channels_.erase(xservice_addr);
+    xservice_channels_.erase(
+        service_channel_key(xservice_addr, /*http=*/false));
+    xservice_channels_.erase(service_channel_key(xservice_addr, /*http=*/true));
     LOG(INFO) << "Disconnected from xservice: " << xservice_addr;
 
     // if master disconnected，need to update master address

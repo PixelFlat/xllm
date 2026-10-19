@@ -25,11 +25,12 @@ limitations under the License.
 
 #include <boost/algorithm/string.hpp>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <unordered_set>
 #include <utility>
 
+#include "api_service/chat_response_builder.h"
+#include "api_service/openai_http.h"
 #include "api_service/stream_output_parser.h"
 #include "api_service/utils.h"
 #include "core/common/instance_name.h"
@@ -39,6 +40,7 @@ limitations under the License.
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/distributed_runtime/xservice_client.h"
+#include "core/framework/config/distributed_config.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
 #include "core/util/utils.h"
@@ -53,435 +55,62 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-void set_logprobs(proto::ChatChoice* choice,
-                  const std::optional<std::vector<LogProb>>& logprobs) {
-  if (!logprobs.has_value() || logprobs.value().empty()) {
-    return;
-  }
-
-  auto* proto_logprobs = choice->mutable_logprobs();
-  proto_logprobs->mutable_content()->Reserve(logprobs.value().size());
-  for (const auto& logprob : logprobs.value()) {
-    auto* logprob_proto = proto_logprobs->add_content();
-    logprob_proto->set_token(logprob.token);
-    logprob_proto->set_token_id(logprob.token_id);
-    logprob_proto->set_logprob(logprob.logprob);
-
-    if (logprob.top_logprobs.has_value()) {
-      for (const auto& top_logprob : logprob.top_logprobs.value()) {
-        auto* top_logprob_proto = logprob_proto->add_top_logprobs();
-        top_logprob_proto->set_token(top_logprob.token);
-        top_logprob_proto->set_token_id(top_logprob.token_id);
-        top_logprob_proto->set_logprob(top_logprob.logprob);
-      }
-    }
-  }
-}
-
-template <typename ChatCall>
-bool send_tool_call_chunk(std::shared_ptr<ChatCall> call,
-                          size_t index,
-                          const std::string& tool_call_id,
-                          const std::string& function_name,
-                          const std::string& arguments,
-                          int tool_index,
-                          const std::string& request_id,
-                          int64_t created_time,
-                          const std::string& model) {
-  auto& response = call->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* delta = choice->mutable_delta();
-
-  auto* tool_call = delta->add_tool_calls();
-  if (!tool_call_id.empty()) {
-    tool_call->set_id(tool_call_id);
-  }
-  tool_call->set_index(tool_index);
-  tool_call->set_type("function");
-
-  auto* function = tool_call->mutable_function();
-  if (!function_name.empty()) {
-    function->set_name(function_name);
-  }
-  if (!arguments.empty()) {
-    function->set_arguments(arguments);
-  }
-
-  return call->write(response);
-}
-
-template <typename ChatCall>
-bool send_normal_text_chunk(std::shared_ptr<ChatCall> call,
-                            size_t index,
-                            const std::string& content,
-                            const std::string& request_id,
-                            int64_t created_time,
-                            const std::string& model) {
-  auto& response = call->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* delta = choice->mutable_delta();
-  delta->set_content(content);
-
-  return call->write(response);
-}
-
-template <typename ChatCall>
-bool send_reasoning_text_chunk(std::shared_ptr<ChatCall> call,
-                               size_t index,
-                               const std::string& content,
-                               const std::string& request_id,
-                               int64_t created_time,
-                               const std::string& model) {
-  auto& response = call->response();
-  response.Clear();
-  response.set_object("chat.completion.chunk");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  auto* choice = response.add_choices();
-  choice->set_index(index);
-  auto* delta = choice->mutable_delta();
-  delta->set_reasoning_content(content);
-
-  return call->write(response);
-}
-
-template <typename ChatCall>
-bool process_tool_call_stream(std::shared_ptr<ChatCall> call,
-                              std::shared_ptr<StreamOutputParser> stream_parser,
-                              size_t index,
-                              const std::string& delta,
-                              const std::string& request_id,
-                              int64_t created_time,
-                              const std::string& model) {
-  auto* parser = stream_parser->get_tool_call_parser(index);
-  if (!parser) {
-    return true;
-  }
-
-  auto parse_result = parser->parse_streaming_increment(delta);
-
-  if (!parse_result.normal_text.empty()) {
-    if (!send_normal_text_chunk(call,
-                                index,
-                                parse_result.normal_text,
-                                request_id,
-                                created_time,
-                                model)) {
-      return false;
-    }
-  }
-
-  for (const auto& call_item : parse_result.calls) {
-    stream_parser->set_has_tool_call(index, true);
-
-    std::string tool_call_id;
-    std::string function_name;
-
-    if (call_item.name.has_value()) {
-      tool_call_id = function_call::utils::generate_tool_call_id();
-      function_name = call_item.name.value();
-    }
-
-    if (!send_tool_call_chunk(call,
-                              index,
-                              tool_call_id,
-                              function_name,
-                              call_item.parameters,
-                              call_item.tool_index,
-                              request_id,
-                              created_time,
-                              model)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool get_enable_thinking_from_request(
-    const nlohmann::json& chat_template_kwargs,
-    const std::string& reasoning_parser_format) {
-  // Default to true if reasoning_parser is configured
-  // This matches chat template defaults for models like glm47 that enable
-  // thinking by default
-  bool default_value = !reasoning_parser_format.empty();
-
-  if (chat_template_kwargs.empty()) {
-    return default_value;
-  }
-
-  // Check for explicit enable_thinking or thinking setting
-  // qwen3 and glm45/glm47 use enable_thinking and deepseek-v3 uses thinking
-  if (chat_template_kwargs.contains("enable_thinking") ||
-      chat_template_kwargs.contains("thinking")) {
-    auto get_bool_val = [&](const char* key) {
-      auto it = chat_template_kwargs.find(key);
-      if (it != chat_template_kwargs.end() && it->is_boolean()) {
-        return it->get<bool>();
-      }
-      return false;
-    };
-    return get_bool_val("enable_thinking") || get_bool_val("thinking");
-  }
-
-  return default_value;
-}
-
+using api_service::get_enable_thinking_from_request;
 template <typename ChatCall>
 bool send_delta_to_client_brpc(
-    std::shared_ptr<ChatCall> call,
+    const std::shared_ptr<ChatCall>& call,
     bool include_usage,
     std::unordered_set<size_t>* first_message_sent,
     const std::string& request_id,
     int64_t created_time,
     const std::string& model,
     const RequestOutput& output,
-    std::shared_ptr<StreamOutputParser> stream_parser = nullptr) {
-  auto& response = call->response();
+    std::shared_ptr<StreamOutputParser> parser = nullptr) {
   if (output.usage.has_value()) {
     proto::Usage usage;
     api_service::set_proto_usage(&usage, output.usage.value());
     call->set_stream_usage(usage);
   }
-
-  if (stream_parser && output.outputs.size() > 0) {
-    stream_parser->check_resize_for_index(output.outputs.size() - 1);
+  const bool written = api_service::build_chat_delta(
+      call->response(),
+      include_usage,
+      first_message_sent,
+      request_id,
+      created_time,
+      model,
+      output,
+      std::move(parser),
+      [&call](proto::ChatResponse& frame) { return call->write(frame); });
+  if (!written) {
+    return false;
   }
-  // send delta to client
-  for (const auto& seq_output : output.outputs) {
-    const auto& index = seq_output.index;
-    std::string cur_text = seq_output.text;
-
-    if (first_message_sent->find(index) == first_message_sent->end()) {
-      response.Clear();
-      response.set_object("chat.completion.chunk");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(index);
-      auto* message = choice->mutable_delta();
-      message->set_role("assistant");
-      message->set_content("");
-      first_message_sent->insert(index);
-      if (!call->write(response)) {
-        return false;
-      }
-    }
-
-    // Handle reasoning text
-    if (!cur_text.empty()) {
-      if (stream_parser && stream_parser->is_reasoning()) {
-        auto parser = stream_parser->get_reasoning_parser(index);
-        auto result = parser->parse_stream_chunk(cur_text);
-        if (result.normal_text.has_value()) {
-          cur_text = result.normal_text.value();
-        } else {
-          cur_text = "";
-        }
-        if (result.reasoning_text.has_value()) {
-          if (!send_reasoning_text_chunk(call,
-                                         index,
-                                         result.reasoning_text.value(),
-                                         request_id,
-                                         created_time,
-                                         model)) {
-            return false;
-          }
-        }
-      }
-    }
-
-    if (!cur_text.empty()) {
-      // Handle tool call text
-      if (stream_parser && stream_parser->is_tool_call()) {
-        if (!process_tool_call_stream(call,
-                                      stream_parser,
-                                      index,
-                                      cur_text,
-                                      request_id,
-                                      created_time,
-                                      model)) {
-          return false;
-        }
-      } else {
-        response.Clear();
-        response.set_object("chat.completion.chunk");
-        response.set_id(request_id);
-        response.set_created(created_time);
-        response.set_model(model);
-        auto* choice = response.add_choices();
-        choice->set_index(index);
-        set_logprobs(choice, seq_output.logprobs);
-        auto* message = choice->mutable_delta();
-        message->set_content(cur_text);
-        if (!call->write(response)) {
-          return false;
-        }
-      }
-    }
-
-    // Handle finish reason
-    if (seq_output.finish_reason.has_value()) {
-      // Check for unstreamed tool args before sending finish reason
-      if (stream_parser && stream_parser->get_has_tool_call(index)) {
-        auto send_func = [&](const std::string& arguments, int tool_index) {
-          return send_tool_call_chunk(call,
-                                      index,
-                                      "",
-                                      "",
-                                      arguments,
-                                      tool_index,
-                                      request_id,
-                                      created_time,
-                                      model);
-        };
-        if (!api_service::check_for_unstreamed_tool_args(
-                stream_parser, index, send_func)) {
-          return false;
-        }
-      }
-
-      response.Clear();
-      response.set_object("chat.completion.chunk");
-      response.set_id(request_id);
-      response.set_created(created_time);
-      response.set_model(model);
-      auto* choice = response.add_choices();
-      choice->set_index(index);
-      choice->mutable_delta();
-      api_service::set_proto_stop_reason(seq_output.stop_reason,
-                                         choice->mutable_stop_reason());
-
-      if (stream_parser && stream_parser->get_has_tool_call(index) &&
-          seq_output.finish_reason.value() == "stop") {
-        choice->set_finish_reason("tool_calls");
-      } else {
-        choice->set_finish_reason(std::move(seq_output.finish_reason.value()));
-      }
-
-      if (!call->write(response)) {
-        return false;
-      }
-    }
-  }
-
-  if (include_usage && output.usage.has_value() &&
-      (output.finished || output.cancelled)) {
-    response.Clear();
-    const auto& usage = output.usage.value();
-    response.set_object("chat.completion.chunk");
-    response.set_id(request_id);
-    response.set_created(created_time);
-    response.set_model(model);
-    auto* proto_usage = response.mutable_usage();
-    api_service::set_proto_usage(proto_usage, usage);
-    if (!call->write(response)) {
-      return false;
-    }
-  }
-
   if (output.finished || output.cancelled) {
-    response.Clear();
+    call->response().Clear();
     return call->finish();
   }
   return true;
 }
 
 template <typename ChatCall>
-bool send_result_to_client_brpc(std::shared_ptr<ChatCall> call,
+bool send_result_to_client_brpc(const std::shared_ptr<ChatCall>& call,
                                 const std::string& request_id,
                                 int64_t created_time,
                                 const std::string& model,
-                                const RequestOutput& req_output,
-                                const std::string& tool_call_parser_format = "",
-                                const std::string& reasoning_parser_format = "",
-                                bool is_force_reasoning = false,
-                                const std::vector<xllm::JsonTool>& tools = {}) {
-  auto& response = call->response();
-  response.set_object("chat.completion");
-  response.set_id(request_id);
-  response.set_created(created_time);
-  response.set_model(model);
-
-  response.mutable_choices()->Reserve(req_output.outputs.size());
-  for (const auto& output : req_output.outputs) {
-    auto* choice = response.add_choices();
-    choice->set_index(output.index);
-    api_service::set_proto_stop_reason(output.stop_reason,
-                                       choice->mutable_stop_reason());
-    set_logprobs(choice, output.logprobs);
-    auto* message = choice->mutable_message();
-    message->set_role("assistant");
-
-    // handle reasoning output
-    std::string cur_text = output.text;
-    if (!reasoning_parser_format.empty()) {
-      auto reasoning_parser = std::make_unique<ReasoningParser>(
-          reasoning_parser_format, false, is_force_reasoning);
-      auto result = reasoning_parser->parse_non_stream(cur_text);
-      if (result.normal_text.has_value()) {
-        cur_text = result.normal_text.value();
-      } else {
-        cur_text = "";
-      }
-      if (result.reasoning_text.has_value()) {
-        message->set_reasoning_content(result.reasoning_text.value());
-      }
-    }
-
-    // handle tool call output
-    if (!tools.empty() && !tool_call_parser_format.empty() &&
-        !cur_text.empty()) {
-      auto* arena = response.GetArena();
-      auto result =
-          api_service::process_tool_calls(cur_text,
-                                          tools,
-                                          tool_call_parser_format,
-                                          output.finish_reason.value_or(""),
-                                          arena);
-
-      message->mutable_content()->swap(result.text);
-
-      if (result.tool_calls) {
-        auto& source_tool_calls = *result.tool_calls;
-        message->mutable_tool_calls()->Swap(&source_tool_calls);
-      }
-
-      if (!result.finish_reason.empty()) {
-        choice->mutable_finish_reason()->swap(result.finish_reason);
-      }
-    } else {
-      message->set_content(cur_text);
-      if (output.finish_reason.has_value()) {
-        choice->set_finish_reason(output.finish_reason.value());
-      }
-    }
-  }
-
-  if (req_output.usage.has_value()) {
-    const auto& usage = req_output.usage.value();
-    auto* proto_usage = response.mutable_usage();
-    api_service::set_proto_usage(proto_usage, usage);
-  }
-
-  return call->write_and_finish(response);
+                                const RequestOutput& output,
+                                const std::string& tool_parser = "",
+                                const std::string& reasoning_parser = "",
+                                bool force_reasoning = false,
+                                const std::vector<JsonTool>& tools = {}) {
+  api_service::build_chat_result(call->response(),
+                                 request_id,
+                                 created_time,
+                                 model,
+                                 output,
+                                 tool_parser,
+                                 reasoning_parser,
+                                 force_reasoning,
+                                 tools);
+  return call->write_and_finish(call->response());
 }
 
 LLMMaster* check_master(LLMMaster* master) {
@@ -625,23 +254,36 @@ void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
       });
 }
 
-// chat_async for brpc with xllm_serice
 void ChatServiceImpl::process_async_rpc_impl(
     const proto::ChatRequest* request) {
-  const auto& service_request_id = request->service_request_id();
-  const auto& target_xservice_addr = request->source_xservice_addr();
-  OutputCallback callback = [](RequestOutput output) {
+  process_request_from_service(*request);
+}
+
+void ChatServiceImpl::process_request_from_service(
+    const proto::ChatRequest& rpc_request,
+    const std::string& x_request_id,
+    const std::string& x_request_time) {
+  const auto& service_request_id = rpc_request.service_request_id();
+  const auto& target_xservice_addr = rpc_request.source_xservice_addr();
+  OutputCallback callback = [service_request_id,
+                             target_xservice_addr,
+                             stream =
+                                 rpc_request.stream()](RequestOutput output) {
+    // Validation failures may contain only a Status. Bind their owner here too.
+    output.service_request_id = service_request_id;
+    output.target_xservice_addr = target_xservice_addr;
+    output.log_request_status();
+    output.stream = stream;
     const auto results = XServiceClient::get_instance()->generations({output});
     return results.size() == 1 && results.front();
   };
   if (rec_master_ != nullptr) {
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "RPC chat is not supported for RecMaster",
+                        "Service chat is not supported for RecMaster",
                         service_request_id,
                         target_xservice_addr);
     return;
   }
-  const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
   auto master = get_model_master(model);
   if (unlikely(master == nullptr)) {
@@ -651,15 +293,17 @@ void ChatServiceImpl::process_async_rpc_impl(
                         target_xservice_addr);
     return;
   }
-  const std::weak_ptr<LLMMaster> weak_master = master;
-  callback = [weak_master](const RequestOutput& req_output) -> bool {
-    const auto master = weak_master.lock();
-    if (master == nullptr) {
-      return false;
-    }
-    req_output.log_request_status();
-    return master->handle_rpc_response(req_output);
-  };
+  if (rpc_request.has_routing() &&
+      (!master->options().enable_disagg_pd() ||
+       rpc_request.routing().decode_name().empty() ||
+       rpc_request.token_ids().empty())) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "PD service requests require PD mode, a Decode route "
+                        "and prompt token IDs",
+                        service_request_id,
+                        target_xservice_addr);
+    return;
+  }
 
   // LLMMaster path (existing logic)
   // Check if the request is being rate-limited.
@@ -672,8 +316,7 @@ void ChatServiceImpl::process_async_rpc_impl(
     return;
   }
 
-  // check if model is supported
-  RequestParams request_params(rpc_request, "", "");
+  RequestParams request_params(rpc_request, x_request_id, x_request_time);
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -707,7 +350,7 @@ void ChatServiceImpl::process_async_rpc_impl(
   if (rpc_request.has_routing()) {
     prompt_tokens = std::vector<int>{};
     prompt_tokens->reserve(rpc_request.token_ids_size());
-    for (int i = 0; i < rpc_request.token_ids_size(); i++) {
+    for (int32_t i = 0; i < rpc_request.token_ids_size(); ++i) {
       prompt_tokens->emplace_back(rpc_request.token_ids(i));
     }
 
@@ -724,12 +367,27 @@ void ChatServiceImpl::process_async_rpc_impl(
                          std::move(prompt_tokens),
                          std::move(request_params),
                          std::nullopt,
-                         callback);
+                         std::move(callback));
 }
 
-// chat_async for brpc
+// Ordinary HTTP admission and response handling.
 void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   const auto& rpc_request = call->request();
+  if (!rpc_request.source_xservice_addr().empty() &&
+      rpc_request.has_routing()) {
+    // Without an attempt ID, the service cannot correlate a result callback.
+    if (rpc_request.service_request_id().empty()) {
+      call->finish_with_error(StatusCode::INVALID_ARGUMENT,
+                              "Missing service callback request ID",
+                              "service_request_id");
+      return;
+    }
+    process_request_from_service(
+        rpc_request, call->get_x_request_id(), call->get_x_request_time());
+    // This acknowledges the result-channel protocol, including business errors.
+    call->accept_async();
+    return;
+  }
   const auto& model = rpc_request.model();
 
   // Route to RecMaster if configured
@@ -751,14 +409,13 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
                             "model");
     return;
   }
+  RequestParams request_params(
+      rpc_request, call->get_x_request_id(), call->get_x_request_time());
   const Status admission = master->get_rate_limiter()->acquire();
   if (unlikely(!admission.ok())) {
     call->finish_with_error(admission.code(), admission.message());
     return;
   }
-
-  RequestParams request_params(
-      rpc_request, call->get_x_request_id(), call->get_x_request_time());
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {

@@ -89,6 +89,12 @@ message Usage {
       [json_name="completion_tokens_details"];
 }
 
+// Public response shape to preserve across the internal P/D handoff.
+enum CompletionResponseType {
+  CHAT_COMPLETION = 0;
+  TEXT_COMPLETION = 1;
+}
+
 // Options for streaming response.
 message StreamOptions{
   // if set, an additional chunk with usage will be streamed before the data: [DONE] message.

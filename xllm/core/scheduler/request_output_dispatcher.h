@@ -73,7 +73,7 @@ class RequestOutputDispatcher final {
   // the threadpool to handle responses
   ThreadPool response_threadpool_;
 
-  // the threadpool to send batched responses via RPC
+  // Serial sender for native RPC and HTTP service output batches.
   ThreadPool rpc_threadpool_;
 
   // the threadpool to generate outputs

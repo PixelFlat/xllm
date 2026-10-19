@@ -17,13 +17,16 @@ limitations under the License.
 
 #include <brpc/closure_guard.h>
 
+#include <utility>
+
 namespace xllm {
 
 DisaggPDService::DisaggPDService(DisaggPDScheduler* scheduler,
                                  Engine* engine,
-                                 int32_t kv_cache_block_tokens) {
+                                 int32_t kv_cache_block_tokens,
+                                 DisaggPDServiceOptions response_options) {
   disagg_pd_service_impl_ = std::make_unique<DisaggPDServiceImpl>(
-      scheduler, engine, kv_cache_block_tokens);
+      scheduler, engine, kv_cache_block_tokens, std::move(response_options));
 }
 
 void DisaggPDService::ReleaseReservation(

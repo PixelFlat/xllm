@@ -30,6 +30,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/distributed_runtime/disagg_pd_service.h"
 #include "core/distributed_runtime/distributed_worker_manager.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/xservice_client.h"
@@ -76,7 +77,8 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
       std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator =
           nullptr,
       std::shared_ptr<KVCacheTransferCoordinator> kv_transfer_coordinator =
-          nullptr)
+          nullptr,
+      DisaggPDServiceOptions response_options = {})
       : DisaggPDScheduler(engine,
                           options,
                           SkipRuntimeStart{},
@@ -91,7 +93,9 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
         &DisaggPDScheduler::dispatch_requests, this);
     server_name_.append(std::to_string(options_.server_idx()));
     rpc_server_thread_ = std::make_unique<std::thread>(
-        &DisaggPDScheduler::start_rpc_server, this);
+        [this, response_options = std::move(response_options)]() mutable {
+          start_rpc_server(std::move(response_options));
+        });
     initialize_rpc_server(server_name_);
     register_instance_info(server_name_);
     if (!options_.disable_ttft_profiling() &&
@@ -230,7 +234,7 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   proto::DisaggPDService_Stub* create_rpc_channel(
       const std::string& instance_name);
 
-  void start_rpc_server();
+  void start_rpc_server(DisaggPDServiceOptions response_options);
 
   // Initialize RPC server and xservice client
   // This method waits for the RPC server to be initialized and sets up the

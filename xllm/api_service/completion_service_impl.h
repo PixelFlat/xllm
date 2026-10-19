@@ -17,6 +17,7 @@ limitations under the License.
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "api_service_impl.h"
 #include "completion.pb.h"
@@ -37,11 +38,14 @@ class CompletionServiceImpl final : public APIServiceImpl<CompletionCall> {
                         std::shared_ptr<MasterManager> master_manager);
 
   // brpc call_data needs to use shared_ptr
-  void process_async_impl(std::shared_ptr<CompletionCall> call);
+  void process_async_impl(std::shared_ptr<CompletionCall> call) override;
 
-  void process_async_rpc_impl(const proto::CompletionRequest* request);
+  void process_async_rpc_impl(const proto::CompletionRequest* request) override;
 
  private:
+  void process_request_from_service(const proto::CompletionRequest& request,
+                                    const std::string& x_request_id = "",
+                                    const std::string& x_request_time = "");
   std::shared_ptr<LLMMaster> get_model_master(const std::string& model) const;
   DISALLOW_COPY_AND_ASSIGN(CompletionServiceImpl);
   std::shared_ptr<MasterManager> master_manager_;

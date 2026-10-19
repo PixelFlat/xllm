@@ -20,6 +20,8 @@ package xllm.proto;
 option cc_generic_services = true;
 
 import "common.proto";
+import "chat.proto";
+import "google/protobuf/struct.proto";
 import "tensor.proto";
 
 message ClusterInfos {
@@ -100,6 +102,13 @@ message DisaggRequest {
   repeated int32 all_stop_token_ids = 49;
   int64 vocab_size = 50;
 
+  // Decode formats the complete OpenAI response and sends it to the service.
+  string model = 53;
+  repeated Tool tools = 54;
+  string tool_choice = 55;
+  google.protobuf.Struct chat_template_kwargs = 56;
+  StreamOptions stream_options = 57;
+  CompletionResponseType response_type = 58;
 }
 
 // response for DisaggRequests from decode instance.
@@ -222,6 +231,11 @@ message GenerationStatus {
 }
 
 // Stream response token to prefill instance from decode.
+// Presence means parsing is engine-owned; empty frames mean buffered output.
+message StructuredChatOutput {
+  repeated ChatResponse frames = 1;
+}
+
 message DisaggStreamGeneration {
   // req id
   string req_id = 1;
@@ -234,6 +248,7 @@ message DisaggStreamGeneration {
   OutputUsage usage = 5;
   bool finished = 6;
   bool finished_on_prefill_instance = 7;
+  StructuredChatOutput chat_output = 8;
 }
 
 message DisaggStreamGenerations {
