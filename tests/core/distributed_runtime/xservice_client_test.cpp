@@ -20,7 +20,11 @@ limitations under the License.
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,6 +32,33 @@ limitations under the License.
 #include <vector>
 
 namespace xllm {
+
+class XServiceClientTestPeer final {
+ public:
+  static std::unique_ptr<XServiceClient> registration_client(
+      const std::string& address) {
+    auto client = std::unique_ptr<XServiceClient>(new XServiceClient());
+    client->master_xservice_addr_ = address;
+    client->http_service_protocol_ = true;
+    client->chan_options_.protocol = "http";
+    client->chan_options_.timeout_ms = 1000;
+    client->chan_options_.max_retry = 0;
+    return client;
+  }
+
+  static bool register_with_retry(XServiceClient& client) {
+    return client.register_direct_instance_with_retry();
+  }
+
+  static void stop(XServiceClient& client) {
+    {
+      std::lock_guard<std::mutex> lock(client.registration_mutex_);
+      client.exited_.store(true);
+    }
+    client.registration_cv_.notify_all();
+  }
+};
+
 namespace {
 
 enum class ResponseMode { NORMAL, TRANSPORT_FAILURE, MISMATCHED_STATUS_COUNT };
@@ -38,6 +69,28 @@ class GenerationTestService final : public xllm_service::proto::XllmRpcService {
       ResponseMode mode = ResponseMode::NORMAL,
       std::unordered_map<std::string, bool> results = {})
       : mode_(mode), results_(std::move(results)) {}
+
+  void RegisterInstance(
+      google::protobuf::RpcController* controller,
+      const xllm_service::proto::InstanceMetaInfo* /*request*/,
+      xllm_service::proto::StatusCode* response,
+      google::protobuf::Closure* done) override {
+    brpc::ClosureGuard done_guard(done);
+    const int32_t attempt = ++registration_calls;
+    if (attempt == 1) {
+      registration_started.set_value();
+    }
+    if (attempt <= registration_failures) {
+      controller->SetFailed("injected transient registration failure");
+      return;
+    }
+    response->set_status_code(registration_status);
+  }
+
+  int32_t registration_failures = 0;
+  int32_t registration_status = 0;
+  std::atomic<int32_t> registration_calls{0};
+  std::promise<void> registration_started;
 
   void Generations(google::protobuf::RpcController* controller,
                    const proto::DisaggStreamGenerations* request,
@@ -119,6 +172,42 @@ RequestOutput make_output(std::string request_id, std::string target) {
   output.service_request_id = "service-" + output.request_id;
   output.target_xservice_addr = std::move(target);
   return output;
+}
+
+TEST(XServiceClientTest, DirectRegistrationRecoversFromTransientFailure) {
+  GenerationTestServer server;
+  server.service().registration_failures = 1;
+  ASSERT_EQ(server.start(), 0);
+  auto client = XServiceClientTestPeer::registration_client(server.address());
+  EXPECT_TRUE(XServiceClientTestPeer::register_with_retry(*client));
+  EXPECT_EQ(server.service().registration_calls.load(), 2);
+}
+
+TEST(XServiceClientTest, DirectRegistrationDoesNotRetryExplicitRejection) {
+  GenerationTestServer server;
+  server.service().registration_status = 1;
+  ASSERT_EQ(server.start(), 0);
+  auto client = XServiceClientTestPeer::registration_client(server.address());
+  EXPECT_FALSE(XServiceClientTestPeer::register_with_retry(*client));
+  EXPECT_EQ(server.service().registration_calls.load(), 1);
+}
+
+TEST(XServiceClientTest, ShutdownInterruptsRegistrationBackoff) {
+  GenerationTestServer server;
+  server.service().registration_failures = 100;
+  auto started = server.service().registration_started.get_future();
+  ASSERT_EQ(server.start(), 0);
+  auto client = XServiceClientTestPeer::registration_client(server.address());
+  auto registration = std::async(std::launch::async, [&client] {
+    return XServiceClientTestPeer::register_with_retry(*client);
+  });
+  const auto first_attempt = started.wait_for(std::chrono::seconds(5));
+  XServiceClientTestPeer::stop(*client);
+  EXPECT_EQ(first_attempt, std::future_status::ready);
+  EXPECT_EQ(registration.wait_for(std::chrono::seconds(1)),
+            std::future_status::ready);
+  EXPECT_FALSE(registration.get());
+  EXPECT_EQ(server.service().registration_calls.load(), 1);
 }
 
 TEST(XServiceClientDeathTest, MismatchedResponseCountIsFatal) {

@@ -303,7 +303,11 @@ void XServiceClient::clear_heartbeat_callback(
 }
 
 XServiceClient::~XServiceClient() {
-  exited_.store(true);
+  {
+    std::lock_guard<std::mutex> lock(registration_mutex_);
+    exited_.store(true);
+  }
+  registration_cv_.notify_all();
   if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
     heartbeat_thread_->join();
   }
@@ -406,7 +410,11 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
       instance_name_ = registered_info.name;
       direct_registration_ = std::move(registration);
     }
-    CHECK(register_direct_instance()) << "Direct service registration failed.";
+    const bool registered = register_direct_instance_with_retry();
+    if (exited_.load()) {
+      return;
+    }
+    CHECK(registered) << "Direct service registration failed.";
     register_done_.store(true);
     return;
   }
@@ -446,7 +454,8 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
   LOG(INFO) << "Success register instance to etcd.";
 }
 
-bool XServiceClient::register_direct_instance() {
+XServiceClient::DirectRegistrationResult
+XServiceClient::register_direct_instance() {
   xllm_service::proto::InstanceMetaInfo request;
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);
@@ -460,15 +469,42 @@ bool XServiceClient::register_direct_instance() {
             stub->RegisterInstance(&cntl, &request, &response, nullptr);
           },
           &master_address)) {
-    return false;
+    return DirectRegistrationResult::REJECTED;
   }
   if (cntl.Failed() || response.status_code() != 0) {
     LOG(ERROR) << "Direct service registration failed: " << master_address
                << ", RPC error: " << cntl.ErrorText()
                << ", status: " << response.status_code();
-    return false;
+    if (cntl.Failed()) {
+      const int32_t http_status = cntl.http_response().status_code();
+      if (!http_service_protocol_ || http_status < 400 || http_status >= 500 ||
+          http_status == 408 || http_status == 429) {
+        return DirectRegistrationResult::RETRYABLE_FAILURE;
+      }
+    }
+    return DirectRegistrationResult::REJECTED;
   }
-  return true;
+  return DirectRegistrationResult::SUCCESS;
+}
+
+bool XServiceClient::register_direct_instance_with_retry() {
+  constexpr int32_t kMaxAttempts = 31;
+  for (int32_t attempt = 1; attempt <= kMaxAttempts && !exited_.load();
+       ++attempt) {
+    const DirectRegistrationResult result = register_direct_instance();
+    if (result == DirectRegistrationResult::SUCCESS) {
+      return true;
+    }
+    if (result == DirectRegistrationResult::REJECTED ||
+        attempt == kMaxAttempts) {
+      return false;
+    }
+    LOG(WARNING) << "Direct service registration retry, attempt=" << attempt;
+    std::unique_lock<std::mutex> lock(registration_mutex_);
+    registration_cv_.wait_for(
+        lock, std::chrono::seconds(2), [this] { return exited_.load(); });
+  }
+  return false;
 }
 
 InstanceInfo XServiceClient::get_instance_info(
@@ -554,7 +590,8 @@ void XServiceClient::heartbeat() {
     } else if (!resp.ok()) {
       LOG(ERROR) << "Failed to send heartbeat to master xservice "
                  << master_addr;
-      if (direct_service_ && !register_direct_instance()) {
+      if (direct_service_ &&
+          register_direct_instance() != DirectRegistrationResult::SUCCESS) {
         LOG(ERROR) << "Failed to renew direct service registration.";
       }
     }

@@ -205,6 +205,8 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `etcd_addr` | `string` | `""` | 保存实例元信息的 etcd 地址。 |
 | `etcd_namespace` | `string` | `""` | xLLM etcd key 使用的可选 namespace 前缀，例如 `prod-a`。 |
 | `enable_service_routing` | `bool` | `false` | 是否启用 xLLM service routing。 |
+| `xservice_rpc_protocol` | `string` | `"baidu_std"` | `XServiceClient` 与服务层通信使用的协议，支持 `baidu_std` 和 `http`。不改变 P/D 引擎间的 RPC 和 KV 传输协议。 |
+| `xservice_address` | `string` | `""` | HTTP 服务层的直连控制地址（`host:port`），用于实例注册、心跳和元信息查询。要求 `xservice_rpc_protocol=http`，与 `etcd_addr` 互斥。具体请求的结果回传使用请求中携带的服务层地址。 |
 | `heart_beat_interval` | `double` | `0.5` | 心跳间隔。 |
 | `etcd_ttl` | `int32` | `3` | etcd key 的 TTL。 |
 

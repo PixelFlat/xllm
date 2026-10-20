@@ -18,6 +18,7 @@ limitations under the License.
 #include <brpc/channel.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -73,6 +74,14 @@ class XServiceClient {
   std::vector<bool> generations(const std::vector<RequestOutput>& outputs);
 
  private:
+  friend class XServiceClientTestPeer;
+
+  enum class DirectRegistrationResult {
+    SUCCESS,
+    RETRYABLE_FAILURE,
+    REJECTED,
+  };
+
   std::vector<bool> send_generations(std::span<const RequestOutput> outputs);
 
   std::vector<bool> generations_rpc(std::span<const RequestOutput> outputs);
@@ -81,7 +90,8 @@ class XServiceClient {
       const std::vector<ServiceGenerationOutput>& outputs);
   bool register_instance_with_retry(const std::string& key,
                                     const std::string& value);
-  bool register_direct_instance();
+  DirectRegistrationResult register_direct_instance();
+  bool register_direct_instance_with_retry();
   bool reconcile_registration();
   void reconcile_registration_loop();
 
@@ -141,6 +151,7 @@ class XServiceClient {
 
   std::shared_mutex mutex_;
   std::mutex registration_mutex_;
+  std::condition_variable registration_cv_;
   brpc::ChannelOptions chan_options_;
   std::unique_ptr<EtcdClient> etcd_client_;
   detail::HeartbeatCallbackRegistry<xllm_service::proto::HeartbeatRequest>

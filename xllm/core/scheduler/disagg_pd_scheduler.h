@@ -45,6 +45,7 @@ namespace xllm {
 
 class KVCacheTransferCoordinator;
 
+inline constexpr int32_t kDecodeAddNewInvalidRequestStatusCode = 400;
 inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
 
 bool is_permanent_rejection(int32_t status_code);
@@ -207,7 +208,8 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
 
-  void do_permanent_rejection(const std::shared_ptr<Request>& request);
+  void do_permanent_rejection(const std::shared_ptr<Request>& request,
+                              int32_t status_code);
 
   size_t num_queued_requests() const override;
   bool enqueue_ready_request(std::shared_ptr<Request> request) override;

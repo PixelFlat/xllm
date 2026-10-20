@@ -147,7 +147,8 @@ void send_reservation_release(const std::string& req_id,
 }  // namespace
 
 bool is_permanent_rejection(int32_t status_code) {
-  return status_code == kDecodeAddNewPromptTooLongStatusCode;
+  return status_code == kDecodeAddNewInvalidRequestStatusCode ||
+         status_code == kDecodeAddNewPromptTooLongStatusCode;
 }
 
 bool exceeds_decode_capacity(size_t num_prompt_tokens,
@@ -493,6 +494,14 @@ void DisaggPDScheduler::dispatch_requests() {
            "No decode address provided to the prefill instance"});
       continue;
     }
+    if (request->source_xservice_addr().empty() ||
+        request->service_request_id().empty()) {
+      output_dispatcher_->process_failed_request(
+          request,
+          {StatusCode::INVALID_ARGUMENT,
+           "PD request requires a service address and request ID"});
+      continue;
+    }
 
     std::vector<std::shared_ptr<Request>> requests;
     requests.emplace_back(request);
@@ -699,11 +708,13 @@ void DisaggPDScheduler::dispatch_requests() {
     for (size_t i = 0; i < requests.size(); ++i) {
       if (resps.resps()[i].status_code() != 200) {
         if (is_permanent_rejection(resps.resps()[i].status_code())) {
-          LOG(ERROR) << "Decode rejected an oversized prompt, request_id="
-                     << requests[i]->request_id() << ", prompt_tokens="
+          LOG(ERROR) << "Decode permanently rejected request, status_code="
+                     << resps.resps()[i].status_code()
+                     << ", request_id=" << requests[i]->request_id()
+                     << ", prompt_tokens="
                      << requests[i]->state().prompt_tokens.size()
                      << ", selected_instance=" << selected_instance;
-          do_permanent_rejection(requests[i]);
+          do_permanent_rejection(requests[i], resps.resps()[i].status_code());
           continue;
         }
         // Keep created_time order: retry from the local pending queue instead
@@ -1385,12 +1396,17 @@ bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {
 }
 
 void DisaggPDScheduler::do_permanent_rejection(
-    const std::shared_ptr<Request>& request) {
+    const std::shared_ptr<Request>& request,
+    int32_t status_code) {
   CHECK(request != nullptr);
+  const bool invalid_request =
+      status_code == kDecodeAddNewInvalidRequestStatusCode;
   output_dispatcher_->process_failed_request(
       request,
-      {StatusCode::RESOURCE_EXHAUSTED,
-       "Request prompt exceeds decode KV cache capacity"});
+      {invalid_request ? StatusCode::INVALID_ARGUMENT
+                       : StatusCode::RESOURCE_EXHAUSTED,
+       invalid_request ? "Decode rejected invalid PD service metadata"
+                       : "Request prompt exceeds decode KV cache capacity"});
   kv_cache_manager_->deallocate(request.get());
   std::lock_guard<std::mutex> lock(req_to_channel_map_mutex_);
   req_to_channel_map_.erase(request->request_id());

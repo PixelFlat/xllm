@@ -205,6 +205,8 @@ Current support covers ordinary non-PD text inference with prefix caching enable
 | `etcd_addr` | `string` | `""` | etcd address used to save instance metadata. |
 | `etcd_namespace` | `string` | `""` | Optional etcd namespace prefix for all xLLM keys, for example `prod-a`. |
 | `enable_service_routing` | `bool` | `false` | Whether to enable xLLM service routing. |
+| `xservice_rpc_protocol` | `string` | `"baidu_std"` | Protocol used by `XServiceClient` to communicate with the service layer: `baidu_std` or `http`. Does not change P/D engine RPC or KV transfer protocols. |
+| `xservice_address` | `string` | `""` | Direct HTTP service control address (`host:port`) for instance registration, heartbeats and metadata queries. Requires `xservice_rpc_protocol=http` and is mutually exclusive with `etcd_addr`. Per-request result callbacks use the service address supplied in the request. |
 | `heart_beat_interval` | `double` | `0.5` | Heartbeat interval. |
 | `etcd_ttl` | `int32` | `3` | Time to live for etcd keys. |
 

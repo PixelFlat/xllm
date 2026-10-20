@@ -233,6 +233,16 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
     auto* resp = response->add_resps();
     resp->set_req_id(req.req_id());
 
+    if (response_options_.enable_response_formatting &&
+        (req.source_xservice_addr().empty() || req.service_req_id().empty() ||
+         (req.response_type() != proto::CHAT_COMPLETION &&
+          req.response_type() != proto::TEXT_COMPLETION))) {
+      LOG(ERROR) << "Invalid PD service response metadata, request_id="
+                 << req.req_id();
+      resp->set_status_code(kDecodeAddNewInvalidRequestStatusCode);
+      continue;
+    }
+
     auto new_request = generate_request(req);
     if (new_request == nullptr) {
       resp->set_status_code(500);

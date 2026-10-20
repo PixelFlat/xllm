@@ -36,6 +36,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/distributed_runtime/disagg_pd_service_impl.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "core/util/scope_guard.h"
@@ -50,6 +51,16 @@ limitations under the License.
 #include "scheduler/request_output_dispatcher.h"
 
 namespace xllm {
+
+class XServiceClientTestPeer final {
+ public:
+  static bool set_initialized(bool initialized) {
+    XServiceClient* client = XServiceClient::get_instance();
+    const bool previous = client->initialize_done_;
+    client->initialize_done_ = initialized;
+    return previous;
+  }
+};
 
 class DisaggPDSchedulerTestPeer final {
  public:
@@ -461,7 +472,9 @@ std::shared_ptr<Request> make_request(
     bool enable_schedule_overlap = false,
     bool stream = false,
     bool logprobs = false,
-    size_t max_tokens = 4) {
+    size_t max_tokens = 4,
+    const std::string& service_request_id = "service-req",
+    const std::string& source_xservice_addr = "") {
   RequestSamplingParam sampling_param;
   sampling_param.logprobs = logprobs;
   SchedulerParam scheduler_param;
@@ -491,7 +504,8 @@ std::shared_ptr<Request> make_request(
                                    "x-request-id",
                                    "x-request-time",
                                    std::move(state),
-                                   "service-req");
+                                   service_request_id,
+                                   source_xservice_addr);
 }
 
 void finish_prefill(Sequence* sequence) {
@@ -939,10 +953,81 @@ TEST(DisaggPDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
       /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
 }
 
-TEST(DisaggPDSchedulerTest, OnlyOversizedDecodeResponseIsTerminal) {
+TEST(DisaggPDSchedulerTest, InvalidMetadataAndOversizedResponsesAreTerminal) {
   EXPECT_FALSE(is_permanent_rejection(/*status_code=*/404));
+  EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewInvalidRequestStatusCode));
   EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewPromptTooLongStatusCode));
   EXPECT_FALSE(is_permanent_rejection(/*status_code=*/500));
+}
+
+TEST(DisaggPDSchedulerTest, MissingServiceMetadataFailsBeforeDecodeLookup) {
+  for (const auto& [service_id, address] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"service-id", ""}, {"", "127.0.0.1:1"}, {"", ""}}) {
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    auto options = make_options();
+    options.request_queue_size(1);
+    TestDisaggPDScheduler scheduler(&engine, options);
+    auto request = make_request(
+        {1, 2}, "invalid", false, false, false, 4, service_id, address);
+    request->state().decode_address = "127.0.0.1:1";
+    std::promise<Status> error;
+    auto status = error.get_future();
+    request->state().output_func = [&error](const RequestOutput& output) {
+      error.set_value(output.status.value());
+      return true;
+    };
+    ASSERT_TRUE(scheduler.add_request(request));
+    {
+      std::thread dispatcher([&scheduler] { scheduler.dispatch_requests(); });
+      ScopeGuard stop_dispatch([&scheduler, &dispatcher] {
+        scheduler.stop_dispatch_for_test();
+        dispatcher.join();
+      });
+      ASSERT_EQ(status.wait_for(std::chrono::seconds(5)),
+                std::future_status::ready);
+      EXPECT_EQ(status.get().code(), StatusCode::INVALID_ARGUMENT);
+    }
+    scheduler.wait_for_responses();
+    auto next = make_request({3, 4}, "next");
+    EXPECT_TRUE(scheduler.add_request(next));
+  }
+}
+
+TEST(DisaggPDSchedulerTest, DecodeRejectsMalformedMetadataBeforeKvAllocation) {
+  // This rejection must not need an actual service connection or KV allocation.
+  const bool initialized = XServiceClientTestPeer::set_initialized(true);
+  ScopeGuard restore_client(
+      [initialized] { XServiceClientTestPeer::set_initialized(initialized); });
+  FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+  TestDisaggPDScheduler scheduler(&engine, make_options());
+  DisaggPDServiceOptions options;
+  options.enable_response_formatting = true;
+  DisaggPDServiceImpl service(
+      &scheduler, &engine, /*kv_cache_block_tokens=*/2, options);
+  for (int32_t invalid_field = 0; invalid_field < 4; ++invalid_field) {
+    proto::DisaggRequests requests;
+    auto* request = requests.add_reqs();
+    request->set_req_id("invalid");
+    request->set_source_xservice_addr("127.0.0.1:1");
+    request->set_service_req_id("attempt");
+    if (invalid_field == 0 || invalid_field == 2) {
+      request->clear_source_xservice_addr();
+    }
+    if (invalid_field == 1 || invalid_field == 2) {
+      request->clear_service_req_id();
+    }
+    if (invalid_field == 3) {
+      request->set_response_type(
+          static_cast<proto::CompletionResponseType>(99));
+    }
+    proto::DisaggResponses responses;
+    service.decode_recv_new_requests(&requests, &responses);
+    ASSERT_EQ(responses.resps_size(), 1);
+    EXPECT_EQ(responses.resps(0).status_code(),
+              kDecodeAddNewInvalidRequestStatusCode);
+    EXPECT_TRUE(scheduler.reservations_empty());
+  }
 }
 
 TEST(DisaggPDSchedulerTest, DetectsRankPreservingFlatKvGroups) {
