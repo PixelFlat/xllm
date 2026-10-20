@@ -86,11 +86,12 @@ cc_library(
     xservice_client.cpp
     model_residency_coordinator.cpp
   DEPS
-    :api_service
+    :api_response
     :worker_model_codec
     :models
     :parallel_config_validation
     :runtime
+    :scheduler
     :kv_cache_manager_factory
     :util
     glog::glog
@@ -158,6 +159,7 @@ cc_library(
     vlm_master.cpp
     dit_master.cpp
   DEPS
+    :api_response
     :common
     :distributed_runtime
     :scheduler

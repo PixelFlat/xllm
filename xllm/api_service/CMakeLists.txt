@@ -1,12 +1,37 @@
 include(cc_library)
 include(cc_binary)
 
+# Shared response encoding must not depend on service handlers or masters: PD
+# decode uses it without going through an API service.
+cc_library(
+  NAME
+    api_response
+  HDRS
+    chat_response_builder.h
+    completion_response_builder.h
+    openai_json.h
+    stream_output_parser.h
+    utils.h
+  SRCS
+    openai_json.cpp
+    stream_output_parser.cpp
+  DEPS
+    :common
+    :function_call
+    :reasoning
+    :util
+    absl::strings
+    glog::glog
+    nlohmann_json::nlohmann_json
+    proto::xllm_proto
+    xxHash
+)
+
 cc_library(
   NAME
     api_service
   HDRS
     openai_request.h
-    openai_json.h
     openai_http.h
     openai_batch.h
     api_service.h
@@ -21,10 +46,8 @@ cc_library(
     json_fast_path.h
     json_scan.h
     completion_service_impl.h
-    completion_response_builder.h
     rec_completion_service_impl.h
     chat_service_impl.h
-    chat_response_builder.h
     anthropic_request_utils.h
     anthropic_service_impl.h
     anthropic_stream_utils.h
@@ -41,13 +64,10 @@ cc_library(
     serving_mode.h
     stream_call.h
     models_service_impl.h
-    stream_output_parser.h
     mm_service_utils.h
     embedding_output_builder.h
-    utils.h
   SRCS
     openai_request.cpp
-    openai_json.cpp
     api_service.cpp
     control_service_impl.cpp
     chat_json_parser.cpp
@@ -73,10 +93,10 @@ cc_library(
     video_generation_service_impl.cpp
     models_service_impl.cpp
     rerank_service_impl.cpp
-    stream_output_parser.cpp
     qwen3_rerank_service_impl.cpp
     embedding_output_builder.cpp
   DEPS
+    :api_response
     :master
     :chat_template
     :util
