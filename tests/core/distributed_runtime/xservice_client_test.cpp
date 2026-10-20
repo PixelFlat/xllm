@@ -204,7 +204,9 @@ TEST(XServiceClientTest, ShutdownInterruptsRegistrationBackoff) {
   const auto first_attempt = started.wait_for(std::chrono::seconds(5));
   XServiceClientTestPeer::stop(*client);
   EXPECT_EQ(first_attempt, std::future_status::ready);
-  EXPECT_EQ(registration.wait_for(std::chrono::seconds(1)),
+  // Shutdown interrupts the backoff, but not an in-flight HTTP RPC, whose
+  // channel timeout can be the configured value or the 10-second default.
+  EXPECT_EQ(registration.wait_for(std::chrono::seconds(15)),
             std::future_status::ready);
   EXPECT_FALSE(registration.get());
   EXPECT_EQ(server.service().registration_calls.load(), 1);
