@@ -237,96 +237,11 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `speculative_suffix_use_tree_spec` | `bool` | `false` | 是否使用 tree-based suffix speculation，而不是 path speculation。 |
 | `draft_sampling_mode` | `string` | `"greedy"` | draft 模型生成 proposal token 的采样方式：`greedy`、`probabilistic`。仅 `MTP`、`DSpark`、`Eagle3` 支持 `probabilistic`。 |
 | `enable_atb_spec_kernel` | `bool` | `false` | 是否使用 ATB speculative kernel。 |
-| `enable_adaptive_speculative_decode` | `bool` | `false` | 开启自适应投机长度。DSpark graph task pipeline 要求 greedy Draft7；未提供已保存成本表时，在服务就绪前进行完整推理步的成本标定。 |
+| `enable_adaptive_speculative_decode` | `bool` | `false` | 开启自适应投机长度。DSpark graph task pipeline 要求 greedy Draft7；未提供已保存成本表时，在服务就绪前进行完整推理步的成本标定。限制和示例见[自适应 DSpark](/zh/features/adaptive_dspark/)。 |
 | `adaptive_speculative_min_gain` | `double` | `0.0` | DSpark 改变上一个有效验证预算时，要求的最小预测相对吞吐收益。 |
 | `adaptive_dspark_calibration` | `string` | `""` | 可选的启动标定 JSON 文件；为空时使用内置默认配置，两种情况都会打印实际生效值。不能与已保存成本表输入同时指定。 |
 | `adaptive_dspark_cost_table` | `string` | `""` | 加载兼容的已保存完整步成本表，跳过启动采样和拟合；支持一维 SPS 和二维加性模型，仍需 graph warmup。 |
 | `adaptive_dspark_cost_table_output` | `string` | `""` | 可选的启动标定结果输出文件，保存为带版本和配置身份的 bundle；为空则只保留在内存，绝不覆盖已有文件。加载已保存表时不能指定输出。 |
-
-### DSpark 自适应启动标定
-
-当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
-head 的 DSpark draft、`num_speculative_tokens=7`、greedy 采样、DP=1/CP=1、
-ACL graph、异步调度和 task pipeline。必须启用 graph warmup；这条路径暂不支持
-自适应 unified graph。固定步数 DSpark 和其他算法的执行限制保持各自原有约定。
-
-例如，在已有多 rank 启动脚本的**每个 rank**中加入下列配置。下面展示 16 rank
-服务的 rank 0；其余 rank 使用各自的 `node_rank` 和监听端口：
-
-```bash
-export HCCL_OP_EXPANSION_MODE=AIV
-xllm --model=/models/target --draft_model=/models/dspark \
-  --backend=llm --model_impl=python --npu_kernel_backend=TORCH \
-  --nnodes=16 --node_rank=0 --host=127.0.0.1 --port=8000 \
-  --master_node_addr=127.0.0.1:27000 \
-  --speculative_algorithm=DSpark --num_speculative_tokens=7 \
-  --draft_sampling_mode=greedy --enable_adaptive_speculative_decode=true \
-  --enable_graph=true --python_graph_backend=aclgraph \
-  --disable_graph_warmup=false --enable_schedule_overlap=true \
-  --enable_task_pipeline=true --enable_unified_mtp_graph=false \
-  --dp_size=1 --cp_size=1 --max_seqs_per_batch=16 \
-  --acl_graph_decode_batch_size_limit=16 \
-  --adaptive_dspark_cost_table_output=/results/dspark-costs.json
-```
-
-客户端显式传入 `temperature=0`。标定不需要 HTTP 客户端、手动拟合命令或第二次
-启动：服务先预热图，再驱动真实异步 prefill/decode 流水线，在内存中收集完成时间
-窗口，随后在 CPU 拟合成本，并在就绪前向所有 worker 安装同一份不可变成本表。
-正常服务不会增加逐轮计时 Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、
-结果回读和 confidence 异步反馈仍然保留。
-
-未指定标定文件和已保存成本表时，内置默认值为：
-
-| 配置项 | 实际默认值 |
-|:-------|:-----------|
-| `model` | `additive` |
-| `request_buckets` | 实际已捕获的物理 draft request 桶 |
-| `target_graph_rows` | 每个 request 桶对应的所有合法已捕获 target 桶，包括完整宽度 |
-| `contexts` | 一个区间：prefill 2048 token，KV 覆盖 1–4096 |
-| `warmup_steps` | `8` |
-| `window_steps` | 每个窗口 `32` 个完整 decode 间隔 |
-| `windows_per_point` | `3` |
-| `token_seed` | `1` |
-
-默认 KV 上限不会超过模型上下文限制；较短上下文会缩短 prefill，为最坏情况下的
-生成进度和两个在途 Slot 预留空间。如果默认采样步数仍然无法容纳，启动会明确
-报错，要求提供更小的显式配置。对所有已捕获桶采样可能增加启动时间，可用 JSON
-限制标定网格。
-
-指定 `--adaptive_dspark_calibration=/configs/dspark.json` 可覆盖默认配置，例如：
-
-```json
-{
-  "model": "additive",
-  "request_buckets": [1, 2, 4, 8, 16],
-  "contexts": [
-    {"prefill_tokens": 1868, "min_kv_length": 1800, "max_kv_length": 4096}
-  ],
-  "warmup_steps": 8,
-  "window_steps": 32,
-  "windows_per_point": 3,
-  "token_seed": 1
-}
-```
-
-`model` 支持 `sps` 和 `additive`。一维 SPS 表按物理 target graph 行数 `G`
-描述每秒完整步数，成本为 `1000 / SPS(G)` 毫秒；二维加性模型拟合
-`bias + alpha(Bcap) + theta(G)` 秒，其中 `Bcap` 是物理 draft request 桶，
-不是 HTTP 逻辑并发数。这些都是完整一步的成本，不能再次加上 draft/commit 耗时。
-二维网格必须通过共同的 G 值连通；request 桶和可选的 `target_graph_rows` 必须
-已经捕获，并保留完整宽度覆盖。上下文区间不能重叠，且必须满足模型、KV 容量和
-最坏采样进度的限制。
-
-不管使用默认值还是传入文件，启动日志都会输出
-`DSpark adaptive effective configuration`，包含来源、补齐默认项后的生效配置
-及实际捕获的图几何。服务过程中不做标定、拟合或 graph recapture。未标定的
-KV 区间或 request 桶使用已经预热的完整宽度准入策略，不做 eager 重试。
-
-后续兼容的启动可移除标定和输出参数，改为
-`--adaptive_dspark_cost_table=/results/dspark-costs.json`。日志会打印成本表来源、
-保存的标定配置和生效覆盖范围，并校验权重/量化配置及并行、执行设置的兼容性。
-加载表只跳过采样与拟合，不跳过 graph warmup。随机 token 标定和较小训练误差
-本身不能证明提速，仍应使用真实请求对比固定步数基线的 TPOT、接受率和接受长度。
 
 ## ProfileConfig
 
