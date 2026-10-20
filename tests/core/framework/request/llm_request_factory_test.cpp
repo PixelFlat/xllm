@@ -590,25 +590,6 @@ TEST_F(LLMRequestFactoryTest,
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
-TEST_F(LLMRequestFactoryTest, DisaggregatedPdAcceptsSingleBeamRequest) {
-  options_.enable_disagg_pd(true);
-  auto factory = make_factory();
-  CallbackCapture capture;
-  RequestParams sp;
-  sp.beam_width = 1;
-  sp.max_tokens = 16;
-
-  auto request = factory->create(/*prompt=*/"hello",
-                                 /*prompt_tokens=*/std::nullopt,
-                                 sp,
-                                 /*call=*/std::nullopt,
-                                 make_capture_callback(&capture));
-
-  ASSERT_NE(request, nullptr);
-  EXPECT_FALSE(capture.called);
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
-}
-
 TEST_F(LLMRequestFactoryTest, NonDisaggregatedBeamSearchRemainsSupported) {
   options_.enable_disagg_pd(false);
   auto factory = make_factory();
@@ -634,6 +615,7 @@ TEST_F(LLMRequestFactoryTest, RetainsHttpResponseOptionsForDecodeDispatch) {
   auto factory = make_factory();
   CallbackCapture capture;
   RequestParams sp;
+  sp.beam_width = 1;
   sp.max_tokens = 16;
   sp.source_xservice_addr = "worker:1234";
   sp.response_model = "response-model";
@@ -661,6 +643,8 @@ TEST_F(LLMRequestFactoryTest, RetainsHttpResponseOptionsForDecodeDispatch) {
                    .bool_value());
   EXPECT_TRUE(state.response_stream_options.include_usage());
   EXPECT_TRUE(state.response_stream_options.continuous_usage_stats());
+  EXPECT_EQ(state.sampling_param.beam_width, 1);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
   EXPECT_FALSE(capture.called);
 }
 

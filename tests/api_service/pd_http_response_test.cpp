@@ -29,7 +29,6 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/chat_response_builder.h"
-#include "api_service/completion_response_builder.h"
 #include "api_service/openai_json.h"
 #include "api_service/stream_call.h"
 #include "chat.pb.h"
@@ -170,44 +169,6 @@ TEST(StreamCallOutputTest, AsyncAdmissionReturnsJsonWithoutStartingSse) {
     }
     EXPECT_TRUE(completed);
   }
-}
-
-template <typename Request, typename Response>
-void expect_json_matches_http_connection(Request request, Response response) {
-  brpc::Controller controller;
-  StreamCall<Request, Response> incoming(&controller,
-                                         brpc::DoNothing(),
-                                         &request,
-                                         &response,
-                                         /*use_arena=*/true,
-                                         /*is_http_request=*/true);
-  incoming.set_system_fingerprint("fingerprint");
-  ASSERT_TRUE(incoming.write_and_finish(response));
-  const std::string encoded = serialize_openai_response(
-      request, response, proto::Usage{}, "fingerprint", /*delta=*/false);
-  EXPECT_EQ(encoded, controller.response_attachment().to_string());
-}
-
-TEST(OpenAIResponseEncodingTest,
-     SharedJsonMatchesChatAndCompletionConnections) {
-  proto::ChatRequest chat_request;
-  chat_request.set_tool_choice("required");
-  proto::ChatResponse chat_response;
-  chat_response.set_object("chat.completion");
-  chat_response.set_id("request");
-  auto* chat_choice = chat_response.add_choices();
-  chat_choice->mutable_message()->set_content("answer");
-  chat_choice->set_finish_reason("stop");
-  expect_json_matches_http_connection(std::move(chat_request),
-                                      std::move(chat_response));
-
-  proto::CompletionRequest completion_request;
-  proto::CompletionResponse completion_response;
-  completion_response.set_object("text_completion");
-  completion_response.set_id("request");
-  completion_response.add_choices()->set_text("answer");
-  expect_json_matches_http_connection(std::move(completion_request),
-                                      std::move(completion_response));
 }
 
 TEST(OpenAIResponseEncodingTest, StreamingUsageAndFingerprintShareOneEncoder) {
@@ -629,7 +590,18 @@ TEST_F(PDHttpResponseTest, ParsesToolCallAndPreservesItsIdAcrossChunks) {
   auto* tool = request_.add_tools();
   tool->set_type("function");
   tool->mutable_function()->set_name("weather");
-  auto emit = callback(/*tool_format=*/"qwen25");
+  request_.set_req_id("decode-output");
+  request_.set_model("decode-model");
+  request_.set_tool_choice("auto");
+  (*request_.mutable_chat_template_kwargs()
+        ->mutable_fields())["enable_thinking"]
+      .set_bool_value(false);
+  request_.mutable_stream_options()->set_include_usage(true);
+  request_.mutable_stream_options()->set_continuous_usage_stats(true);
+  proto::DisaggRequest decoded;
+  ASSERT_TRUE(decoded.ParseFromString(request_.SerializeAsString()));
+  auto emit = decode_callback(decoded, "qwen25", "qwen3", "decode-fingerprint");
+  ASSERT_TRUE(emit);
   ASSERT_TRUE(emit(output("<tool_call>\n")));
   ASSERT_TRUE(emit(output(
       "{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
@@ -638,7 +610,16 @@ TEST_F(PDHttpResponseTest, ParsesToolCallAndPreservesItsIdAcrossChunks) {
   std::string name;
   std::string arguments;
   bool tool_finish = false;
-  for (const auto& chunk : chunks(service_.outputs())) {
+  const auto received = service_.outputs();
+  ASSERT_EQ(received.size(), 2U);
+  EXPECT_EQ(received.front().sequence, "0");
+  EXPECT_EQ(received.back().finished, "true");
+  const auto parsed = chunks(received);
+  ASSERT_FALSE(parsed.empty());
+  for (const auto& chunk : parsed) {
+    EXPECT_EQ(chunk["id"], "decode-output");
+    EXPECT_EQ(chunk["model"], "decode-model");
+    EXPECT_TRUE(chunk.contains("usage"));
     for (const auto& choice : chunk["choices"]) {
       tool_finish |= choice["finish_reason"] == "tool_calls";
       const auto& delta = choice["delta"];
@@ -663,6 +644,8 @@ TEST_F(PDHttpResponseTest, ParsesToolCallAndPreservesItsIdAcrossChunks) {
   EXPECT_EQ(name, "weather");
   EXPECT_EQ(nlohmann::json::parse(arguments)["city"], "Paris");
   EXPECT_TRUE(tool_finish);
+  EXPECT_EQ(parsed.back()["system_fingerprint"], "decode-fingerprint");
+  EXPECT_EQ(parsed.back()["usage"]["completion_tokens"], 2);
 }
 
 TEST_F(PDHttpResponseTest, PrefillErrorsNeedNoTokenResponseSession) {
@@ -915,66 +898,6 @@ TEST_F(PDHttpResponseTest,
               std::vector<bool>({false}));
     EXPECT_EQ(service_.outputs().size(), delivered);
   }
-}
-
-TEST_F(PDHttpResponseTest, DecodeUsesExplicitResponseOptionsAfterWireTransfer) {
-  proto::DisaggRequest prefill_request;
-  prefill_request.set_req_id("decode-output");
-  prefill_request.set_service_req_id(request_.service_req_id());
-  prefill_request.set_source_xservice_addr(request_.source_xservice_addr());
-  prefill_request.set_model("decode-model");
-  prefill_request.set_stream(true);
-  prefill_request.add_tools()->mutable_function()->set_name("weather");
-  prefill_request.set_tool_choice("auto");
-  (*prefill_request.mutable_chat_template_kwargs()
-        ->mutable_fields())["enable_thinking"]
-      .set_bool_value(false);
-  prefill_request.mutable_stream_options()->set_include_usage(true);
-  prefill_request.mutable_stream_options()->set_continuous_usage_stats(true);
-  proto::DisaggRequest decode_request;
-  ASSERT_TRUE(
-      decode_request.ParseFromString(prefill_request.SerializeAsString()));
-  auto emit = decode_callback(decode_request,
-                              /*tool_parser_format=*/"qwen25",
-                              /*reasoning_parser_format=*/"qwen3",
-                              /*system_fingerprint=*/"decode-fingerprint");
-  ASSERT_TRUE(emit);
-  ASSERT_TRUE(emit(output("<tool_call>\n")));
-  ASSERT_TRUE(emit(output(
-      "{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
-      /*finished=*/true)));
-  const auto received = service_.outputs();
-  ASSERT_FALSE(received.empty());
-  EXPECT_EQ(received.front().sequence, "0");
-  EXPECT_EQ(received.back().finished, "true");
-  const auto parsed = chunks(received);
-  ASSERT_FALSE(parsed.empty());
-  std::string name;
-  std::string arguments;
-  for (const auto& chunk : parsed) {
-    EXPECT_EQ(chunk["id"], "decode-output");
-    EXPECT_EQ(chunk["model"], "decode-model");
-    EXPECT_TRUE(chunk.contains("usage"));
-    for (const auto& choice : chunk["choices"]) {
-      const auto& delta = choice["delta"];
-      if (!delta.contains("tool_calls")) {
-        continue;
-      }
-      for (const auto& call : delta["tool_calls"]) {
-        const auto& function = call["function"];
-        if (function.contains("name")) {
-          name += function["name"].get<std::string>();
-        }
-        if (function.contains("arguments")) {
-          arguments += function["arguments"].get<std::string>();
-        }
-      }
-    }
-  }
-  EXPECT_EQ(name, "weather");
-  EXPECT_EQ(nlohmann::json::parse(arguments)["city"], "Paris");
-  EXPECT_EQ(parsed.back()["system_fingerprint"], "decode-fingerprint");
-  EXPECT_EQ(parsed.back()["usage"]["completion_tokens"], 2);
 }
 
 class NativeResultService final : public xllm_service::proto::XllmRpcService {

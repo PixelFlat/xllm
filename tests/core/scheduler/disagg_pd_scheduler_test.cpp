@@ -1873,57 +1873,19 @@ TEST(DisaggPDSchedulerTest,
   }
 }
 
-TEST(DisaggPDSchedulerTest, ServiceSenderKeepsFirstTokenAheadOfDecodeBatch) {
-  OutputTokenizer tokenizer;
-  RequestOutputDispatcher dispatcher(&tokenizer,
-                                     /*enable_service_routing=*/true,
-                                     /*disable_log_stats=*/true,
-                                     [](std::shared_ptr<Request>) {});
-  auto request = make_request({1, 2}, "req", false, /*stream=*/true);
-  std::promise<void> first_started;
-  auto started = first_started.get_future();
-  std::promise<void> release_first;
-  auto release = release_first.get_future().share();
-  std::vector<RequestOutput> received;
-  request->state().outputs_func =
-      [&received, &first_started, release](
-          const std::vector<RequestOutput>& outputs) {
-        if (received.empty()) {
-          first_started.set_value();
-          release.wait();
-        }
-        received.insert(received.end(), outputs.begin(), outputs.end());
-        return std::vector<bool>(outputs.size(), true);
-      };
-  ScopeGuard cleanup([&] {
-    release_first.set_value();
-    dispatcher.wait_completion();
-  });
-  auto& sequence = request->sequences().front();
-  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
-  sequence->append_token(Token(65));
-  dispatcher.process_stream_request(request);
-  ASSERT_EQ(started.wait_for(std::chrono::seconds(5)),
-            std::future_status::ready);
-  sequence->append_token(Token(66));
-  std::vector<std::shared_ptr<Request>> batch{request};
-  dispatcher.process_stream_requests(batch);
-  release_first.set_value();
-  cleanup.dismiss();
-  dispatcher.wait_completion();
-  ASSERT_EQ(received.size(), 2U);
-  EXPECT_EQ(received[0].outputs.front().text, "A");
-  EXPECT_EQ(received[1].outputs.front().text, "B");
-}
-
 TEST(DisaggPDSchedulerTest,
      DecodeEmitsFirstTokenAsynchronouslyBeforeAnyDecodeStep) {
-  for (const bool overlap : {false, true}) {
-    SCOPED_TRACE(overlap ? "overlap" : "no overlap");
+  const bool initialized = XServiceClientTestPeer::set_initialized(true);
+  ScopeGuard restore_client(
+      [initialized] { XServiceClientTestPeer::set_initialized(initialized); });
+  for (const auto& [overlap, batched] : std::vector<std::pair<bool, bool>>{
+           {false, false}, {true, false}, {false, true}, {true, true}}) {
+    SCOPED_TRACE("overlap=" + std::to_string(overlap) +
+                 ", batched=" + std::to_string(batched));
     FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
     engine.set_tokenizer(std::make_unique<OutputTokenizer>());
     auto options = make_decode_options();
-    options.enable_schedule_overlap(overlap);
+    options.enable_schedule_overlap(overlap).enable_service_routing(batched);
     TestDisaggPDScheduler scheduler(&engine, options);
     auto request = make_request({65, 66},
                                 "req",
@@ -1952,8 +1914,10 @@ TEST(DisaggPDSchedulerTest,
       return true;
     };
     request->state().output_func = record;
+    std::atomic<int32_t> batch_callbacks{0};
     request->state().outputs_func =
-        [record](const std::vector<RequestOutput>& batch) {
+        [record, &batch_callbacks](const std::vector<RequestOutput>& batch) {
+          ++batch_callbacks;
           std::vector<bool> accepted;
           accepted.reserve(batch.size());
           for (const auto& output : batch) {
@@ -2025,6 +1989,7 @@ TEST(DisaggPDSchedulerTest,
     cleanup.dismiss();
     scheduler.wait_for_responses();
     ASSERT_EQ(outputs.size(), 2U);
+    EXPECT_EQ(batch_callbacks.load(), batched ? 2 : 0);
     ASSERT_EQ(outputs.back().outputs.size(), 1U);
     EXPECT_EQ(outputs.back().outputs.front().text, "+");
     EXPECT_EQ(outputs.back().outputs.front().token_ids,
