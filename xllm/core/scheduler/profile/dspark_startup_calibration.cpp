@@ -26,6 +26,7 @@ limitations under the License.
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <system_error>
 #include <utility>
 
 #include "core/distributed_runtime/distributed_worker_manager.h"
@@ -279,9 +280,22 @@ void ProfileManager::calibrate_dspark_startup() {
   CHECK(options_.enable_schedule_overlap());
   DSparkStartupCalibrationConfig config = dspark_calibration_config();
   if (!options_.adaptive_dspark_cost_table_output().empty()) {
-    CHECK(
-        !std::filesystem::exists(options_.adaptive_dspark_cost_table_output()))
-        << "DSpark cost-table output already exists; choose a new path.";
+    const std::filesystem::path output =
+        options_.adaptive_dspark_cost_table_output();
+    const std::filesystem::path parent = output.has_parent_path()
+                                             ? output.parent_path()
+                                             : std::filesystem::path(".");
+    std::error_code error;
+    CHECK(std::filesystem::is_directory(parent, error))
+        << "DSpark cost-table output directory is missing or inaccessible: "
+        << parent << ": " << error.message();
+    CHECK_EQ(::access(parent.c_str(), W_OK | X_OK), 0)
+        << "DSpark cost-table output directory is not writable/searchable: "
+        << parent;
+    CHECK(!std::filesystem::exists(output, error) && !error)
+        << "DSpark cost-table output already exists or cannot be inspected; "
+           "choose a new path: "
+        << output;
   }
   CHECK_EQ(geometry.at("slot_count").get<uint32_t>(), 2U);
   const auto requests =
