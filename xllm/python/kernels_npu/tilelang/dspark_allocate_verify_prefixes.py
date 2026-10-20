@@ -26,10 +26,12 @@ DSPARK_ALLOCATE_VERIFY_PREFIXES_PASS_CONFIGS = {
 }
 
 MAX_DSPARK_BATCH_SIZE = 128
-DSPARK_DRAFT_TOKENS = 7
+SUPPORTED_DSPARK_DRAFT_WIDTHS = (5, 7)
 
 
-def build_dspark_allocate_verify_prefixes_kernel(max_batch_size: int, device_control: bool = False) -> tvm.tir.PrimFunc:
+def build_dspark_allocate_verify_prefixes_kernel(
+    max_batch_size: int, device_control: bool = False, draft_width: int = 7
+) -> tvm.tir.PrimFunc:
     """Find the boundary score with vector sort, then resolve its ties exactly.
 
     Sorting indices are deliberately unused: hardware sort stability is not
@@ -39,7 +41,10 @@ def build_dspark_allocate_verify_prefixes_kernel(max_batch_size: int, device_con
     """
     if max_batch_size not in (1, 2, 4, 8, 16, 32, 64, 128):
         raise ValueError("max_batch_size must be a supported power-of-two bucket")
-    gamma = DSPARK_DRAFT_TOKENS
+    if draft_width not in SUPPORTED_DSPARK_DRAFT_WIDTHS:
+        raise ValueError("draft_width must be 5 or 7")
+    gamma = draft_width
+    arena_words = 3 * gamma + 1
     batch_tile = ((max_batch_size + 31) // 32) * 32
     sort_size = ((max_batch_size * gamma + 31) // 32) * 32
 
@@ -51,11 +56,15 @@ def build_dspark_allocate_verify_prefixes_kernel(max_batch_size: int, device_con
         batch_size: T.int32,
         budget: T.int32,
     ):
-        confidence = T.match_buffer(confidence_handle, (batch_size * (22 if device_control else gamma),), "float32")
+        confidence = T.match_buffer(
+            confidence_handle, (batch_size * (arena_words if device_control else gamma),), "float32"
+        )
         # Keep sizes as expressions of the explicit INT32 ABI metadata. A raw
         # Var shape is otherwise inferred as another parameter by this backend.
         widths = T.match_buffer(
-            widths_handle, (batch_size * 22 if device_control else T.Select(batch_size > 0, batch_size, 0),), "int32"
+            widths_handle,
+            (batch_size * arena_words if device_control else T.Select(batch_size > 0, batch_size, 0),),
+            "int32",
         )
         control = T.match_buffer(control_handle, (1,), "int64")
         with T.Kernel(1, is_npu=True) as (_, vid), T.Scope("V"):
@@ -82,8 +91,8 @@ def build_dspark_allocate_verify_prefixes_kernel(max_batch_size: int, device_con
                     # The graph capacity is immutable; the live request count
                     # and compact-arena offsets are device-authoritative.
                     selected_budget = T.min(active_rows * gamma, budget - active_rows)
-                    confidence_offset = active_rows * 14
-                    width_offset = active_rows * 21
+                    confidence_offset = active_rows * (2 * gamma)
+                    width_offset = active_rows * (3 * gamma)
                 T.tile.fill(width_ub, 1)
                 if selected_budget == active_rows * gamma:
                     T.tile.fill(width_ub, gamma + 1)

@@ -26,7 +26,7 @@ select a verification budget. Parameter types and defaults are listed in the
 ## Supported configuration
 
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
-draft with a confidence head, `num_speculative_tokens=7`, greedy sampling,
+draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy sampling,
 DP=1/CP=1, ACL graphs, schedule overlap and task pipeline. Graph warmup must be
 enabled. This path does not enable adaptive unified graphs. Fixed-width DSpark
 and other algorithms retain their own execution contracts.
@@ -57,6 +57,16 @@ xllm --model=/models/target --draft_model=/models/dspark \
 
 Send greedy requests with explicit `temperature=0`.
 
+For Draft5, change only `--num_speculative_tokens=5` and select a new output
+file such as `/results/dspark-costs-draft5.json`. The draft generates five
+candidates; adaptive verification can select a shorter prefix. The three
+device kernels use width-specific compiled specializations, and Slot storage
+is sized to the selected width rather than padded to Draft7. The width is
+fixed at startup, included in graph binding keys and saved-table compatibility,
+and cannot change between replays. Draft5 and Draft7 costs must not be mixed.
+Unversioned legacy tables without a `draft_width` field are treated as Draft7;
+newly fitted bare tables record their width explicitly.
+
 ## Startup calibration
 
 No HTTP calibration client, external fitting command or second service launch
@@ -74,6 +84,7 @@ With no calibration file or saved table, the built-in settings are:
 | Setting | Effective default |
 |:--------|:------------------|
 | `model` | `additive` |
+| `draft_width` | Selected `num_speculative_tokens`; `5` or `7` |
 | `request_buckets` | Actual captured physical draft request buckets |
 | `target_graph_rows` | All legal captured target tiers, including full width, for each request bucket |
 | `contexts` | One interval: prefill 2048 tokens, KV coverage 1–4096 |
@@ -91,7 +102,8 @@ bucket can increase startup time; use a JSON file to restrict the grid.
 ### Custom configuration
 
 To override the defaults, add `--adaptive_dspark_calibration=/configs/dspark.json`.
-For example:
+The width is inferred from the launch configuration; an optional `draft_width`
+field in the JSON must match it. For example:
 
 ```json
 {

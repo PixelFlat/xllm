@@ -66,6 +66,24 @@ TEST(DSparkWindowCollectorTest, MeasuresIntervalsNotCompletionCount) {
   EXPECT_EQ(window->draft_tokens, 14U);
 }
 
+TEST(DSparkWindowCollectorTest, RecordsConfiguredDraftFiveWidth) {
+  auto config = make_config();
+  config.draft_width = 5;
+  DSparkSteadyWindowCollector collector(config);
+  const std::vector<std::string> ids = {"draft-five"};
+  for (uint64_t generation = 1; generation <= 3; ++generation) {
+    auto step = make_step(generation, generation * 1000000, ids);
+    step.draft_tokens = 5;
+    const auto window = collector.observe(step);
+    if (generation == 3) {
+      ASSERT_TRUE(window);
+      EXPECT_EQ(window->draft_tokens, 10U);
+    } else {
+      EXPECT_FALSE(window);
+    }
+  }
+}
+
 TEST(DSparkWindowCollectorTest, AveragesAcrossBurstRetirementGaps) {
   auto config = make_config();
   config.window_steps = 4;

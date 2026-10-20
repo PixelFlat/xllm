@@ -66,12 +66,14 @@ TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveDsparkDraft7) {
   SpeculativeConfig speculative_config;
   speculative_config.adaptive_dspark_cost_table("/tmp/dspark_sps.json");
   EXPECT_DEATH(speculative_config.validate(),
-               "requires adaptive DSpark Draft7");
+               "requires adaptive DSpark Draft5/7");
   speculative_config.enable_adaptive_speculative_decode(true)
       .speculative_algorithm("DSpark")
       .num_speculative_tokens(5);
+  speculative_config.validate();
+  speculative_config.num_speculative_tokens(6);
   EXPECT_DEATH(speculative_config.validate(),
-               "requires adaptive DSpark Draft7");
+               "requires adaptive DSpark Draft5/7");
 }
 
 TEST(SpeculativeConfigTest,

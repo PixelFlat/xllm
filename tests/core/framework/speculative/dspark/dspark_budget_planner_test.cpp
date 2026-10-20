@@ -47,6 +47,52 @@ const std::array<DSparkGraphCost, 9> kCalibrationGraphs = {
     {64, 0.0},
     {128, 0.0}};
 
+TEST(DSparkBudgetPlannerTest, SupportsConfiguredDraftWidthAtCommonBatchSizes) {
+  for (const uint32_t draft_width : {5U, 7U}) {
+    for (const uint32_t batch_size : {1U, 8U, 16U}) {
+      SCOPED_TRACE(draft_width);
+      SCOPED_TRACE(batch_size);
+      auto options = profile_options();
+      options.draft_width = draft_width;
+      const std::array<DSparkGraphCost, 3> costs = {
+          DSparkGraphCost{batch_size, 1.0},
+          {batch_size * 2, 1.5},
+          {batch_size * (draft_width + 1), 8.0}};
+      const auto full =
+          DSparkBudgetPlanner::plan(batch_size, {}, costs, options);
+      ASSERT_TRUE(full);
+      EXPECT_EQ(full->draft_budget, batch_size * draft_width);
+      EXPECT_EQ(full->graph_rows, batch_size * (draft_width + 1));
+      const std::vector<double> confidence(batch_size * draft_width, 0.0);
+      const auto pruned =
+          DSparkBudgetPlanner::plan(batch_size, confidence, costs, options);
+      ASSERT_TRUE(pruned);
+      EXPECT_EQ(pruned->draft_budget, 0U);
+      EXPECT_EQ(pruned->graph_rows, batch_size);
+      const auto calibration = DSparkBudgetPlanner::calibration_plan(
+          batch_size, batch_size, costs.back().graph_rows, costs, draft_width);
+      ASSERT_TRUE(calibration);
+      EXPECT_EQ(calibration->draft_budget, batch_size * draft_width);
+    }
+  }
+}
+
+TEST(DSparkBudgetPlannerTest, RejectsUnsupportedWidthsAndMismatchedFeedback) {
+  auto options = profile_options();
+  for (const uint32_t draft_width : {0U, 3U, 6U, 8U}) {
+    options.draft_width = draft_width;
+    EXPECT_FALSE(DSparkBudgetPlanner::plan(1, {}, kCosts, options));
+    EXPECT_FALSE(
+        DSparkBudgetPlanner::calibration_plan(1, 1, 8, kCosts, draft_width));
+  }
+  options.draft_width = 5;
+  EXPECT_FALSE(DSparkBudgetPlanner::plan(
+      1, std::vector<double>(7, 0.5), kCosts, options));
+  options.draft_width = 7;
+  EXPECT_FALSE(DSparkBudgetPlanner::plan(
+      1, std::vector<double>(5, 0.5), kCosts, options));
+}
+
 TEST(DSparkBudgetPlannerTest, CalibrationUsesKnownTierWithoutCostMeasurements) {
   const auto plan = DSparkBudgetPlanner::calibration_plan(
       /*logical_requests=*/8,

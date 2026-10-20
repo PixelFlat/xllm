@@ -506,6 +506,7 @@ struct DSparkAdaptiveGraphInput {
   torch::Tensor owners;
   torch::Tensor columns;
   uint32_t block_size = 0;
+  uint32_t draft_width = 7;
 };
 
 namespace detail {

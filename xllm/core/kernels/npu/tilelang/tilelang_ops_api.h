@@ -28,7 +28,7 @@ namespace xllm::kernel::npu::tilelang {
 
 // Public TileLang kernel APIs exported to the xLLM NPU runtime.
 
-// Fixed Draft7 adaptive verification. All buffers are preallocated contiguous
+// Draft5/7 adaptive verification. All buffers are preallocated contiguous
 // tensors on one NPU; these APIs enqueue on its current stream without copying
 // tensor values to Host. Admission validates the supported geometry first.
 // Allocation distributes exactly budget candidates into anchor-inclusive
@@ -41,10 +41,12 @@ void dspark_allocate_verify_prefixes(const torch::Tensor& confidence,
 // width packing for the live Device count B. The control word's low 32 bits
 // contain B, and its high 32 bits suppress KV writes during cold profiling.
 // Host admission guarantees 0 <= B <= min(batch_capacity, capacity). The
-// allocator selects K=min(7*B, capacity-B) without a Host confidence read.
+// allocator selects K=min(draft_width*B, capacity-B) without a Host confidence
+// read.
 void dspark_allocate_verify_prefixes_graph(torch::Tensor& arena,
                                            const torch::Tensor& control,
-                                           int64_t capacity);
+                                           int64_t capacity,
+                                           int64_t draft_width = 7);
 
 // Pack request-contiguous prefixes into a known physical graph capacity G.
 // Cache slots use base_positions, while base_kv_lengths already includes the
@@ -82,12 +84,14 @@ void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
                                      torch::Tensor& q_seq_lens,
                                      torch::Tensor& owners,
                                      torch::Tensor& columns,
-                                     int64_t block_size);
+                                     int64_t block_size,
+                                     int64_t draft_width = 7);
 
 // Exact greedy verification at each request's own cut boundary. Proposals,
 // widths and packed target IDs must already agree across sampling ranks.
-// Results [B,8], accepted lengths [B] and context slots [G] are written in
-// place; context masking never reads another core's newly written result.
+// Results [B,draft_width+1], accepted lengths [B] and context slots [G] are
+// written in place; context masking never reads another core's newly written
+// result.
 void dspark_greedy_verify_commit(const torch::Tensor& proposals,
                                  const torch::Tensor& target_tokens,
                                  const torch::Tensor& widths,

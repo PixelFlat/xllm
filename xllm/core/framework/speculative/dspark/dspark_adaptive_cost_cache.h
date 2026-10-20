@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,7 @@ struct DSparkAdaptiveCostProfile {
   DSparkCostScope cost_scope = DSparkCostScope::VERIFY_TAIL;
   // Contexts outside this calibrated interval must not reuse its costs.
   uint32_t min_kv_length = 1;
+  uint32_t draft_width = 7;
 };
 
 // State-thread-owned, startup-only profile construction. Store profiles only
@@ -46,11 +48,14 @@ class DSparkAdaptiveCostCache final {
   // Match the smallest warmed KV bound covering this prepared input. Missing
   // capacity/profile is an explicit full-width admission policy, not an
   // execution retry. Both graph rows and KV geometry must be covered.
-  std::optional<DSparkAdaptiveCostProfile> lookup(uint32_t draft_graph_rows,
-                                                  uint32_t max_kv_length) const;
+  std::optional<DSparkAdaptiveCostProfile> lookup(
+      uint32_t draft_graph_rows,
+      uint32_t max_kv_length,
+      uint32_t draft_width = 7) const;
 
  private:
-  std::map<std::pair<uint32_t, uint32_t>, DSparkAdaptiveCostProfile> profiles_;
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t>, DSparkAdaptiveCostProfile>
+      profiles_;
 };
 
 }  // namespace xllm

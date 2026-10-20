@@ -22,15 +22,17 @@ DEPENDENCY_MODULES = (kernel_impl,)
 
 @register_kernel
 class DSparkGreedyVerifyCommitKernel(TilelangKernel):
-    DISPATCH_SCHEMA = [DispatchField("max_batch_size", "int32")]
+    DISPATCH_SCHEMA = [DispatchField("max_batch_size", "int32"), DispatchField("draft_width", "int32")]
     SPECIALIZATIONS = [
-        {"variant_key": f"batch_{batch}", "max_batch_size": batch} for batch in (1, 2, 4, 8, 16, 32, 64, 128)
+        {"variant_key": f"batch_{batch}_draft_{width}", "max_batch_size": batch, "draft_width": width}
+        for batch in (1, 2, 4, 8, 16, 32, 64, 128)
+        for width in (5, 7)
     ]
 
     @staticmethod
-    def generate_source(max_batch_size: int) -> str:
+    def generate_source(max_batch_size: int, draft_width: int) -> str:
         tilelang.disable_cache()
-        kernel = kernel_impl.build_dspark_greedy_verify_commit_kernel(max_batch_size)
+        kernel = kernel_impl.build_dspark_greedy_verify_commit_kernel(max_batch_size, draft_width)
         with tilelang.tvm.transform.PassContext(
             opt_level=3, config=kernel_impl.DSPARK_GREEDY_VERIFY_COMMIT_PASS_CONFIGS
         ):

@@ -30,6 +30,7 @@ struct DSparkWindowConfig {
   uint32_t warmup_steps = 8;
   uint32_t window_steps = 32;
   uint32_t max_windows = 3;
+  uint32_t draft_width = 7;
 };
 
 // Borrowed Host snapshots of a retired Task; no Device reads or timing Events.

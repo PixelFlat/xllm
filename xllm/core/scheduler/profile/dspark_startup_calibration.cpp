@@ -162,12 +162,14 @@ const DSparkStartupCalibrationConfig&
 ProfileManager::dspark_calibration_config() {
   if (!dspark_calibration_config_) {
     if (options_.adaptive_dspark_calibration().empty()) {
-      dspark_calibration_config_ =
-          default_dspark_startup_calibration(static_cast<uint32_t>(
-              engine_->model_args().max_position_embeddings()));
+      dspark_calibration_config_ = default_dspark_startup_calibration(
+          static_cast<uint32_t>(
+              engine_->model_args().max_position_embeddings()),
+          options_.decode_graph_warmup_config().num_speculative_tokens);
     } else {
       dspark_calibration_config_ = parse_dspark_startup_calibration(
-          read_file(options_.adaptive_dspark_calibration()));
+          read_file(options_.adaptive_dspark_calibration()),
+          options_.decode_graph_warmup_config().num_speculative_tokens);
     }
     CHECK(dspark_calibration_config_)
         << "Invalid DSpark calibration configuration or insufficient context "
@@ -211,7 +213,8 @@ int32_t ProfileManager::dspark_calibration_warmup_seq_len(
       max_kv_length,
       static_cast<uint32_t>(engine_->model_args().max_position_embeddings()),
       static_cast<uint32_t>(block_manager_pool_->block_size()),
-      static_cast<uint32_t>(default_length));
+      static_cast<uint32_t>(default_length),
+      options_.decode_graph_warmup_config().num_speculative_tokens);
   CHECK(length) << "DSpark calibration KV bound exceeds safe graph warmup "
                    "capacity, including both in-flight allocations.";
   return static_cast<int32_t>(*length);
@@ -298,6 +301,7 @@ void ProfileManager::calibrate_dspark_startup() {
         << output;
   }
   CHECK_EQ(geometry.at("slot_count").get<uint32_t>(), 2U);
+  CHECK_EQ(geometry.at("draft_width").get<uint32_t>(), config.draft_width);
   const auto requests =
       geometry.at("request_buckets").get<std::vector<uint32_t>>();
   const auto graphs =
@@ -366,8 +370,8 @@ void ProfileManager::calibrate_dspark_startup() {
     std::vector<Sequence*> sequences;
     owned.reserve(point.requests);
     sequences.reserve(point.requests);
-    const size_t capacity =
-        point.context.prefill_tokens + (decode_rounds + 3) * 8;
+    const size_t capacity = point.context.prefill_tokens +
+                            (decode_rounds + 3) * (config.draft_width + 1);
     for (uint32_t row = 0; row < point.requests; ++row) {
       std::vector<int32_t> prompt(point.context.prefill_tokens);
       std::generate(
@@ -383,7 +387,8 @@ void ProfileManager::calibrate_dspark_startup() {
       state.sampling_param.top_k = 0;
       state.sampling_param.top_p = 1.0;
       state.stopping_checker.set_ignore_eos(true);
-      state.stopping_checker.set_max_generated_tokens((decode_rounds + 3) * 8);
+      state.stopping_checker.set_max_generated_tokens((decode_rounds + 3) *
+                                                      (config.draft_width + 1));
       state.stopping_checker.set_max_context_len(capacity);
       auto request = std::make_shared<Request>("dspark-calibration-" +
                                                    std::to_string(index) + "-" +
@@ -456,7 +461,8 @@ void ProfileManager::calibrate_dspark_startup() {
       const auto fitted = fit_dspark_cost_table(context_windows,
                                                 config.model,
                                                 point.context.min_kv_length,
-                                                point.context.max_kv_length);
+                                                point.context.max_kv_length,
+                                                config.draft_width);
       CHECK(fitted) << "Cannot fit an identifiable positive DSpark cost table.";
       bundle["profiles"].emplace_back(
           nlohmann::json{{"min_kv_length", point.context.min_kv_length},

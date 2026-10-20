@@ -25,7 +25,7 @@ limitations under the License.
 ## 支持的配置
 
 当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
-head 的 DSpark draft、`num_speculative_tokens=7`、greedy 采样、DP=1/CP=1、
+head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy 采样、DP=1/CP=1、
 ACL graph、异步调度和 task pipeline。必须启用 graph warmup；这条路径暂不支持
 自适应 unified graph。固定步数 DSpark 和其他算法的执行限制保持各自原有约定。
 
@@ -54,6 +54,13 @@ xllm --model=/models/target --draft_model=/models/dspark \
 
 客户端显式传入 `temperature=0`。
 
+使用 Draft5 时，将步数改为 `--num_speculative_tokens=5`，并选择新的输出文件，
+例如 `/results/dspark-costs-draft5.json`。draft 本身生成五个候选，自适应验证可
+选择更短前缀。三个 device kernel 按宽度编译特化，Slot 按所选宽度分配，不会
+填充到 Draft7。宽度在启动时固定，纳入 graph binding 和已保存成本表的兼容性
+校验，不能在 replay 之间改变；Draft5 和 Draft7 的成本不能混用。
+无版本旧表若未记录 `draft_width`，按 Draft7 处理；新拟合的裸表会显式记录宽度。
+
 ## 启动标定
 
 标定不需要 HTTP 客户端、手动拟合命令或第二次启动：服务先预热图，再驱动真实
@@ -69,6 +76,7 @@ Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回�
 | 配置项 | 实际默认值 |
 |:-------|:-----------|
 | `model` | `additive` |
+| `draft_width` | 启动参数 `num_speculative_tokens`，取值为 `5` 或 `7` |
 | `request_buckets` | 实际已捕获的物理 draft request 桶 |
 | `target_graph_rows` | 每个 request 桶对应的所有合法已捕获 target 桶，包括完整宽度 |
 | `contexts` | 一个区间：prefill 2048 token，KV 覆盖 1–4096 |
@@ -84,7 +92,8 @@ Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回�
 
 ### 自定义配置
 
-指定 `--adaptive_dspark_calibration=/configs/dspark.json` 可覆盖默认配置，例如：
+指定 `--adaptive_dspark_calibration=/configs/dspark.json` 可覆盖默认配置。
+宽度由启动参数推导；若 JSON 显式指定 `draft_width`，其值必须与启动参数一致。例如：
 
 ```json
 {

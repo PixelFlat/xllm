@@ -31,7 +31,6 @@ namespace {
 #include XLLM_TL_DSPARK_ALLOCATE_VERIFY_PREFIXES_REGISTRY_INC
 
 constexpr int64_t kMaxBatchSize = 128;
-constexpr int64_t kDraftTokens = 7;
 
 bool spans_overlap(const torch::Tensor& first, const torch::Tensor& second) {
   if (first.numel() == 0 || second.numel() == 0) {
@@ -49,7 +48,8 @@ bool spans_overlap(const torch::Tensor& first, const torch::Tensor& second) {
 
 DsparkAllocateVerifyPrefixesSpecialization build_runtime_specialization(
     int64_t batch_size,
-    bool device_control) {
+    bool device_control,
+    int64_t draft_width) {
   int32_t bucket = 1;
   while (bucket < batch_size) {
     bucket *= 2;
@@ -57,7 +57,9 @@ DsparkAllocateVerifyPrefixesSpecialization build_runtime_specialization(
   return make_dspark_allocate_verify_prefixes_specialization(
       DsparkAllocateVerifyPrefixesMaxBatchSize{bucket},
       DsparkAllocateVerifyPrefixesDeviceControl{device_control ? int32_t{1}
-                                                               : int32_t{0}});
+                                                               : int32_t{0}},
+      DsparkAllocateVerifyPrefixesDraftWidth{
+          static_cast<int32_t>(draft_width)});
 }
 }  // namespace
 
@@ -72,9 +74,10 @@ void dspark_allocate_verify_prefixes(const torch::Tensor& confidence,
   CHECK(confidence.is_contiguous());
   const int64_t batch_size = confidence.size(0);
   CHECK_LE(batch_size, kMaxBatchSize);
-  CHECK_EQ(confidence.size(1), kDraftTokens);
+  const int64_t draft_width = confidence.size(1);
+  CHECK(draft_width == 5 || draft_width == 7);
   CHECK_GE(budget, 0);
-  CHECK_LE(budget, batch_size * kDraftTokens);
+  CHECK_LE(budget, batch_size * draft_width);
   CHECK_EQ(widths.device(), confidence.device());
   CHECK_EQ(widths.scalar_type(), torch::kInt32);
   CHECK_EQ(widths.dim(), 1);
@@ -85,8 +88,8 @@ void dspark_allocate_verify_prefixes(const torch::Tensor& confidence,
   if (batch_size == 0) {
     return;
   }
-  const auto specialization =
-      build_runtime_specialization(batch_size, /*device_control=*/false);
+  const auto specialization = build_runtime_specialization(
+      batch_size, /*device_control=*/false, draft_width);
   const auto* entry =
       find_dspark_allocate_verify_prefixes_kernel_entry(specialization);
   CHECK(entry != nullptr)
@@ -103,18 +106,21 @@ void dspark_allocate_verify_prefixes(const torch::Tensor& confidence,
 
 void dspark_allocate_verify_prefixes_graph(torch::Tensor& arena,
                                            const torch::Tensor& control,
-                                           int64_t capacity) {
+                                           int64_t capacity,
+                                           int64_t draft_width) {
+  CHECK(draft_width == 5 || draft_width == 7);
+  const int64_t arena_bytes = 12 * draft_width + 4;
   CHECK(arena.defined());
   CHECK(arena.device().is_privateuseone());
   CHECK_EQ(arena.scalar_type(), torch::kUInt8);
   CHECK_EQ(arena.dim(), 1);
   CHECK(arena.is_contiguous());
   CHECK_GT(arena.numel(), 0);
-  CHECK_EQ(arena.numel() % 88, 0);
-  const int64_t batch_capacity = arena.numel() / 88;
+  CHECK_EQ(arena.numel() % arena_bytes, 0);
+  const int64_t batch_capacity = arena.numel() / arena_bytes;
   CHECK_LE(batch_capacity, kMaxBatchSize);
   CHECK_GT(capacity, 0);
-  CHECK_LE(capacity, kMaxBatchSize * (kDraftTokens + 1));
+  CHECK_LE(capacity, kMaxBatchSize * (draft_width + 1));
   CHECK(control.defined());
   CHECK_EQ(control.device(), arena.device());
   CHECK_EQ(control.scalar_type(), torch::kInt64);
@@ -124,8 +130,8 @@ void dspark_allocate_verify_prefixes_graph(torch::Tensor& arena,
   CHECK(!spans_overlap(arena, control));
   // Prepare validates the active count before writing the control word. Read
   // it only on Device: graph replay must not turn it into a Host scalar.
-  const auto specialization =
-      build_runtime_specialization(batch_capacity, /*device_control=*/true);
+  const auto specialization = build_runtime_specialization(
+      batch_capacity, /*device_control=*/true, draft_width);
   const auto* entry =
       find_dspark_allocate_verify_prefixes_kernel_entry(specialization);
   CHECK(entry != nullptr)

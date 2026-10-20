@@ -45,6 +45,7 @@ struct DSparkBudgetOptions {
   double min_gain = 0.0;
   uint32_t exploration_interval = 32;
   DSparkCostScope cost_scope = DSparkCostScope::VERIFY_TAIL;
+  uint32_t draft_width = 7;
 };
 
 class DSparkBudgetPlanner final {
@@ -58,11 +59,12 @@ class DSparkBudgetPlanner final {
       uint32_t logical_requests,
       uint32_t physical_requests,
       uint32_t requested_graph_rows,
-      std::span<const DSparkGraphCost> prewarmed_graphs);
+      std::span<const DSparkGraphCost> prewarmed_graphs,
+      uint32_t draft_width = 7);
 
-  // Lagged confidence is retired Host feedback, flattened [batch, 7], or
-  // empty. Costs must be ascending, unique, prewarmed physical graph buckets.
-  // Missing confidence or a usable full-width cost selects the warmed
+  // Lagged confidence is retired Host feedback, flattened [batch, draft_width],
+  // or empty. Costs must be ascending, unique, prewarmed physical graph
+  // buckets. Missing confidence or a usable full-width cost selects the warmed
   // full-width plan. A previous plan belongs to this batch geometry; request
   // identity/feedback generation checks and rounds_since_full_width are owned
   // by the caller. Invalid input or missing full-width graph capacity returns

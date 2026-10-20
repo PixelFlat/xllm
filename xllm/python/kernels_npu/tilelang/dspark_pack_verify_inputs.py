@@ -28,13 +28,18 @@ DSPARK_PACK_VERIFY_INPUTS_PASS_CONFIGS = {
 DSPARK_BLOCK_TABLE_TILE = 4096
 
 
-def build_dspark_pack_verify_inputs_kernel(max_batch_size: int, device_control: bool = False) -> tvm.tir.PrimFunc:
+def build_dspark_pack_verify_inputs_kernel(
+    max_batch_size: int, device_control: bool = False, draft_width: int = 7
+) -> tvm.tir.PrimFunc:
     """Read widths after TP broadcast; fuse mapping, gathers, metadata and tables."""
     if max_batch_size not in (1, 2, 4, 8, 16, 32, 64, 128):
         raise ValueError("max_batch_size must be a supported power-of-two bucket")
+    if draft_width not in (5, 7):
+        raise ValueError("draft_width must be 5 or 7")
+    arena_words = 3 * draft_width + 1
     batch_tile = ((max_batch_size + 31) // 32) * 32
     offset_tile = ((max_batch_size + 32) // 32) * 32
-    proposal_tile = ((max_batch_size * 7 + 15) // 16) * 16
+    proposal_tile = ((max_batch_size * draft_width + 15) // 16) * 16
     row_tile = 32
 
     @T.prim_func
@@ -64,12 +69,14 @@ def build_dspark_pack_verify_inputs_kernel(max_batch_size: int, device_control: 
         # Guarded shape expressions avoid duplicate inferred shape parameters;
         # exact dynamic spans still equal the caller-validated tensor storage.
         anchors = T.match_buffer(anchors_handle, (T.Select(batch_size > 0, batch_size, 0),), "int64")
-        proposals = T.match_buffer(proposals_handle, (batch_size * 7,), "int64")
+        proposals = T.match_buffer(proposals_handle, (batch_size * draft_width,), "int64")
         base_positions = T.match_buffer(base_positions_handle, (T.Select(batch_size > 0, batch_size, 0),), "int32")
         base_lengths = T.match_buffer(base_lengths_handle, (T.Select(batch_size > 0, batch_size, 0),), "int32")
         base_tables = T.match_buffer(base_tables_handle, (batch_size * table_columns,), "int32")
         widths = T.match_buffer(
-            widths_handle, (batch_size * 22 if device_control else T.Select(batch_size > 0, batch_size, 0),), "int32"
+            widths_handle,
+            (batch_size * arena_words if device_control else T.Select(batch_size > 0, batch_size, 0),),
+            "int32",
         )
         offsets = T.match_buffer(offsets_handle, (batch_size + 1,), "int32")
         tokens = T.match_buffer(tokens_handle, (T.Select(capacity > 0, capacity, 0),), "int32")
@@ -116,7 +123,7 @@ def build_dspark_pack_verify_inputs_kernel(max_batch_size: int, device_control: 
                     T.barrier_all()
                     active_rows = T.Cast("int32", control_ub[0])
                     suppress_kv_writes = T.Cast("int32", control_ub[0] // T.int64(4294967296))
-                    width_offset = active_rows * 21
+                    width_offset = active_rows * (3 * draft_width)
                 # A sentinel makes owner+1 safe even when the compound while
                 # condition evaluates both operands after the final request.
                 T.tile.fill(offsets_ub, 2147483647)
@@ -124,7 +131,7 @@ def build_dspark_pack_verify_inputs_kernel(max_batch_size: int, device_control: 
                 if active_rows > 0:
                     T.copy(widths[width_offset : width_offset + active_rows], width_ub)
                     T.copy(anchors[0:active_rows], anchors_ub)
-                    T.copy(proposals[0 : active_rows * 7], proposals_ub)
+                    T.copy(proposals[0 : active_rows * draft_width], proposals_ub)
                     T.copy(base_positions[0:active_rows], base_positions_ub)
                     T.copy(base_lengths[0:active_rows], base_lengths_ub)
                     for row in T.serial(active_rows):
@@ -164,7 +171,7 @@ def build_dspark_pack_verify_inputs_kernel(max_batch_size: int, device_control: 
                                 if column == 0:
                                     tokens_ub[lane] = T.Cast("int32", anchors_ub[owner])
                                 else:
-                                    tokens_ub[lane] = T.Cast("int32", proposals_ub[owner * 7 + column - 1])
+                                    tokens_ub[lane] = T.Cast("int32", proposals_ub[owner * draft_width + column - 1])
                             else:
                                 T.tile.fill(table_ub, 0)
                             # Keep the complete caller-owned row stride without

@@ -35,8 +35,6 @@ namespace {
 #include XLLM_TL_DSPARK_PACK_VERIFY_INPUTS_REGISTRY_INC
 
 constexpr int64_t kMaxBatchSize = 128;
-constexpr int64_t kDraftTokens = 7;
-constexpr int64_t kMaxCapacity = kMaxBatchSize * (kDraftTokens + 1);
 constexpr int64_t kMaxOffset = std::numeric_limits<int32_t>::max();
 constexpr int64_t kRowsPerTask = 32;
 constexpr int64_t kVectorsPerCore = 2;
@@ -69,7 +67,8 @@ bool spans_overlap(const torch::Tensor& first, const torch::Tensor& second) {
 
 DsparkPackVerifyInputsSpecialization build_runtime_specialization(
     int64_t batch_size,
-    bool device_control) {
+    bool device_control,
+    int64_t draft_width) {
   int32_t bucket = 1;
   while (bucket < batch_size) {
     bucket *= 2;
@@ -77,7 +76,8 @@ DsparkPackVerifyInputsSpecialization build_runtime_specialization(
   return make_dspark_pack_verify_inputs_specialization(
       DsparkPackVerifyInputsMaxBatchSize{bucket},
       DsparkPackVerifyInputsDeviceControl{device_control ? int32_t{1}
-                                                         : int32_t{0}});
+                                                         : int32_t{0}},
+      DsparkPackVerifyInputsDraftWidth{static_cast<int32_t>(draft_width)});
 }
 
 int32_t copy_core_count(const torch::Device& device, int64_t capacity) {
@@ -122,7 +122,14 @@ void pack_verify_inputs(const torch::Tensor& anchors,
                         torch::Tensor& columns,
                         int64_t block_size,
                         const torch::Tensor& control,
-                        bool device_control) {
+                        bool device_control,
+                        int64_t draft_width) {
+  CHECK(proposals.defined());
+  if (!device_control) {
+    CHECK_EQ(proposals.dim(), 2);
+    draft_width = proposals.size(1);
+  }
+  CHECK(draft_width == 5 || draft_width == 7);
   CHECK(anchors.defined());
   CHECK(anchors.device().is_privateuseone());
   CHECK_EQ(anchors.dim(), 1);
@@ -137,7 +144,8 @@ void pack_verify_inputs(const torch::Tensor& anchors,
   CHECK(proposals.is_contiguous());
   if (device_control) {
     CHECK_GT(batch_size, 0);
-    check_vector(proposals, device, torch::kUInt8, batch_size * 88);
+    check_vector(
+        proposals, device, torch::kUInt8, batch_size * (12 * draft_width + 4));
     CHECK(widths.is_same(proposals));
     check_vector(control, device, torch::kInt64, /*rows=*/1);
     CHECK(!spans_overlap(proposals, control));
@@ -146,7 +154,7 @@ void pack_verify_inputs(const torch::Tensor& anchors,
     CHECK_EQ(proposals.scalar_type(), torch::kInt64);
     CHECK_EQ(proposals.dim(), 2);
     CHECK_EQ(proposals.size(0), batch_size);
-    CHECK_EQ(proposals.size(1), kDraftTokens);
+    CHECK_EQ(proposals.size(1), draft_width);
   }
   CHECK(base_block_table.defined());
   CHECK_EQ(base_block_table.device(), device);
@@ -164,7 +172,7 @@ void pack_verify_inputs(const torch::Tensor& anchors,
   const int64_t capacity = tokens.size(0);
   CHECK_GE(capacity, device_control ? int64_t{1} : batch_size);
   CHECK_GE(capacity, 0);
-  CHECK_LE(capacity, kMaxCapacity);
+  CHECK_LE(capacity, kMaxBatchSize * (draft_width + 1));
   CHECK_LE(table_columns,
            kMaxOffset / std::max<int64_t>({1, capacity, batch_size}));
   check_vector(offsets, device, torch::kInt32, batch_size + 1);
@@ -213,7 +221,7 @@ void pack_verify_inputs(const torch::Tensor& anchors,
     }
   }
   const auto specialization =
-      build_runtime_specialization(batch_size, device_control);
+      build_runtime_specialization(batch_size, device_control, draft_width);
   const auto* entry =
       find_dspark_pack_verify_inputs_kernel_entry(specialization);
   CHECK(entry != nullptr) << available_dspark_pack_verify_inputs_variant_keys();
@@ -279,7 +287,8 @@ void dspark_pack_verify_inputs(const torch::Tensor& anchors,
                      columns,
                      block_size,
                      torch::Tensor(),
-                     /*device_control=*/false);
+                     /*device_control=*/false,
+                     /*draft_width=*/0);
 }
 
 void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
@@ -297,7 +306,8 @@ void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
                                      torch::Tensor& q_seq_lens,
                                      torch::Tensor& owners,
                                      torch::Tensor& columns,
-                                     int64_t block_size) {
+                                     int64_t block_size,
+                                     int64_t draft_width) {
   pack_verify_inputs(anchors,
                      arena,
                      base_positions,
@@ -315,6 +325,7 @@ void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
                      columns,
                      block_size,
                      control,
-                     /*device_control=*/true);
+                     /*device_control=*/true,
+                     draft_width);
 }
 }  // namespace xllm::kernel::npu::tilelang

@@ -52,15 +52,17 @@ def greedy_verify_commit_out(
     Inputs must already have TP consensus; the target is greedy without
     requested log-probabilities. All buffers must be non-overlapping.
     """
-    if proposals.ndim != 2 or proposals.shape[1] != 7 or packed_target_ids.ndim != 1:
-        raise ValueError("proposals must be [batch,7] and packed target IDs one-dimensional")
+    if proposals.ndim != 2 or proposals.shape[1] not in (5, 7) or packed_target_ids.ndim != 1:
+        raise ValueError("proposals must be [batch,5/7] and packed target IDs one-dimensional")
     batch_size = proposals.shape[0]
+    draft_width = proposals.shape[1]
+    result_width = draft_width + 1
     capacity = packed_target_ids.shape[0]
     if capacity < batch_size:
         raise ValueError("packed capacity must contain at least one anchor per request")
     device = proposals.device
     inputs = (
-        ("proposals", proposals, (batch_size, 7), torch.int64),
+        ("proposals", proposals, (batch_size, draft_width), torch.int64),
         ("target IDs", packed_target_ids, (capacity,), torch.int64),
         ("widths", widths, (batch_size,), torch.int32),
         ("offsets", offsets, (batch_size + 1,), torch.int32),
@@ -69,7 +71,7 @@ def greedy_verify_commit_out(
         ("source slots", source_slots, (capacity,), torch.int32),
     )
     outputs = (
-        ("tokens", tokens, (batch_size, 8), torch.int64),
+        ("tokens", tokens, (batch_size, result_width), torch.int64),
         ("lengths", lengths, (batch_size,), torch.int32),
         ("context slots", context_slots, (capacity,), torch.int32),
     )
@@ -86,14 +88,16 @@ def greedy_verify_commit_out(
     if batch_size == 0:
         context_slots.fill_(-1)
         return
-    column_ids = torch.arange(8, dtype=torch.int32, device=device)
+    column_ids = torch.arange(result_width, dtype=torch.int32, device=device)
     # Only the small token-ID result is rectangular. Hidden states and logits
     # remain packed; each request loads its own bounded target rows.
     target_indices = offsets[:-1, None] + torch.minimum(column_ids[None, :], widths[:, None] - 1)
-    target_tokens = packed_target_ids.index_select(0, target_indices.flatten().to(torch.int64)).view(batch_size, 8)
-    compared = column_ids[None, :7] < widths[:, None] - 1
-    rejected = compared & (proposals != target_tokens[:, :7])
-    first_rejected = torch.where(rejected, column_ids[None, :7], 7).amin(dim=1)
+    target_tokens = packed_target_ids.index_select(0, target_indices.flatten().to(torch.int64)).view(
+        batch_size, result_width
+    )
+    compared = column_ids[None, :draft_width] < widths[:, None] - 1
+    rejected = compared & (proposals != target_tokens[:, :draft_width])
+    first_rejected = torch.where(rejected, column_ids[None, :draft_width], draft_width).amin(dim=1)
     committed_lengths = torch.minimum(first_rejected + 1, widths)
     lengths.copy_(committed_lengths)
     tokens.copy_(target_tokens)

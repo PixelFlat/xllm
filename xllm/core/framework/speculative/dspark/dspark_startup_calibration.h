@@ -55,6 +55,7 @@ struct DSparkStartupCalibrationConfig {
   uint32_t window_steps = 32;
   uint32_t windows_per_point = 3;
   uint32_t token_seed = 1;
+  uint32_t draft_width = 7;
 };
 
 struct DSparkCalibrationPoint {
@@ -64,28 +65,31 @@ struct DSparkCalibrationPoint {
 };
 
 std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
-    std::string_view contents);
+    std::string_view contents,
+    uint32_t draft_width = 7);
 
 // Default contexts are bounded by the model; request buckets are resolved from
 // the actual captured geometry after warmup, not guessed from HTTP concurrency.
 std::optional<DSparkStartupCalibrationConfig>
-default_dspark_startup_calibration(uint32_t max_positions);
+default_dspark_startup_calibration(uint32_t max_positions,
+                                   uint32_t draft_width = 7);
 
 // Materialize numeric defaults; an omitted target axis selects legal captures.
 std::string serialize_dspark_startup_calibration(
     const DSparkStartupCalibrationConfig& config);
 
 // Keep the legacy bound when compact-page rounding already covers the sample;
-// otherwise choose the smallest sufficient capture. Draft7 adds six mask
-// positions. Both eight-token in-flight allocations must fit the model limit.
+// otherwise choose the smallest sufficient capture. Both in-flight allocations
+// of draft_width + 1 tokens must fit the model limit.
 std::optional<uint32_t> dspark_calibration_warmup_length(
     uint32_t max_kv_length,
     uint32_t max_positions,
     uint32_t logical_block_size,
-    uint32_t default_length);
+    uint32_t default_length,
+    uint32_t draft_width = 7);
 
 // Only captured physical buckets are legal. Full width is the first captured
-// bucket covering 8*Bcap, which need not equal 8*Bcap itself.
+// bucket covering (draft_width + 1)*Bcap, which need not be that exact size.
 std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
     const DSparkStartupCalibrationConfig& config,
     std::span<const uint32_t> captured_requests,
@@ -98,7 +102,8 @@ std::optional<std::string> fit_dspark_cost_table(
     std::span<const DSparkSteadyWindow> windows,
     DSparkSpsCostModel::Kind kind,
     uint32_t min_kv_length,
-    uint32_t max_kv_length);
+    uint32_t max_kv_length,
+    uint32_t draft_width = 7);
 
 // The owner starts/replaces a sample only after draining the pipeline.
 // observe() runs on the existing result-retirement thread, without file I/O.

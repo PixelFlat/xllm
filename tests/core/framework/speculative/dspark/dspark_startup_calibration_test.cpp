@@ -85,6 +85,55 @@ TEST(DSparkStartupCalibrationTest, DefaultsUseAdditiveCostsAndBoundedContext) {
   EXPECT_EQ(config->token_seed, 1U);
 }
 
+TEST(DSparkStartupCalibrationTest, DraftFiveUsesItsOwnCapacityAndGeometry) {
+  const auto config =
+      parse_dspark_startup_calibration(configuration().dump(), 5);
+  ASSERT_TRUE(config);
+  EXPECT_EQ(config->draft_width, 5U);
+  const std::string serialized = serialize_dspark_startup_calibration(*config);
+  EXPECT_TRUE(parse_dspark_startup_calibration(serialized, 5));
+  EXPECT_FALSE(parse_dspark_startup_calibration(serialized, 7));
+  EXPECT_FALSE(parse_dspark_startup_calibration(serialized, 0));
+  const std::array<uint32_t, 2> requests{1, 4};
+  const std::array<uint32_t, 8> graphs{1, 2, 4, 6, 8, 16, 24, 32};
+  const auto points = plan_dspark_calibration(*config, requests, graphs);
+  ASSERT_TRUE(points);
+  EXPECT_EQ(points->back().target_graph_rows, 24U);
+  EXPECT_EQ(points->back().requests, 4U);
+  EXPECT_TRUE(default_dspark_startup_calibration(864, 5));
+  EXPECT_FALSE(default_dspark_startup_calibration(864, 7));
+  EXPECT_FALSE(default_dspark_startup_calibration(4096, 6));
+  EXPECT_EQ(dspark_calibration_warmup_length(8192, 32768, 128, 2048, 5), 4093U);
+}
+
+TEST(DSparkStartupCalibrationTest, DraftFiveFitsMatchingGeneratedTokenCounts) {
+  auto sample = window(1, 8, 10.0);
+  sample.draft_tokens = sample.steps * 5;
+  const std::array<DSparkSteadyWindow, 1> samples{sample};
+  const auto fitted = fit_dspark_cost_table(
+      samples, DSparkSpsCostModel::Kind::SPS, 1800, 4096, 5);
+  ASSERT_TRUE(fitted);
+  const auto data = nlohmann::json::parse(*fitted);
+  EXPECT_EQ(data["draft_width"], 5);
+  EXPECT_EQ(data["metadata"]["cells"][0]["generated_draft_tokens"], 160);
+  EXPECT_FALSE(fit_dspark_cost_table(
+      samples, DSparkSpsCostModel::Kind::SPS, 1800, 4096, 7));
+}
+
+TEST(DSparkStartupCalibrationTest, UnversionedCostsCannotCrossDraftWidths) {
+  auto table = sps_table();
+  const std::string five = nlohmann::json{{"num_speculative_tokens", 5}}.dump();
+  const std::string seven =
+      nlohmann::json{{"num_speculative_tokens", 7}}.dump();
+  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump(), five));
+  EXPECT_TRUE(DSparkCostTableBundle::from_json(table.dump(), seven));
+  table["draft_width"] = 5;
+  EXPECT_TRUE(DSparkCostTableBundle::from_json(table.dump(), five));
+  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump(), seven));
+  table["draft_width"] = 6;
+  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump()));
+}
+
 TEST(DSparkStartupCalibrationTest, DefaultsRespectShortModelContexts) {
   auto config = default_dspark_startup_calibration(1024);
   ASSERT_TRUE(config);

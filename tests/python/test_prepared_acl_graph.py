@@ -155,7 +155,7 @@ def _block_metadata(request_count: int, query_width: int, pages: int = 64) -> Si
 
 
 def _adaptive_inputs(
-    device: torch.device, table_width: int = 2, graph_rows: int = 8
+    device: torch.device, table_width: int = 2, graph_rows: int = 8, draft_width: int = 7
 ) -> tuple[torch.Tensor, torch.Tensor, SimpleNamespace, DSparkAdaptiveGraphInputs]:
     capacity = 3
     metadata = _metadata(graph_rows)
@@ -165,7 +165,7 @@ def _adaptive_inputs(
     tokens = torch.zeros(graph_rows, dtype=torch.int32, device=device)
     positions = torch.zeros_like(tokens)
     inputs = DSparkAdaptiveGraphInputs(
-        arena=torch.zeros(88 * capacity, dtype=torch.uint8, device=device),
+        arena=torch.zeros((12 * draft_width + 4) * capacity, dtype=torch.uint8, device=device),
         control=torch.tensor([1], dtype=torch.int64, device=device),
         anchors=torch.arange(100, 100 + capacity, dtype=torch.int64, device=device),
         base_positions=torch.full((capacity,), 1, dtype=torch.int32, device=device),
@@ -178,6 +178,7 @@ def _adaptive_inputs(
         owners=torch.full((graph_rows,), -99, dtype=torch.int32, device=device),
         columns=torch.full((graph_rows,), -99, dtype=torch.int32, device=device),
         block_size=128,
+        draft_width=draft_width,
     )
     return tokens, positions, metadata, inputs
 
@@ -228,11 +229,14 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> PreparedAclGraphRunner:
     return result
 
 
-def test_adaptive_prepared_binding_ignores_live_device_control(runner: PreparedAclGraphRunner) -> None:
+@pytest.mark.parametrize("draft_width", [5, 7])
+def test_adaptive_prepared_binding_ignores_live_device_control(
+    runner: PreparedAclGraphRunner, draft_width: int
+) -> None:
     runner.max_batch = 8
     runner.attention_backend.is_mla = True
     runner.attention_backend.logical_page_size = 128
-    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"), draft_width=draft_width)
     runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
     binding = runner._prepared_binding(tokens, positions, metadata, dspark_adaptive=inputs)
     entry = runner._prepared_graphs[binding]
@@ -1151,8 +1155,11 @@ def test_mtp_real_graph_replays_live_inputs_across_slots(reuse_topk: bool, dp_si
 
 @pytest.mark.parametrize("table_width", [8192, 8195])
 @pytest.mark.parametrize("graph_rows", [8, 16])
+@pytest.mark.parametrize("draft_width", [5, 7])
 @torch.inference_mode()
-def test_adaptive_target_graph_packs_live_control_without_recapture(table_width: int, graph_rows: int) -> None:
+def test_adaptive_target_graph_packs_live_control_without_recapture(
+    table_width: int, graph_rows: int, draft_width: int
+) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
@@ -1176,7 +1183,7 @@ def test_adaptive_target_graph_packs_live_control_without_recapture(table_width:
     )
     prepared = PreparedAclGraphRunner(PackedInputTarget(), backend, device, graph_rows)
     stream = torch.npu.Stream(device=device)
-    slots = [_adaptive_inputs(device, table_width, graph_rows) for _ in range(2)]
+    slots = [_adaptive_inputs(device, table_width, graph_rows, draft_width) for _ in range(2)]
     for tokens, positions, metadata, inputs in slots:
         # Startup writes are suppressed by the same captured device control
         # later used for normal serving, not by a second capture variant.
@@ -1199,13 +1206,17 @@ def test_adaptive_target_graph_packs_live_control_without_recapture(table_width:
         inactive = _adaptive_tensors(*slots[1 - slot_id])
         untouched = [tensor.cpu().clone() for tensor in inactive]
         arena = torch.full_like(inputs.arena, 199, device="cpu")
-        proposals = torch.arange(batch_size * 7, dtype=torch.int64).view(batch_size, 7) + 1000 + phase * 20
-        confidence = torch.full((batch_size, 7), 0.05)
+        proposals = (
+            torch.arange(batch_size * draft_width, dtype=torch.int64).view(batch_size, draft_width) + 1000 + phase * 20
+        )
+        confidence = torch.full((batch_size, draft_width), 0.05)
         confidence[phase % batch_size].fill_(0.99)
         if phase == 4:
             confidence.fill_(1)
-        arena[: 56 * batch_size].copy_(proposals.view(torch.uint8).flatten())
-        arena[56 * batch_size : 84 * batch_size].copy_(confidence.view(torch.uint8).flatten())
+        proposal_bytes = 8 * draft_width * batch_size
+        width_offset = 12 * draft_width * batch_size
+        arena[:proposal_bytes].copy_(proposals.view(torch.uint8).flatten())
+        arena[proposal_bytes:width_offset].copy_(confidence.view(torch.uint8).flatten())
         inputs.arena.copy_(arena)
         inputs.control.fill_(batch_size | (int(suppress) << 32))
         inputs.anchors.copy_(torch.arange(100 + phase, 103 + phase, dtype=torch.int64))
@@ -1218,7 +1229,7 @@ def test_adaptive_target_graph_packs_live_control_without_recapture(table_width:
             torch.arange(3 * table_width, dtype=torch.int32).view(3, table_width) + 10 + phase
         )
 
-        budget = min(7 * batch_size, graph_rows - batch_size)
+        budget = min(draft_width * batch_size, graph_rows - batch_size)
         widths = torch.empty(batch_size, dtype=torch.int32)
         offsets = torch.empty(batch_size + 1, dtype=torch.int32)
         allocate_verify_prefixes(confidence, budget, widths, offsets)
@@ -1242,7 +1253,7 @@ def test_adaptive_target_graph_packs_live_control_without_recapture(table_width:
             prepared.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
             output = prepared.execute(tokens, positions, metadata, dspark_adaptive=inputs)
         torch.npu.current_stream(device).wait_stream(stream)
-        actual_widths = inputs.arena[84 * batch_size : 88 * batch_size].cpu().view(torch.int32)
+        actual_widths = inputs.arena[width_offset : width_offset + 4 * batch_size].cpu().view(torch.int32)
         torch.testing.assert_close(actual_widths, widths)
         torch.testing.assert_close(inputs.offsets[: batch_size + 1].cpu(), offsets)
         for actual, name in (

@@ -193,6 +193,8 @@ struct TaskExecutionPipeline::DSparkAdaptiveState {
   struct Feedback {
     uint64_t generation = 0;
     uint64_t rounds_since_full_width = 0;
+    // Host-only history uses the largest compiled width. Only the configured
+    // prefix is copied/consumed; Device and pinned buffers use the exact width.
     std::array<double, 7> confidence{};
   };
   struct History {

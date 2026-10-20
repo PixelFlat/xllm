@@ -23,7 +23,8 @@ import torch
 class DSparkAdaptiveGraphInputs:
     """Keep Slot-owned storage alive without reading device control on Host.
 
-    ``arena`` has 88 bytes per request-capacity row. Its live compact proposal,
+    ``arena`` has ``12 * draft_width + 4`` bytes per request-capacity row.
+    Its live compact proposal,
     confidence and width regions depend on the low 32 bits of ``control[0]``.
     The high 32 bits suppress cache writes during warmup and profiling. Tensor
     layouts stay fixed when the live request count changes between replays.
@@ -39,3 +40,4 @@ class DSparkAdaptiveGraphInputs:
     owners: torch.Tensor
     columns: torch.Tensor
     block_size: int
+    draft_width: int = 7

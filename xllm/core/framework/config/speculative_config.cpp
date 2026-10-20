@@ -203,20 +203,21 @@ void SpeculativeConfig::validate() const {
         (adaptive_dspark_cost_table().empty() &&
          enable_adaptive_speculative_decode() &&
          is_dspark_algorithm(speculative_algorithm()) &&
-         num_speculative_tokens() == 7))
-      << "adaptive_dspark_calibration requires adaptive DSpark Draft7 without "
+         (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
+      << "adaptive_dspark_calibration requires adaptive DSpark Draft5/7 "
+         "without "
          "a cost-table input.";
   CHECK(adaptive_dspark_cost_table_output().empty() ||
         (adaptive_dspark_cost_table().empty() &&
          enable_adaptive_speculative_decode() &&
          is_dspark_algorithm(speculative_algorithm()) &&
-         num_speculative_tokens() == 7))
+         (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_cost_table_output requires startup calibration.";
   CHECK(adaptive_dspark_cost_table().empty() ||
         (enable_adaptive_speculative_decode() &&
          is_dspark_algorithm(speculative_algorithm()) &&
-         num_speculative_tokens() == 7))
-      << "adaptive_dspark_cost_table requires adaptive DSpark Draft7.";
+         (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
+      << "adaptive_dspark_cost_table requires adaptive DSpark Draft5/7.";
   const DraftSamplingMode mode =
       parse_draft_sampling_mode(draft_sampling_mode());
   const std::string& algorithm = speculative_algorithm();

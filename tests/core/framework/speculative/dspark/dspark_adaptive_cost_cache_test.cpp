@@ -47,6 +47,35 @@ TEST(DSparkAdaptiveCostCacheTest, MatchesSmallestCoveringKvBoundAndDraftGraph) {
   EXPECT_FALSE(cache.lookup(7, 0).has_value());
 }
 
+TEST(DSparkAdaptiveCostCacheTest,
+     SeparatesWidthsEvenWhenDraftRowsAreIdentical) {
+  DSparkAdaptiveCostCache cache;
+  auto five = profile(35, 4096);
+  five.draft_width = 5;
+  five.target_graph_costs.emplace_back(DSparkGraphCost{42, 6.0});
+  ASSERT_TRUE(cache.store(five));
+  EXPECT_FALSE(cache.lookup(35, 2000, 7));
+  auto seven = profile(35, 4096);
+  seven.target_graph_costs.emplace_back(DSparkGraphCost{40, 7.0});
+  ASSERT_TRUE(cache.store(seven));
+  ASSERT_TRUE(cache.lookup(35, 2000, 5));
+  ASSERT_TRUE(cache.lookup(35, 2000, 7));
+  EXPECT_EQ(cache.lookup(35, 2000, 5)->draft_width, 5U);
+  EXPECT_EQ(cache.lookup(35, 2000, 7)->draft_width, 7U);
+}
+
+TEST(DSparkAdaptiveCostCacheTest, DraftFiveRequiresItsOwnFullWidthCapacity) {
+  DSparkAdaptiveCostCache cache;
+  auto five = profile(10, 4096);
+  five.draft_width = 5;
+  five.target_graph_costs = {{1, 1.0}, {4, 2.0}, {8, 3.0}};
+  EXPECT_FALSE(cache.store(five));
+  five.target_graph_costs.emplace_back(DSparkGraphCost{12, 4.0});
+  EXPECT_TRUE(cache.store(five));
+  five.draft_width = 0;
+  EXPECT_FALSE(cache.store(five));
+}
+
 TEST(DSparkAdaptiveCostCacheTest, DoesNotApplyContextTableAcrossCoverageGaps) {
   DSparkAdaptiveCostCache cache;
   auto first = profile(7, 4096);

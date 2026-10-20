@@ -269,15 +269,16 @@ Status TaskExecutionPipeline::create(
   }
   if (capacity.adaptive_dspark &&
       (!Platform::is_npu() || capacity.kind != SpeculativeTaskKind::DSPARK ||
-       capacity.num_speculative_tokens != 7 || !capacity.sparse_dsa_target ||
-       !common.enable_mla || common.max_graph_batch_size == 0 ||
-       common.model.max_sequences > 128 ||
+       (capacity.num_speculative_tokens != 5 &&
+        capacity.num_speculative_tokens != 7) ||
+       !capacity.sparse_dsa_target || !common.enable_mla ||
+       common.max_graph_batch_size == 0 || common.model.max_sequences > 128 ||
        capacity.draft_sampling_mode != DraftSamplingMode::GREEDY ||
        !std::isfinite(capacity.adaptive_min_gain) ||
        capacity.adaptive_min_gain < 0.0 ||
        !draft.model.has_dspark_confidence_head())) {
     return invalid(
-        "Adaptive task pipeline requires NPU DSpark Draft7, sparse DSA "
+        "Adaptive task pipeline requires NPU DSpark Draft5/7, sparse DSA "
         "Target graphs, a ConfidenceHead, greedy sampling and supported "
         "request/page capacity.");
   }
@@ -440,12 +441,14 @@ Status TaskExecutionPipeline::initialize_speculative() {
           torch::empty({expanded}, options.dtype(torch::kInt64));
       slot->adaptive = std::make_unique<SpeculativeSlot::Adaptive>();
       auto& adaptive = *slot->adaptive;
-      adaptive.arena_storage = torch::empty({static_cast<int64_t>(count) * 88},
-                                            options.dtype(torch::kUInt8));
-      adaptive.host_feedback_storage = torch::empty(
-          {static_cast<int64_t>(count) * 32}, pinned.dtype(torch::kUInt8));
+      adaptive.arena_storage =
+          torch::empty({static_cast<int64_t>(count) * (12 * (width - 1) + 4)},
+                       options.dtype(torch::kUInt8));
+      adaptive.host_feedback_storage =
+          torch::empty({static_cast<int64_t>(count) * (4 * width)},
+                       pinned.dtype(torch::kUInt8));
       adaptive.previous_storage =
-          torch::empty({count, 7}, options.dtype(torch::kInt64));
+          torch::empty({count, width - 1}, options.dtype(torch::kInt64));
       adaptive.offsets_storage =
           torch::empty({count + 1}, options.dtype(torch::kInt32));
       adaptive.owners_storage =
@@ -454,14 +457,15 @@ Status TaskExecutionPipeline::initialize_speculative() {
           torch::empty({expanded}, options.dtype(torch::kInt32));
       adaptive.embedding_ids.reserve(count);
       adaptive.request_ids.reserve(count);
-      adaptive.lagged_confidence.reserve(count * 7);
+      adaptive.lagged_confidence.reserve(count * (width - 1));
       adaptive.draft_counts.reserve(count);
     } else {
       slot->proposal_storage =
           torch::empty({count * (width - 1)}, options.dtype(torch::kInt64));
     }
     slot->accepted_mask_storage =
-        torch::empty({expanded}, options.dtype(torch::kBool));
+        torch::empty({std::max<int64_t>(expanded, dspark_adaptive_ ? 8 : 0)},
+                     options.dtype(torch::kBool));
     if (slot->adaptive) {
       // Adaptive commit never uses the fixed-width rejection mask. Borrow its
       // first eight bytes rather than allocate another Device control buffer.
@@ -899,13 +903,13 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (slot.adaptive) {
     if (input.input_params.meta.is_graph_warmup) {
       slot.adaptive->plan = {
-          slot.rows * 7,
+          slot.rows * speculative_capacity_->num_speculative_tokens,
           task_graph_batch_size(slot.validate_input->model_params().parallel,
                                 graph_batch_sizes_)};
       slot.adaptive->max_kv_length =
           static_cast<uint32_t>(*std::max_element(
               slot.upper_kv_lengths.begin(), slot.upper_kv_lengths.end())) +
-          7;
+          speculative_capacity_->num_speculative_tokens;
       return Status();
     }
     return plan_adaptive_dspark(slot, input);
@@ -918,6 +922,7 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
     const LlmForwardInput& input) {
   CHECK(slot.adaptive != nullptr);
   auto& adaptive = *slot.adaptive;
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
   const uint64_t generation = next_task_id_;
   const uint64_t eligible_generation = generation > 2 ? generation - 2 : 0;
   // Engine coordinated submission retires n-2 on every sampling rank before
@@ -953,9 +958,10 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
       complete_feedback = false;
       continue;
     }
-    adaptive.lagged_confidence.insert(adaptive.lagged_confidence.end(),
-                                      feedback->confidence.begin(),
-                                      feedback->confidence.end());
+    adaptive.lagged_confidence.insert(
+        adaptive.lagged_confidence.end(),
+        feedback->confidence.begin(),
+        feedback->confidence.begin() + draft_width);
     rounds_since_full_width =
         std::max(rounds_since_full_width, feedback->rounds_since_full_width);
   }
@@ -965,16 +971,19 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
   adaptive.max_kv_length =
       static_cast<uint32_t>(*std::max_element(slot.upper_kv_lengths.begin(),
                                               slot.upper_kv_lengths.end())) +
-      7;
+      draft_width;
   std::vector<DSparkGraphCost> costs;
   costs.reserve(captured_graph_batch_sizes_.size());
   for (const int64_t graph_rows : captured_graph_batch_sizes_) {
     costs.emplace_back(DSparkGraphCost{static_cast<uint32_t>(graph_rows), 0.0});
   }
   DSparkBudgetOptions options;
+  options.draft_width = draft_width;
   options.min_gain = speculative_capacity_->adaptive_min_gain;
   const auto profile = speculative_capacity_->adaptive_costs->lookup(
-      slot.drafts.front()->padded_batch_size, adaptive.max_kv_length);
+      slot.drafts.front()->padded_batch_size,
+      adaptive.max_kv_length,
+      draft_width);
   if (profile) {
     options.cost_scope = profile->cost_scope;
     options.fixed_draft_time_ms = profile->fixed_draft_time_ms;
@@ -1009,9 +1018,9 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
     const uint32_t graph_rows =
         dspark_adaptive_->calibration_point->target_graph_rows;
     const uint32_t physical_requests =
-        slot.drafts.front()->padded_batch_size / 7;
+        slot.drafts.front()->padded_batch_size / draft_width;
     plan = DSparkBudgetPlanner::calibration_plan(
-        slot.rows, physical_requests, graph_rows, costs);
+        slot.rows, physical_requests, graph_rows, costs, draft_width);
     if (!plan) {
       return invalid(
           "DSpark calibration requires a known G and prewarmed full-width "
@@ -1030,7 +1039,7 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
   }
   adaptive.plan = *plan;
   adaptive.generation = generation;
-  adaptive.generated_draft_tokens = slot.rows * 7;
+  adaptive.generated_draft_tokens = slot.rows * draft_width;
   adaptive.selected_draft_tokens = plan->draft_budget;
   VLOG(1) << "DSpark adaptive budget: B=" << slot.rows
           << ", generated=" << adaptive.generated_draft_tokens
@@ -1161,7 +1170,8 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   if (dspark_adaptive_) {
     // Scheduler startup runs Prefill warmup before the Decode bucket sweep.
     // Preserve its normal context/bootstrap execution; only Decode owns the
-    // prepared Draft7/verify bindings and their adaptive cost measurements.
+    // prepared block-draft/verify bindings and their adaptive cost
+    // measurements.
     if (!batch.forward_type.is_decode()) {
       return Status();
     }
@@ -1293,16 +1303,20 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
 
 void TaskExecutionPipeline::bind_adaptive_dspark_views(SpeculativeSlot& slot) {
   auto& adaptive = *slot.adaptive;
-  const int64_t proposal_bytes = static_cast<int64_t>(slot.rows) * 56;
-  const int64_t confidence_bytes = static_cast<int64_t>(slot.rows) * 28;
-  const int64_t feedback_bytes = static_cast<int64_t>(slot.rows) * 32;
+  const int64_t draft_width = speculative_capacity_->num_speculative_tokens;
+  const int64_t proposal_bytes =
+      static_cast<int64_t>(slot.rows) * draft_width * 8;
+  const int64_t confidence_bytes =
+      static_cast<int64_t>(slot.rows) * draft_width * 4;
+  const int64_t feedback_bytes =
+      static_cast<int64_t>(slot.rows) * (draft_width + 1) * 4;
   slot.proposal = prefix(adaptive.arena_storage, proposal_bytes)
                       .view(torch::kInt64)
-                      .view({slot.rows, 7});
+                      .view({slot.rows, draft_width});
   adaptive.confidence =
       adaptive.arena_storage.narrow(/*dim=*/0, proposal_bytes, confidence_bytes)
           .view(torch::kFloat32)
-          .view({slot.rows, 7});
+          .view({slot.rows, draft_width});
   adaptive.widths =
       adaptive.arena_storage
           .narrow(/*dim=*/0, proposal_bytes + confidence_bytes, slot.rows * 4)
@@ -1315,7 +1329,7 @@ void TaskExecutionPipeline::bind_adaptive_dspark_views(SpeculativeSlot& slot) {
       prefix(adaptive.host_feedback_storage, feedback_bytes);
   adaptive.host_confidence = prefix(adaptive.host_feedback, confidence_bytes)
                                  .view(torch::kFloat32)
-                                 .view({slot.rows, 7});
+                                 .view({slot.rows, draft_width});
   adaptive.host_widths =
       adaptive.host_feedback.narrow(/*dim=*/0, confidence_bytes, slot.rows * 4)
           .view(torch::kInt32);
@@ -1349,6 +1363,7 @@ void TaskExecutionPipeline::bind_adaptive_dspark_graph_input(
   input.owners = prefix(adaptive.owners_storage, adaptive.plan.graph_rows);
   input.columns = prefix(adaptive.columns_storage, adaptive.plan.graph_rows);
   input.block_size = capacity_.logical_block_size;
+  input.draft_width = speculative_capacity_->num_speculative_tokens;
   slot.validate_input->model_params().graph.dspark_adaptive = std::move(input);
   // B and the startup write mask are Device values, not capture-time scalars.
   // All sources retain their full Slot capacity so a G graph can serve any
@@ -1392,7 +1407,7 @@ Status TaskExecutionPipeline::warmup_adaptive_dspark_graphs(
         binding.model_params().parallel, invocation.graph_batch_sizes);
     if (draft_rows == 0) {
       return invalid(
-          "Adaptive DSpark requires a warmed Draft7 request bucket.");
+          "Adaptive DSpark requires a warmed Draft5/7 request bucket.");
     }
     auto conservative = host;
     conservative.positions = slot.upper_positions;
@@ -1442,8 +1457,10 @@ Status TaskExecutionPipeline::warmup_adaptive_dspark_graphs(
       // the scheduler's synthetic warmup. These are the same full-capacity
       // sources used by serving; no bootstrap-only graph binding is created.
       slot.rows = std::min(original_rows, physical_rows);
-      slot.adaptive->plan = {std::min(slot.rows * 7, physical_rows - slot.rows),
-                             physical_rows};
+      slot.adaptive->plan = {
+          std::min(slot.rows * speculative_capacity_->num_speculative_tokens,
+                   physical_rows - slot.rows),
+          physical_rows};
       bind_adaptive_dspark_views(slot);
       slot.adaptive->arena_storage.zero_();
       slot.state->token_storage_.fill_(1);
@@ -2244,28 +2261,31 @@ void TaskExecutionPipeline::generate_adaptive_dspark_proposals(
     const torch::Tensor& anchors) {
   auto& invocation = *slot.drafts.front();
   auto& adaptive = *slot.adaptive;
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
   // Admission checked every penalty is neutral and sampling is greedy. Use
   // the same minimal sampler in serving and startup profiling; do not launch
   // no-op penalty kernels merely because the client supplied neutral tensors.
   SamplingParameters sampling;
   const auto base_logits =
-      invocation.logits.view({slot.rows, 7, capacity_.vocab_size});
+      invocation.logits.view({slot.rows, draft_width, capacity_.vocab_size});
   auto previous_tokens = anchors;
-  for (uint32_t column = 0; column < 7; ++column) {
+  for (uint32_t column = 0; column < draft_width; ++column) {
     auto logits = base_logits.select(/*dim=*/1, column) +
                   draft_->model.dspark_markov_bias(previous_tokens);
     const auto sampled = sampler_.forward(logits, sampling);
     slot.proposal.select(/*dim=*/1, column).copy_(sampled.next_tokens);
     previous_tokens = sampled.next_tokens;
   }
-  invocation.sampled.probs = torch::Tensor();
+  invocation.sampled.draft_logits = torch::Tensor();
   adaptive.previous_tokens.select(/*dim=*/1, /*index=*/0).copy_(anchors);
-  adaptive.previous_tokens.narrow(/*dim=*/1, /*start=*/1, /*length=*/6)
-      .copy_(slot.proposal.narrow(/*dim=*/1, /*start=*/0, /*length=*/6));
+  adaptive.previous_tokens
+      .narrow(/*dim=*/1, /*start=*/1, /*length=*/draft_width - 1)
+      .copy_(slot.proposal.narrow(
+          /*dim=*/1, /*start=*/0, /*length=*/draft_width - 1));
   const auto confidence = draft_->model.dspark_confidence_probs(
       invocation.output.hidden_states
-          .narrow(/*dim=*/0, /*start=*/0, slot.rows * 7)
-          .view({slot.rows, 7, capacity_.hidden_size}),
+          .narrow(/*dim=*/0, /*start=*/0, slot.rows * draft_width)
+          .view({slot.rows, draft_width, capacity_.hidden_size}),
       adaptive.previous_tokens);
   CHECK(confidence.defined());
   CHECK(confidence.sizes() == adaptive.confidence.sizes());
@@ -2464,7 +2484,8 @@ ForwardOutput TaskExecutionPipeline::consume_speculative(uint32_t slot_id) {
     step.completed_ns = completed_ns;
     if (!slot.is_warmup && slot.decode && slot.rows != 0) {
       step.logical_requests = slot.rows;
-      step.draft_requests = slot.drafts.front()->padded_batch_size / 7;
+      step.draft_requests = slot.drafts.front()->padded_batch_size /
+                            speculative_capacity_->num_speculative_tokens;
       step.target_graph_rows = slot.adaptive->plan.graph_rows;
       step.max_kv_length = slot.adaptive->max_kv_length;
       step.draft_tokens = slot.adaptive->selected_draft_tokens;
@@ -2521,13 +2542,14 @@ ForwardOutput TaskExecutionPipeline::consume_speculative(uint32_t slot_id) {
 
 void TaskExecutionPipeline::consume_adaptive_dspark(SpeculativeSlot& slot) {
   auto& adaptive = *slot.adaptive;
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
   const int32_t* widths = adaptive.host_widths.const_data_ptr<int32_t>();
   const float* confidence = adaptive.host_confidence.const_data_ptr<float>();
   adaptive.draft_counts.clear();
   uint32_t selected = 0;
   for (uint32_t row = 0; row < slot.rows; ++row) {
     CHECK_GE(widths[row], 1);
-    CHECK_LE(widths[row], 8);
+    CHECK_LE(widths[row], draft_width + 1);
     adaptive.draft_counts.emplace_back(widths[row] - 1);
     selected += static_cast<uint32_t>(widths[row] - 1);
   }
@@ -2535,7 +2557,7 @@ void TaskExecutionPipeline::consume_adaptive_dspark(SpeculativeSlot& slot) {
   if (slot.is_warmup) {
     return;
   }
-  const bool full_width = adaptive.plan.draft_budget == slot.rows * 7;
+  const bool full_width = adaptive.plan.draft_budget == slot.rows * draft_width;
   for (uint32_t row = 0; row < slot.rows; ++row) {
     const int32_t id = adaptive.embedding_ids[row];
     CHECK_GT(id, 0);
@@ -2553,8 +2575,8 @@ void TaskExecutionPipeline::consume_adaptive_dspark(SpeculativeSlot& slot) {
     feedback.generation = adaptive.generation;
     feedback.rounds_since_full_width =
         full_width ? 0 : history.versions[0].rounds_since_full_width + 1;
-    for (uint32_t column = 0; column < 7; ++column) {
-      const float probability = confidence[row * 7 + column];
+    for (uint32_t column = 0; column < draft_width; ++column) {
+      const float probability = confidence[row * draft_width + column];
       CHECK(std::isfinite(probability));
       CHECK_GE(probability, 0.0F);
       CHECK_LE(probability, 1.0F);
@@ -2604,15 +2626,19 @@ void TaskExecutionPipeline::trace_adaptive_dspark(
                         {"request_ids", adaptive.request_ids},
                         {"logical_requests", slot.rows},
                         {"physical_requests",
-                         slot.drafts.front()->padded_batch_size / 7},
+                         slot.drafts.front()->padded_batch_size /
+                             speculative_capacity_->num_speculative_tokens},
                         {"target_graph_rows", adaptive.plan.graph_rows},
                         {"max_kv_length", adaptive.max_kv_length},
                         {"selected_draft_tokens", adaptive.plan.draft_budget},
                         {"draft_counts", adaptive.draft_counts},
                         {"accepted_counts", accepted},
                         {"conditional_confidence",
-                         std::vector<float>(confidence,
-                                            confidence + slot.rows * 7)},
+                         std::vector<float>(
+                             confidence,
+                             confidence +
+                                 slot.rows * speculative_capacity_
+                                                 ->num_speculative_tokens)},
                         {"lagged_conditional_confidence",
                          adaptive.lagged_confidence}}
              .dump();

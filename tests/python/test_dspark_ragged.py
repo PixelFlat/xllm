@@ -63,7 +63,7 @@ def test_device_control_budget_matches_fixed_graph_capacity(batch_size: int, gra
     assert offsets.tolist() == [0] + torch.cumsum(widths, dim=0).tolist()
 
 
-@pytest.mark.parametrize("batch_size", [0, 1, 2, 3, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [0, 1, 2, 3, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("fraction", [0.0, 0.25, 0.5, 1.0])
 def test_prefix_allocation_is_exact_and_matches_vanilla(batch_size: int, fraction: float) -> None:
     generator = torch.Generator().manual_seed(17 + batch_size)
@@ -345,11 +345,15 @@ def test_reference_does_not_read_device_values_or_infer_output_shapes() -> None:
             pytest.fail("reference must not convert device tensor values to host scalars")
 
 
-def _native_inputs(batch_size: int, device: str, table_width: int = 256) -> dict[str, torch.Tensor]:
+def _native_inputs(
+    batch_size: int, device: str, table_width: int = 256, draft_width: int = 7
+) -> dict[str, torch.Tensor]:
     positions = (torch.arange(batch_size, dtype=torch.int32) * 17 + 15) % (table_width * 16 - 7)
     return {
         "anchors": torch.arange(100, 100 + batch_size, dtype=torch.int64).to(device),
-        "proposals": (torch.arange(batch_size * 7, dtype=torch.int64).view(batch_size, 7) + 1000).to(device),
+        "proposals": (
+            torch.arange(batch_size * draft_width, dtype=torch.int64).view(batch_size, draft_width) + 1000
+        ).to(device),
         "base_positions": positions.to(device),
         "base_kv_lengths": (positions + 9).to(device),
         "base_block_table": (
@@ -418,29 +422,33 @@ def _check_native_pack(
 @pytest.mark.parametrize("batch_size", [0, 1, 2, 3])
 @pytest.mark.parametrize("graph_rows", [4, 8])
 @pytest.mark.parametrize("suppress", [False, True])
+@pytest.mark.parametrize("draft_width", [5, 7])
 @torch.inference_mode()
 def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
-    batch_size: int, graph_rows: int, suppress: bool
+    batch_size: int, graph_rows: int, suppress: bool, draft_width: int
 ) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
     capacity, table_width = 3, 8195
-    inputs = _native_inputs(capacity, "npu:0", table_width)
+    inputs = _native_inputs(capacity, "npu:0", table_width, draft_width)
     inputs["base_positions"].copy_(torch.tensor([4096 * 16 - 4, 4096 * 16, table_width * 16 - 8], dtype=torch.int32))
     inputs["base_kv_lengths"].copy_(inputs["base_positions"] + 1)
-    confidence = torch.ones(batch_size, 7)
+    confidence = torch.ones(batch_size, draft_width)
     if batch_size:
         confidence[0].fill_(0.05)
-    arena_host = torch.full((88 * capacity,), 199, dtype=torch.uint8)
+    proposal_bytes = 8 * draft_width * batch_size
+    width_offset = 12 * draft_width * batch_size
+    arena_bytes = 12 * draft_width + 4
+    arena_host = torch.full((arena_bytes * capacity,), 199, dtype=torch.uint8)
     proposals = inputs["proposals"].cpu()[:batch_size].contiguous()
-    arena_host[: 56 * batch_size].copy_(proposals.view(torch.uint8).flatten())
-    arena_host[56 * batch_size : 84 * batch_size].copy_(confidence.view(torch.uint8).flatten())
+    arena_host[:proposal_bytes].copy_(proposals.view(torch.uint8).flatten())
+    arena_host[proposal_bytes:width_offset].copy_(confidence.view(torch.uint8).flatten())
     arena = arena_host.to("npu:0")
     control = torch.tensor([batch_size | (int(suppress) << 32)], dtype=torch.int64, device="npu:0")
     offsets = torch.full((capacity + 1,), -99, dtype=torch.int32, device="npu:0")
     outputs = create_verify_buffers(graph_rows, table_width, "npu:0")
-    torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(arena, control, graph_rows)
+    torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(arena, control, graph_rows, draft_width)
     torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(
         inputs["anchors"],
         arena,
@@ -458,14 +466,15 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
         outputs.owners,
         outputs.columns,
         16,
+        draft_width,
     )
-    budget = min(7 * batch_size, graph_rows - batch_size)
+    budget = min(draft_width * batch_size, graph_rows - batch_size)
     widths, reference_offsets = _allocation(confidence, budget)
     arena_actual = arena.cpu()
-    torch.testing.assert_close(arena_actual[84 * batch_size : 88 * batch_size].view(torch.int32), widths)
+    torch.testing.assert_close(arena_actual[width_offset : width_offset + 4 * batch_size].view(torch.int32), widths)
     # Only the compact width region is writable, including B=0 where there
     # are no live regions. Capacity padding must not become an extra request.
-    arena_host[84 * batch_size : 88 * batch_size].copy_(widths.view(torch.uint8).flatten())
+    arena_host[width_offset : width_offset + 4 * batch_size].copy_(widths.view(torch.uint8).flatten())
     torch.testing.assert_close(arena_actual, arena_host, rtol=0, atol=0)
     torch.testing.assert_close(offsets[: batch_size + 1].cpu(), reference_offsets)
     reference = create_verify_buffers(graph_rows, table_width, "cpu")
@@ -483,34 +492,38 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("batch_size", [0, 1, 2, 3, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [0, 1, 2, 3, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("draft_width", [5, 7])
 @torch.inference_mode()
-def test_native_dspark_allocation_and_packing_match_reference(batch_size: int, fraction: float) -> None:
+def test_native_dspark_allocation_and_packing_match_reference(
+    batch_size: int, fraction: float, draft_width: int
+) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
     generator = torch.Generator().manual_seed(107 + batch_size)
-    confidence = torch.rand(batch_size, 7, generator=generator)
-    budget = int(batch_size * 7 * fraction)
+    confidence = torch.rand(batch_size, draft_width, generator=generator)
+    budget = int(batch_size * draft_width * fraction)
     expected_widths, _ = _allocation(confidence, budget)
     widths = torch.empty(batch_size, dtype=torch.int32, device="npu:0")
     offsets = torch.empty(batch_size + 1, dtype=torch.int32, device="npu:0")
     torch.ops.xllm_ops.dspark_allocate_verify_prefixes(confidence.to("npu:0"), widths, budget)
     torch.testing.assert_close(widths.cpu(), expected_widths)
-    inputs = _native_inputs(batch_size, "npu:0")
-    outputs = create_verify_buffers(min(batch_size + budget + 5, 1024), 256, "npu:0")
+    inputs = _native_inputs(batch_size, "npu:0", draft_width=draft_width)
+    outputs = create_verify_buffers(min(batch_size + budget + 5, 128 * (draft_width + 1)), 256, "npu:0")
     _native_pack(inputs, widths, offsets, outputs)
     _check_native_pack(inputs, widths, offsets, outputs, batch_size + budget)
 
 
 @pytest.mark.parametrize("value", [0.0, 1.0])
+@pytest.mark.parametrize("draft_width", [5, 7])
 @torch.inference_mode()
-def test_native_dspark_allocation_resolves_equal_scores_stably(value: float) -> None:
+def test_native_dspark_allocation_resolves_equal_scores_stably(value: float, draft_width: int) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
-    confidence = torch.full((3, 7), value, device="npu:0")
+    confidence = torch.full((3, draft_width), value, device="npu:0")
     widths = torch.empty(3, dtype=torch.int32, device="npu:0")
     torch.ops.xllm_ops.dspark_allocate_verify_prefixes(confidence, widths, 5)
     assert widths.cpu().tolist() == [3, 3, 2]

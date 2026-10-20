@@ -83,7 +83,8 @@ py::object dspark_adaptive_graph_input(const ModelParamsView& params) {
           py::arg("offsets") = input.offsets,
           py::arg("owners") = input.owners,
           py::arg("columns") = input.columns,
-          py::arg("block_size") = input.block_size);
+          py::arg("block_size") = input.block_size,
+          py::arg("draft_width") = input.draft_width);
 }
 
 void register_xllm_runtime_module(py::module_& m) {

@@ -24,9 +24,10 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-constexpr uint32_t kDraftWidth = 7;
-
 bool valid_options(const DSparkBudgetOptions& options) {
+  if (options.draft_width != 5 && options.draft_width != 7) {
+    return false;
+  }
   if (options.cost_scope != DSparkCostScope::VERIFY_TAIL &&
       options.cost_scope != DSparkCostScope::FULL_STEP) {
     return false;
@@ -67,10 +68,12 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
     uint32_t logical_requests,
     uint32_t physical_requests,
     uint32_t requested_graph_rows,
-    std::span<const DSparkGraphCost> prewarmed_graphs) {
-  if (logical_requests == 0 || logical_requests > physical_requests ||
+    std::span<const DSparkGraphCost> prewarmed_graphs,
+    uint32_t draft_width) {
+  if ((draft_width != 5 && draft_width != 7) || logical_requests == 0 ||
+      logical_requests > physical_requests ||
       physical_requests >
-          std::numeric_limits<uint32_t>::max() / (kDraftWidth + 1) ||
+          std::numeric_limits<uint32_t>::max() / (draft_width + 1) ||
       !valid_costs(prewarmed_graphs, /*fixed_time_ms=*/0.0)) {
     return std::nullopt;
   }
@@ -84,7 +87,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
         });
   };
   const auto requested = find_rows(requested_graph_rows);
-  const auto full = find_rows(physical_requests * (kDraftWidth + 1));
+  const auto full = find_rows(physical_requests * (draft_width + 1));
   if (requested == prewarmed_graphs.end() ||
       requested->graph_rows != requested_graph_rows ||
       full == prewarmed_graphs.end()) {
@@ -98,7 +101,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
                                   ? requested_graph_rows
                                   : full->graph_rows;
   return DSparkBudgetPlan{
-      std::min(logical_requests * kDraftWidth, graph_rows - logical_requests),
+      std::min(logical_requests * draft_width, graph_rows - logical_requests),
       graph_rows};
 }
 
@@ -109,9 +112,9 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
     const DSparkBudgetOptions& options,
     std::optional<DSparkBudgetPlan> previous,
     uint64_t rounds_since_full_width) {
-  if (batch_size == 0 ||
-      batch_size > std::numeric_limits<uint32_t>::max() / (kDraftWidth + 1) ||
-      !valid_options(options)) {
+  const uint32_t draft_width = options.draft_width;
+  if (batch_size == 0 || !valid_options(options) ||
+      batch_size > std::numeric_limits<uint32_t>::max() / (draft_width + 1)) {
     return std::nullopt;
   }
   const double fixed_time_ms =
@@ -119,7 +122,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
   if (!valid_costs(prewarmed_costs, fixed_time_ms)) {
     return std::nullopt;
   }
-  const uint32_t max_budget = batch_size * kDraftWidth;
+  const uint32_t max_budget = batch_size * draft_width;
   const uint32_t full_rows = batch_size + max_budget;
   if ((!lagged_conditional_confidence.empty() &&
        lagged_conditional_confidence.size() != max_budget) ||
@@ -174,9 +177,9 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
   path_probabilities.reserve(max_budget);
   for (uint32_t row = 0; row < batch_size; ++row) {
     double path_probability = 1.0;
-    for (uint32_t step = 0; step < kDraftWidth; ++step) {
+    for (uint32_t step = 0; step < draft_width; ++step) {
       path_probability *=
-          lagged_conditional_confidence[row * kDraftWidth + step];
+          lagged_conditional_confidence[row * draft_width + step];
       path_probabilities.emplace_back(path_probability);
     }
   }
@@ -205,7 +208,8 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
       continue;
     }
     // Within the same physical graph, additional prefix rows have no target
-    // cost. Spend all available capacity, bounded by the fixed Draft7 block.
+    // cost. Spend all available capacity, bounded by the configured draft
+    // block.
     const DSparkBudgetPlan candidate{
         std::min(max_budget, cost.graph_rows - batch_size), cost.graph_rows};
     const double candidate_score = score(candidate, cost);

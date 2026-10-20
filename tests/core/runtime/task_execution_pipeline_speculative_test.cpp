@@ -295,8 +295,9 @@ class CountingModel final : public CausalLM {
       const torch::Tensor& previous_tokens) override {
     confidence_hidden.emplace_back(hidden.clone());
     confidence_previous.emplace_back(previous_tokens.clone());
-    return torch::full(
-        {hidden.size(0), 7}, confidence_value, options_.dtype(torch::kFloat32));
+    return torch::full(previous_tokens.sizes(),
+                       confidence_value,
+                       options_.dtype(torch::kFloat32));
   }
 
   void load_model(std::unique_ptr<ModelLoader> /*loader*/) override {}
@@ -389,7 +390,8 @@ class PreparedTestExecutor final : public ExecutorImpl {
       if (adaptive.arena.defined()) {
         counting->adaptive_warmup_bindings.emplace_back(
             adaptive_graph_binding(adaptive, tokens.numel()));
-        EXPECT_EQ(adaptive.arena.numel(), adaptive.anchors.numel() * 88);
+        EXPECT_EQ(adaptive.arena.numel(),
+                  adaptive.anchors.numel() * (12 * adaptive.draft_width + 4));
         EXPECT_EQ(adaptive.control.numel(), 1);
         EXPECT_EQ(adaptive.offsets.numel(), adaptive.anchors.numel() + 1);
         EXPECT_EQ(adaptive.base_block_table.size(0), adaptive.anchors.numel());
@@ -431,7 +433,7 @@ class PreparedTestExecutor final : public ExecutorImpl {
       auto owners = adaptive.owners;
       auto columns = adaptive.columns;
       kernel::npu::tilelang::dspark_allocate_verify_prefixes_graph(
-          arena, adaptive.control, tokens.numel());
+          arena, adaptive.control, tokens.numel(), adaptive.draft_width);
       kernel::npu::tilelang::dspark_pack_verify_inputs_graph(
           adaptive.anchors,
           arena,
@@ -448,7 +450,8 @@ class PreparedTestExecutor final : public ExecutorImpl {
           queries,
           owners,
           columns,
-          adaptive.block_size);
+          adaptive.block_size,
+          adaptive.draft_width);
       if (counting != nullptr) {
         counting->adaptive_forward_bindings.emplace_back(
             adaptive_graph_binding(adaptive, tokens.numel()));
@@ -836,21 +839,31 @@ class SpeculativePipelineTest : public ::testing::Test {
     }
   }
 
-  void configure_adaptive_dspark(bool profiled = true) {
+  void configure_adaptive_dspark(bool profiled = true,
+                                 uint32_t draft_width = 7) {
     configure_dspark_batch_graphs();
+    capacity_.num_speculative_tokens = draft_width;
     capacity_.adaptive_dspark = true;
     capacity_.sparse_dsa_target = true;
     draft_->confidence_head = true;
     auto costs = std::make_shared<DSparkAdaptiveCostCache>();
     if (profiled) {
-      for (const uint32_t draft_rows : {7U, 14U, 28U}) {
+      for (const uint32_t requests : {1U, 2U, 4U}) {
         DSparkAdaptiveCostProfile profile;
-        profile.draft_graph_rows = draft_rows;
+        profile.draft_width = draft_width;
+        profile.draft_graph_rows = requests * draft_width;
         profile.max_kv_length = 32;
         profile.fixed_draft_time_ms = 1.0;
         profile.commit_time_ms = 0.1;
-        profile.target_graph_costs = {
-            {1, 1.0}, {2, 2.0}, {4, 4.0}, {8, 8.0}, {16, 16.0}, {32, 32.0}};
+        profile.target_graph_costs = {{1, 1.0},
+                                      {2, 2.0},
+                                      {4, 4.0},
+                                      {6, 6.0},
+                                      {8, 8.0},
+                                      {12, 12.0},
+                                      {16, 16.0},
+                                      {24, 24.0},
+                                      {32, 32.0}};
         ASSERT_TRUE(costs->store(std::move(profile)));
       }
     }
@@ -925,7 +938,10 @@ class SpeculativePipelineTest : public ::testing::Test {
   }
 
   void warmup_dspark_batch_graphs() {
-    for (uint32_t batch_size = 1; batch_size <= 3; ++batch_size) {
+    for (uint32_t batch_size = 1;
+         batch_size <=
+         std::min<uint32_t>(3, capacity_.common.model.max_sequences);
+         ++batch_size) {
       execute(dspark_batch_input(batch_size, /*decode=*/false));
       auto warmup = dspark_batch_input(batch_size, /*decode=*/true);
       warmup.input_params.meta.is_graph_warmup = true;
@@ -933,7 +949,8 @@ class SpeculativePipelineTest : public ::testing::Test {
       EXPECT_TRUE(output.is_graph_warmup);
       ASSERT_TRUE(output.sample_output.next_tokens.defined());
       EXPECT_EQ(output.sample_output.next_tokens.size(0), batch_size);
-      EXPECT_EQ(output.sample_output.next_tokens.size(1), 8);
+      EXPECT_EQ(output.sample_output.next_tokens.size(1),
+                capacity_.num_speculative_tokens + 1);
     }
   }
 
@@ -2401,6 +2418,27 @@ TEST_F(SpeculativePipelineTest,
 }
 
 TEST_F(SpeculativePipelineTest,
+       AdaptiveDraftFiveSupportsOneRequestSlotAndLaggedFeedback) {
+  configure_adaptive_dspark(/*profiled=*/true, /*draft_width=*/5);
+  capacity_.common.model.max_sequences = 1;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_batch_graphs();
+  execute(dspark_batch_input(1, /*decode=*/false));
+  const size_t warmups = target_->graph_warmup_bindings.size();
+  for (uint32_t round = 0; round < 4; ++round) {
+    const auto output = execute(dspark_batch_input(1, /*decode=*/true));
+    ASSERT_EQ(output.sample_output.next_tokens.size(0), 1);
+    ASSERT_EQ(output.sample_output.next_tokens.size(1), 6);
+    ASSERT_EQ(output.spec_verify_layouts.size(), 1U);
+    EXPECT_LE(output.spec_verify_layouts.front().verify_len, 5);
+    EXPECT_EQ(draft_->confidence_previous.back().size(1), 5);
+  }
+  EXPECT_EQ(target_->graph_warmup_bindings.size(), warmups);
+  pipeline_.reset();
+}
+
+TEST_F(SpeculativePipelineTest,
        AdaptiveDSparkRequiresMeasuredCostsAndFreshRequestFeedback) {
   configure_adaptive_dspark(/*profiled=*/false);
   create();
@@ -2519,7 +2557,7 @@ TEST_F(SpeculativePipelineTest, AdaptiveDSparkRejectsUnsupportedAdmission) {
   };
   EXPECT_FALSE(try_create().ok());
   capacity_.sparse_dsa_target = true;
-  capacity_.num_speculative_tokens = 5;
+  capacity_.num_speculative_tokens = 6;
   EXPECT_FALSE(try_create().ok());
   capacity_.num_speculative_tokens = 7;
   draft_->confidence_head = false;

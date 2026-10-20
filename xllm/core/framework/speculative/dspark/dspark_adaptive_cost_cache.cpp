@@ -22,15 +22,15 @@ limitations under the License.
 namespace xllm {
 
 bool DSparkAdaptiveCostCache::store(DSparkAdaptiveCostProfile profile) {
-  constexpr uint32_t kDraftWidth = 7;
+  const uint32_t draft_width = profile.draft_width;
   const bool valid_scope =
       (profile.cost_scope == DSparkCostScope::VERIFY_TAIL &&
        profile.fixed_draft_time_ms > 0.0) ||
       (profile.cost_scope == DSparkCostScope::FULL_STEP &&
        profile.fixed_draft_time_ms == 0.0 && profile.commit_time_ms == 0.0);
-  if (profile.draft_graph_rows == 0 ||
-      profile.draft_graph_rows % kDraftWidth != 0 ||
-      profile.draft_graph_rows / kDraftWidth > 128 ||
+  if ((draft_width != 5 && draft_width != 7) || profile.draft_graph_rows == 0 ||
+      profile.draft_graph_rows % draft_width != 0 ||
+      profile.draft_graph_rows / draft_width > 128 ||
       profile.min_kv_length == 0 ||
       profile.max_kv_length < profile.min_kv_length ||
       !std::isfinite(profile.fixed_draft_time_ms) || !valid_scope ||
@@ -57,23 +57,27 @@ bool DSparkAdaptiveCostCache::store(DSparkAdaptiveCostProfile profile) {
           [](const DSparkGraphCost& lhs, const DSparkGraphCost& rhs) {
             return lhs.graph_rows >= rhs.graph_rows;
           }) != costs.end() ||
-      costs.back().graph_rows < profile.draft_graph_rows / kDraftWidth * 8) {
+      costs.back().graph_rows <
+          profile.draft_graph_rows / draft_width * (draft_width + 1)) {
     return false;
   }
-  const auto key =
-      std::make_pair(profile.draft_graph_rows, profile.max_kv_length);
+  const auto key = std::make_tuple(
+      draft_width, profile.draft_graph_rows, profile.max_kv_length);
   profiles_.insert_or_assign(key, std::move(profile));
   return true;
 }
 
 std::optional<DSparkAdaptiveCostProfile> DSparkAdaptiveCostCache::lookup(
     uint32_t draft_graph_rows,
-    uint32_t max_kv_length) const {
+    uint32_t max_kv_length,
+    uint32_t draft_width) const {
   if (draft_graph_rows == 0 || max_kv_length == 0) {
     return std::nullopt;
   }
-  const auto found = profiles_.lower_bound({draft_graph_rows, max_kv_length});
-  if (found == profiles_.end() || found->first.first != draft_graph_rows ||
+  const auto found =
+      profiles_.lower_bound({draft_width, draft_graph_rows, max_kv_length});
+  if (found == profiles_.end() || found->second.draft_width != draft_width ||
+      found->second.draft_graph_rows != draft_graph_rows ||
       found->second.min_kv_length > max_kv_length) {
     return std::nullopt;
   }

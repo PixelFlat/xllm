@@ -47,9 +47,10 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
     const DSparkCalibrationCommand& command) {
   std::vector<uint32_t> requests;
   std::vector<uint32_t> graphs;
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
   const auto& first = *slots_.front()->speculative->drafts.front();
   for (const int64_t rows : first.captured_graph_batch_sizes) {
-    if (rows <= 0 || rows % 7 != 0) {
+    if (rows <= 0 || rows % draft_width != 0) {
       return std::nullopt;
     }
     const bool common =
@@ -59,7 +60,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
           return std::binary_search(captured.begin(), captured.end(), rows);
         });
     if (common) {
-      requests.emplace_back(static_cast<uint32_t>(rows / 7));
+      requests.emplace_back(static_cast<uint32_t>(rows / draft_width));
     }
   }
   graphs.reserve(captured_graph_batch_sizes_.size());
@@ -71,7 +72,8 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
         std::min(capacity_.max_kv_seq_len, capacity_.max_positions);
     for (const auto& slot : slots_) {
       const auto& draft = *slot->speculative->drafts.front();
-      const auto captured = draft.captured_graph_kv_capacities.find(batch * 7);
+      const auto captured =
+          draft.captured_graph_kv_capacities.find(batch * draft_width);
       if (captured == draft.captured_graph_kv_capacities.end()) {
         return uint32_t{0};
       }
@@ -92,6 +94,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
                                            {"max_kv_length", kv_bound(batch)}});
       }
       return nlohmann::json{{"request_buckets", requests},
+                            {"draft_width", draft_width},
                             {"target_graph_rows", graphs},
                             {"kv_bounds", std::move(bounds)},
                             {"slot_count", capacity_.slot_count}}
@@ -106,8 +109,8 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
           !data.contains("point") || !data["point"].is_number_unsigned()) {
         return std::nullopt;
       }
-      const auto config =
-          parse_dspark_startup_calibration(data["configuration"].dump());
+      const auto config = parse_dspark_startup_calibration(
+          data["configuration"].dump(), draft_width);
       if (!config) {
         return std::nullopt;
       }
@@ -170,8 +173,8 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
         const auto& covered_requests =
             entry.request_buckets.empty() ? requests : entry.request_buckets;
         for (const uint32_t batch : covered_requests) {
-          const auto full =
-              std::lower_bound(graphs.begin(), graphs.end(), batch * 8);
+          const auto full = std::lower_bound(
+              graphs.begin(), graphs.end(), batch * (draft_width + 1));
           if (!std::binary_search(requests.begin(), requests.end(), batch) ||
               full == graphs.end() ||
               (!entry.request_buckets.empty() &&
@@ -183,7 +186,8 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
             continue;
           }
           DSparkAdaptiveCostProfile profile;
-          profile.draft_graph_rows = batch * 7;
+          profile.draft_width = draft_width;
+          profile.draft_graph_rows = batch * draft_width;
           profile.min_kv_length = entry.min_kv_length;
           profile.max_kv_length =
               std::min(entry.max_kv_length, kv_bound(batch));

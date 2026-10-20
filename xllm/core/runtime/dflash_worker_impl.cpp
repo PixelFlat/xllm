@@ -348,8 +348,10 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
          options.enable_adaptive_speculative_decode() &&
          SpeculativeConfig::is_dspark_algorithm(
              options.speculative_algorithm()) &&
-         options.num_speculative_tokens() == 7))
-      << "DSpark startup calibration options require an adaptive DSpark Draft7 "
+         (options.num_speculative_tokens() == 5 ||
+          options.num_speculative_tokens() == 7)))
+      << "DSpark startup calibration options require an adaptive DSpark "
+         "Draft5/7 "
          "task "
          "pipeline.";
   const bool enable_adaptive = options.enable_adaptive_speculative_decode() &&

@@ -33,9 +33,11 @@ from xllm.python.model_executor.dspark_ragged import (
 from xllm.python.model_executor.dspark_ragged_commit import greedy_verify_commit_out
 
 
-def _inputs(width_values: list[int], rejected_positions: list[int], capacity: int) -> tuple[torch.Tensor, ...]:
+def _inputs(
+    width_values: list[int], rejected_positions: list[int], capacity: int, draft_width: int = 7
+) -> tuple[torch.Tensor, ...]:
     batch_size = len(width_values)
-    proposals = torch.full((batch_size, 7), -999, dtype=torch.int64)
+    proposals = torch.full((batch_size, draft_width), -999, dtype=torch.int64)
     target_ids = []
     offsets = [0]
     owners = []
@@ -61,7 +63,7 @@ def _inputs(width_values: list[int], rejected_positions: list[int], capacity: in
         torch.tensor(owners, dtype=torch.int32),
         torch.tensor(columns, dtype=torch.int32),
         torch.arange(capacity, dtype=torch.int32) + 40,
-        torch.full((batch_size, 8), 777, dtype=torch.int64),
+        torch.full((batch_size, draft_width + 1), 777, dtype=torch.int64),
         torch.full((batch_size,), -77, dtype=torch.int32),
         torch.full((capacity,), 123, dtype=torch.int32),
     )
@@ -69,7 +71,7 @@ def _inputs(width_values: list[int], rejected_positions: list[int], capacity: in
 
 def _oracle(inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     proposals, target_ids, widths, offsets, owners, columns, source_slots = inputs[:7]
-    tokens = torch.full((proposals.shape[0], 8), -1, dtype=torch.int64)
+    tokens = torch.full((proposals.shape[0], proposals.shape[1] + 1), -1, dtype=torch.int64)
     lengths = torch.empty(proposals.shape[0], dtype=torch.int32)
     context_slots = torch.full(source_slots.shape, -1, dtype=torch.int32)
     for request, width in enumerate(widths.tolist()):
@@ -209,13 +211,32 @@ def _assert_npu_outputs(inputs: tuple[torch.Tensor, ...], expected: tuple[torch.
         torch.testing.assert_close(actual.cpu(), reference)
 
 
-@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
-@pytest.mark.parametrize("batch_size", [1, 2, 3, 16])
-@pytest.mark.parametrize("first_reject", range(8))
+@pytest.mark.parametrize("draft_width", [5, 7])
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
 @torch.inference_mode()
-def test_npu_greedy_commit_matches_reference_at_every_rejection(batch_size: int, first_reject: int) -> None:
-    widths = [8] + [1 + (index - 1) % 8 for index in range(1, batch_size)]
-    cpu_inputs = _inputs(widths, [min(first_reject, width - 1) for width in widths], batch_size * 8)
+def test_reference_commit_supports_both_widths_at_every_rejection(draft_width: int, batch_size: int) -> None:
+    for first_reject in range(draft_width + 1):
+        widths = [draft_width + 1] + [1 + index % (draft_width + 1) for index in range(1, batch_size)]
+        inputs = _inputs(
+            widths, [min(first_reject, width - 1) for width in widths], batch_size * (draft_width + 1), draft_width
+        )
+        expected = _oracle(inputs)
+        greedy_verify_commit_out(*inputs)
+        _assert_npu_outputs(inputs, expected)
+
+
+@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 8, 16])
+@pytest.mark.parametrize("first_reject", range(8))
+@pytest.mark.parametrize("draft_width", [5, 7])
+@torch.inference_mode()
+def test_npu_greedy_commit_matches_reference_at_every_rejection(
+    batch_size: int, first_reject: int, draft_width: int
+) -> None:
+    widths = [draft_width + 1] + [1 + (index - 1) % (draft_width + 1) for index in range(1, batch_size)]
+    cpu_inputs = _inputs(
+        widths, [min(first_reject, width - 1) for width in widths], batch_size * (draft_width + 1), draft_width
+    )
     expected = _oracle(cpu_inputs)
     inputs = tuple(tensor.to("npu:0") for tensor in cpu_inputs)
     addresses = tuple(tensor.data_ptr() for tensor in inputs)
@@ -228,12 +249,16 @@ def test_npu_greedy_commit_matches_reference_at_every_rejection(batch_size: int,
 
 
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
-@pytest.mark.parametrize("batch_size,capacity", [(128, 1024), (1, 1024), (3, 64)])
+@pytest.mark.parametrize("batch_size,capacity_scale", [(128, 128), (1, 128), (3, 8)])
+@pytest.mark.parametrize("draft_width", [5, 7])
 @torch.inference_mode()
-def test_npu_maximum_and_padded_capacity_dispatch_matches_reference(batch_size: int, capacity: int) -> None:
-    widths = [1 + index % 8 for index in range(batch_size)]
+def test_npu_maximum_and_padded_capacity_dispatch_matches_reference(
+    batch_size: int, capacity_scale: int, draft_width: int
+) -> None:
+    capacity = capacity_scale * (draft_width + 1)
+    widths = [1 + index % (draft_width + 1) for index in range(batch_size)]
     rejections = [min(index % 5, width - 1) for index, width in enumerate(widths)]
-    cpu_inputs = _inputs(widths, rejections, capacity)
+    cpu_inputs = _inputs(widths, rejections, capacity, draft_width)
     expected = _oracle(cpu_inputs)
     inputs = tuple(tensor.to("npu:0") for tensor in cpu_inputs)
     addresses = tuple(tensor.data_ptr() for tensor in inputs)

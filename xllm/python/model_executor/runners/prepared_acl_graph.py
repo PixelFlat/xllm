@@ -130,7 +130,11 @@ class PreparedAclGraphRunner(AclGraphRunner):
 
         counts = tuple(getattr(metadata, "dp_execution_token_counts", ()))
         phases = tuple(getattr(metadata, "dp_is_decode", ()))
-        dspark_binding = () if dspark_adaptive is None else ("adaptive_dspark", dspark_adaptive.block_size)
+        dspark_binding = (
+            ()
+            if dspark_adaptive is None
+            else ("adaptive_dspark", dspark_adaptive.block_size, dspark_adaptive.draft_width)
+        )
         return addresses + dspark_binding + ((counts, phases) if len(counts) > 1 else ())
 
     def _validate_dspark_graph_inputs(
@@ -148,10 +152,12 @@ class PreparedAclGraphRunner(AclGraphRunner):
             raise ValueError("adaptive DSpark inputs must use the graph runner device")
         if inputs.anchors.ndim != 1 or not 1 <= inputs.anchors.numel() <= 128:
             raise ValueError("adaptive DSpark requires request capacity in [1, 128]")
+        if not isinstance(inputs.draft_width, int) or inputs.draft_width not in (5, 7):
+            raise ValueError("adaptive DSpark draft_width must be 5 or 7")
         capacity = inputs.anchors.numel()
         graph_rows = input_ids.numel()
-        if graph_rows > 1024:
-            raise ValueError("adaptive DSpark graph capacity exceeds 1024 rows")
+        if graph_rows > 128 * (inputs.draft_width + 1):
+            raise ValueError("adaptive DSpark graph capacity exceeds the compiled draft-width limit")
         if inputs.base_block_table.ndim != 2 or inputs.base_block_table.shape[0] != capacity:
             raise ValueError("adaptive DSpark requires a block table per request-capacity row")
         table_width = inputs.base_block_table.shape[1]
@@ -167,7 +173,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if inputs.block_size != self.attention_backend.logical_page_size:
             raise ValueError("adaptive DSpark block size must match the target attention backend")
         for name, tensor, shape, dtype in (
-            ("arena", inputs.arena, (88 * capacity,), torch.uint8),
+            ("arena", inputs.arena, ((12 * inputs.draft_width + 4) * capacity,), torch.uint8),
             ("control", inputs.control, (1,), torch.int64),
             ("anchors", inputs.anchors, (capacity,), torch.int64),
             ("base positions", inputs.base_positions, (capacity,), torch.int32),
@@ -413,7 +419,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if isinstance(entry, _PreparedDSparkGraphEntry):
             inputs = entry.dspark_adaptive
             metadata = entry.static_metadata
-            torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(inputs.arena, inputs.control, entry.batch_size)
+            torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(
+                inputs.arena, inputs.control, entry.batch_size, inputs.draft_width
+            )
             torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(
                 inputs.anchors,
                 inputs.arena,
@@ -431,6 +439,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 inputs.owners,
                 inputs.columns,
                 inputs.block_size,
+                inputs.draft_width,
             )
         if isinstance(entry, _PreparedBlockGraphEntry):
             table = entry.static_metadata.block_table

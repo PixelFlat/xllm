@@ -656,7 +656,7 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor(a!) widths, int budget) -> ()");
   m.def(
       "dspark_allocate_verify_prefixes_graph(Tensor(a!) arena, "
-      "Tensor control, int capacity) -> ()");
+      "Tensor control, int capacity, int draft_width=7) -> ()");
   m.def(
       "dspark_pack_verify_inputs(Tensor anchors, Tensor proposals, "
       "Tensor base_positions, Tensor base_kv_lengths, Tensor base_block_table, "
@@ -670,7 +670,7 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor control, Tensor(a!) offsets, Tensor(b!) tokens, "
       "Tensor(c!) positions, Tensor(d!) kv_seq_lens, Tensor(e!) slot_mapping, "
       "Tensor(f!) block_table, Tensor(g!) q_seq_lens, Tensor(h!) owners, "
-      "Tensor(i!) columns, int block_size) -> ()");
+      "Tensor(i!) columns, int block_size, int draft_width=7) -> ()");
   m.def(
       "dspark_greedy_verify_commit(Tensor proposals, Tensor target_tokens, "
       "Tensor widths, Tensor offsets, Tensor owners, Tensor columns, "

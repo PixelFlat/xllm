@@ -32,10 +32,7 @@ namespace xllm::kernel::npu::tilelang {
 namespace {
 #include XLLM_TL_DSPARK_GREEDY_VERIFY_COMMIT_REGISTRY_INC
 
-constexpr int64_t kDraftTokens = 7;
-constexpr int64_t kResultWidth = kDraftTokens + 1;
 constexpr int64_t kMaxBatchSize = 128;
-constexpr int64_t kMaxCapacity = kMaxBatchSize * kResultWidth;
 constexpr int64_t kRowsPerCore = 64;
 
 void check_vector(const torch::Tensor& tensor,
@@ -84,17 +81,20 @@ bool spans_overlap(const torch::Tensor& first, const torch::Tensor& second) {
 
 DsparkGreedyVerifyCommitSpecialization build_runtime_specialization(
     int64_t batch_size,
-    int64_t capacity) {
-  // G may include DP padding beyond 8*logical B. The generated UB target
+    int64_t capacity,
+    int64_t draft_width) {
+  const int64_t result_width = draft_width + 1;
+  // G may include graph padding beyond (draft_width+1)*logical B. The UB target
   // buffer must cover physical G, including an idle shard with B=0.
   const int64_t required =
-      std::max(batch_size, (capacity + kResultWidth - 1) / kResultWidth);
+      std::max(batch_size, (capacity + result_width - 1) / result_width);
   int32_t bucket = 1;
   while (bucket < required) {
     bucket *= 2;
   }
   return make_dspark_greedy_verify_commit_specialization(
-      DsparkGreedyVerifyCommitMaxBatchSize{bucket});
+      DsparkGreedyVerifyCommitMaxBatchSize{bucket},
+      DsparkGreedyVerifyCommitDraftWidth{static_cast<int32_t>(draft_width)});
 }
 }  // namespace
 
@@ -114,20 +114,23 @@ void dspark_greedy_verify_commit(const torch::Tensor& proposals,
   const torch::Device device = proposals.device();
   CHECK_GE(device.index(), 0);
   const int64_t batch_size = proposals.size(0);
+  const int64_t draft_width = proposals.size(1);
+  CHECK(draft_width == 5 || draft_width == 7);
+  const int64_t result_width = draft_width + 1;
   CHECK_LE(batch_size, kMaxBatchSize);
-  check_matrix(proposals, device, torch::kInt64, batch_size, kDraftTokens);
+  check_matrix(proposals, device, torch::kInt64, batch_size, draft_width);
   CHECK(target_tokens.defined());
   CHECK_EQ(target_tokens.dim(), 1);
   const int64_t capacity = target_tokens.size(0);
   CHECK_GE(capacity, batch_size);
-  CHECK_LE(capacity, kMaxCapacity);
+  CHECK_LE(capacity, kMaxBatchSize * result_width);
   check_vector(target_tokens, device, torch::kInt64, capacity);
   check_vector(widths, device, torch::kInt32, batch_size);
   check_vector(offsets, device, torch::kInt32, batch_size + 1);
   for (const torch::Tensor* tensor : {&owners, &columns, &source_slots}) {
     check_vector(*tensor, device, torch::kInt32, capacity);
   }
-  check_matrix(result_tokens, device, torch::kInt64, batch_size, kResultWidth);
+  check_matrix(result_tokens, device, torch::kInt64, batch_size, result_width);
   check_vector(result_lengths, device, torch::kInt32, batch_size);
   check_vector(context_slots, device, torch::kInt32, capacity);
   const std::array<const torch::Tensor*, 7> inputs = {&proposals,
@@ -154,10 +157,11 @@ void dspark_greedy_verify_commit(const torch::Tensor& proposals,
     CHECK_EQ(batch_size, 0);
     return;
   }
-  // The allocator/packer guarantees widths in [1,8], consistent offsets,
-  // and owner/column bounds. These Device values never select Host launches.
+  // The allocator/packer guarantees widths in [1,draft_width+1], consistent
+  // offsets, and owner/column bounds. These Device values never select Host
+  // launches.
   const auto specialization =
-      build_runtime_specialization(batch_size, capacity);
+      build_runtime_specialization(batch_size, capacity, draft_width);
   const auto* entry =
       find_dspark_greedy_verify_commit_kernel_entry(specialization);
   CHECK(entry != nullptr)
