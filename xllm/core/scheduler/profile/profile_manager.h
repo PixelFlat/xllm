@@ -30,12 +30,14 @@ limitations under the License.
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/request/request.h"
 #include "core/framework/request/sequence.h"
+#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
 #include "core/runtime/options.h"
 #include "core/scheduler/profile/decode_graph_warmup_plan.h"
 #include "core/scheduler/profile/time_predictor.h"
 
 namespace xllm {
 class DistributedWorkerManager;
+class SpeculativeConfig;
 
 std::vector<int32_t> build_step_time_profile_batch_sizes(
     int32_t max_seqs_per_batch);
@@ -46,6 +48,13 @@ std::vector<int32_t> build_step_time_profile_batch_sizes(
 // default 16 to keep measured memory aligned with real captures.
 int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len);
 
+// The adaptive DSpark task pipeline profiles its warmed graph buckets itself.
+// Other speculative paths still consume the legacy validate-time predictor.
+bool should_profile_legacy_speculative_validate(
+    const SpeculativeConfig& speculative_config,
+    bool enable_task_pipeline);
+
+std::string dspark_calibration_compatibility(const runtime::Options& options);
 class ProfileManager {
  private:
   using StepCallback = std::function<ForwardOutput(BatchGroup&)>;
@@ -54,6 +63,13 @@ class ProfileManager {
  public:
   struct Options {
     PROPERTY(bool, enable_schedule_overlap) = false;
+
+    PROPERTY(bool, enable_task_pipeline) = false;
+    PROPERTY(bool, enable_adaptive_dspark) = false;
+    PROPERTY(std::string, adaptive_dspark_calibration);
+    PROPERTY(std::string, adaptive_dspark_cost_table);
+    PROPERTY(std::string, adaptive_dspark_cost_table_output);
+    PROPERTY(std::string, dspark_calibration_compatibility);
 
     PROPERTY(int32_t, dp_size) = 1;
 
@@ -201,9 +217,8 @@ class ProfileManager {
 
   void profile_token_budget();
 
-  // True when the validate-time predictor should be profiled: adaptive
-  // speculative decode enabled, SL > 1, and a supported algorithm. The
-  // predictor has no consumer otherwise.
+  // Profile only speculative paths that consume the legacy predictor, not
+  // adaptive DSpark task pipelines with their own graph-bucket measurements.
   bool should_profile_speculative_validate() const;
 
   void profile_speculative_validate_time();
@@ -260,6 +275,12 @@ class ProfileManager {
       StepCallback step_callback,
       ResultCallback result_callback,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager);
+
+  void calibrate_dspark_startup();
+
+  const DSparkStartupCalibrationConfig& dspark_calibration_config();
+  int32_t dspark_calibration_warmup_seq_len(int32_t default_length);
+  std::optional<DSparkStartupCalibrationConfig> dspark_calibration_config_;
 
   std::unique_ptr<TimePredictor> prefill_time_predictor_;
   std::unique_ptr<TimePredictor> decode_time_predictor_;

@@ -19,7 +19,11 @@ limitations under the License.
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
+#include <cmath>
 #include <limits>
+#include <nlohmann/json.hpp>
 
 #include "core/common/metrics.h"
 #include "core/framework/parallel_state/process_group.h"
@@ -28,6 +32,9 @@ limitations under the License.
 #include "core/framework/sampling/gumbel_sampling.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
+#if defined(USE_NPU)
+#include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#endif
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #include "core/runtime/decode_graph_bucket.h"
@@ -162,14 +169,72 @@ uint64_t state_bytes(const MtpContextTensors& state) {
   return bytes;
 }
 
+bool neutral_host_values(const torch::Tensor& tensor, float neutral) {
+  if (!tensor.defined() || tensor.numel() == 0) {
+    return true;
+  }
+  if (!tensor.device().is_cpu()) {
+    return false;
+  }
+  const torch::Tensor values = tensor.to(torch::kFloat32).contiguous();
+  const float* begin = values.const_data_ptr<float>();
+  return std::all_of(begin, begin + values.numel(), [neutral](float value) {
+    return value == neutral;
+  });
+}
+
+bool adaptive_greedy_sampling(const SamplingParameters& sampling) {
+  if (sampling.sampling_mode != SamplingMode::GREEDY ||
+      sampling.logprobs || sampling.max_top_logprobs != 0 ||
+      sampling.use_beam_search || sampling.is_embeddings ||
+      sampling.num_return_sequences != 0 || sampling.acc_logprob.defined() ||
+      (sampling.filter_mask.defined() && sampling.filter_mask.numel() != 0) ||
+      (sampling.filter_bitmask.defined() &&
+       sampling.filter_bitmask.numel() != 0) ||
+      !neutral_host_values(sampling.frequency_penalties, /*neutral=*/0.0F) ||
+      !neutral_host_values(sampling.presence_penalties, /*neutral=*/0.0F) ||
+      !neutral_host_values(sampling.repetition_penalties, /*neutral=*/1.0F)) {
+    return false;
+  }
+  if (!sampling.do_sample.defined() || sampling.do_sample.numel() == 0) {
+    return true;
+  }
+  if (!sampling.do_sample.device().is_cpu() ||
+      sampling.do_sample.scalar_type() != torch::kBool) {
+    return false;
+  }
+  const torch::Tensor values = sampling.do_sample.contiguous();
+  const bool* begin = values.const_data_ptr<bool>();
+  return std::none_of(
+      begin, begin + values.numel(), [](bool value) { return value; });
+}
+
+uint64_t dspark_graph_kv_capacity(const LlmTaskCapacity& capacity,
+                                  uint32_t query_width,
+                                  int32_t maximum_kv_length) {
+  // Match PreparedAclGraphRunner.warmup_prepared's compact block-draft
+  // table: at least 16 context pages plus the query, then round to a power
+  // of two and clamp to the fixed Slot table width. Repeated warmup of the
+  // same binding does not enlarge the already captured Python table.
+  const uint64_t page_size = capacity.logical_block_size;
+  const uint64_t required_pages =
+      (static_cast<uint64_t>(maximum_kv_length) + page_size - 1) / page_size;
+  const uint64_t minimum_pages =
+      16 + (static_cast<uint64_t>(query_width) + page_size - 1) / page_size;
+  const uint64_t pages =
+      std::min(std::bit_ceil(std::max(required_pages, minimum_pages)),
+               static_cast<uint64_t>(capacity.model.max_blocks_per_sequence));
+  return pages * page_size;
+}
+
 }  // namespace
 
 bool supports_unified_block_graph(const SpeculativeTaskCapacity& capacity,
                                   uint32_t rows,
                                   const LlmForwardInput& input) {
   const auto& sampling = input.sampling_params;
-  return capacity.unified_graph && capacity.kind != SpeculativeTaskKind::MTP &&
-         rows > 0 &&
+  return capacity.unified_graph && !capacity.adaptive_dspark &&
+         capacity.kind != SpeculativeTaskKind::MTP && rows > 0 &&
          static_cast<uint64_t>(rows) *
                  (static_cast<uint64_t>(capacity.num_speculative_tokens) + 1) <=
              capacity.common.max_graph_batch_size &&
@@ -193,11 +258,36 @@ Status TaskExecutionPipeline::create(
       static_cast<uint64_t>(capacity.num_speculative_tokens) + 1;
   const uint64_t rows =
       static_cast<uint64_t>(common.model.max_sequences) * width;
-  if (capacity.kind == SpeculativeTaskKind::DSPARK &&
-      (common.dp_size != 1 || common.model.max_sequences != 1)) {
+  if (capacity.kind == SpeculativeTaskKind::DSPARK && common.dp_size != 1) {
+    return invalid("DSpark task pipeline requires DP=1.");
+  }
+  if (capacity.startup_calibration &&
+      (!capacity.adaptive_dspark || capacity.adaptive_costs)) {
     return invalid(
-        "DSpark task pipeline currently requires DP=1 and single-request "
-        "capacity.");
+        "Internal DSpark startup calibration requires adaptive graphs "
+        "without an injected startup cost cache.");
+  }
+  if (capacity.adaptive_dspark &&
+      (!Platform::is_npu() || capacity.kind != SpeculativeTaskKind::DSPARK ||
+       capacity.num_speculative_tokens != 7 || !capacity.sparse_dsa_target ||
+       !common.enable_mla || common.max_graph_batch_size == 0 ||
+       common.model.max_sequences > 128 ||
+       capacity.draft_sampling_mode != DraftSamplingMode::GREEDY ||
+       !std::isfinite(capacity.adaptive_min_gain) ||
+       capacity.adaptive_min_gain < 0.0 ||
+       !draft.model.has_dspark_confidence_head())) {
+    return invalid(
+        "Adaptive task pipeline requires NPU DSpark Draft7, sparse DSA "
+        "Target graphs, a ConfidenceHead, greedy sampling and supported "
+        "request/page capacity.");
+  }
+  if (capacity.adaptive_dspark &&
+      (rows * common.model.max_blocks_per_sequence >
+           std::numeric_limits<int32_t>::max() ||
+       static_cast<uint64_t>(common.logical_block_size) *
+               common.model.max_blocks_per_sequence >
+           std::numeric_limits<int32_t>::max())) {
+    return invalid("Adaptive DSpark block tables exceed INT32 indexing.");
   }
   if (common.enable_kv_push && (capacity.kind != SpeculativeTaskKind::MTP ||
                                 !target.push_kv || !draft.push_kv)) {
@@ -276,6 +366,14 @@ Status TaskExecutionPipeline::initialize_speculative() {
   captured_graph_batch_sizes_.reserve(graph_batch_sizes_.size());
   const auto options = model_.options();
   const auto pinned = options.device(torch::kCPU).pinned_memory(true);
+  if (speculative_capacity_->adaptive_dspark) {
+    dspark_adaptive_ = std::make_unique<DSparkAdaptiveState>();
+    if (!speculative_capacity_->adaptive_costs) {
+      dspark_adaptive_->owned_costs =
+          std::make_shared<DSparkAdaptiveCostCache>();
+      speculative_capacity_->adaptive_costs = dspark_adaptive_->owned_costs;
+    }
+  }
   SlotBufferCapacity base_capacity{c.model,
                                    c.max_unique_tokens,
                                    c.vocab_size,
@@ -337,10 +435,45 @@ Status TaskExecutionPipeline::initialize_speculative() {
     } else {
       slot->draft_first_indices = torch::arange(count, indices).mul(2).add(1);
     }
-    slot->proposal_storage =
-        torch::empty({count * (width - 1)}, options.dtype(torch::kInt64));
+    if (dspark_adaptive_) {
+      slot->target_token_storage =
+          torch::empty({expanded}, options.dtype(torch::kInt64));
+      slot->adaptive = std::make_unique<SpeculativeSlot::Adaptive>();
+      auto& adaptive = *slot->adaptive;
+      adaptive.arena_storage = torch::empty({static_cast<int64_t>(count) * 88},
+                                            options.dtype(torch::kUInt8));
+      adaptive.host_feedback_storage = torch::empty(
+          {static_cast<int64_t>(count) * 32}, pinned.dtype(torch::kUInt8));
+      adaptive.previous_storage =
+          torch::empty({count, 7}, options.dtype(torch::kInt64));
+      adaptive.offsets_storage =
+          torch::empty({count + 1}, options.dtype(torch::kInt32));
+      adaptive.owners_storage =
+          torch::empty({expanded}, options.dtype(torch::kInt32));
+      adaptive.columns_storage =
+          torch::empty({expanded}, options.dtype(torch::kInt32));
+      adaptive.embedding_ids.reserve(count);
+      adaptive.request_ids.reserve(count);
+      adaptive.lagged_confidence.reserve(count * 7);
+      adaptive.draft_counts.reserve(count);
+    } else {
+      slot->proposal_storage =
+          torch::empty({count * (width - 1)}, options.dtype(torch::kInt64));
+    }
     slot->accepted_mask_storage =
         torch::empty({expanded}, options.dtype(torch::kBool));
+    if (slot->adaptive) {
+      // Adaptive commit never uses the fixed-width rejection mask. Borrow its
+      // first eight bytes rather than allocate another Device control buffer.
+      slot->adaptive->control =
+          prefix(slot->accepted_mask_storage, /*count=*/8).view(torch::kInt64);
+      // Consume copies feedback into owned history before releasing this Slot.
+      // Prepare's control H2D precedes Launch and the next feedback D2H, so
+      // this pinned prefix can be reused without overlapping either DMA reader.
+      slot->adaptive->host_control =
+          prefix(slot->adaptive->host_feedback_storage, /*count=*/8)
+              .view(torch::kInt64);
+    }
     slot->host_hidden_storage =
         torch::empty({count, context_hidden_size()}, pinned);
     if (block_draft()) {
@@ -393,6 +526,14 @@ Status TaskExecutionPipeline::initialize_speculative() {
       if (!block_draft()) {
         invocation->graph_batch_sizes = decode_graph_batch_sizes(
             max_batch_size / width * rows_per_sequence);
+        invocation->captured_graph_batch_sizes.reserve(
+            invocation->graph_batch_sizes.size());
+      } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
+        invocation->graph_batch_sizes =
+            decode_graph_batch_sizes(max_batch_size / width);
+        for (int64_t& request_bucket : invocation->graph_batch_sizes) {
+          request_bucket *= rows_per_sequence;
+        }
         invocation->captured_graph_batch_sizes.reserve(
             invocation->graph_batch_sizes.size());
       }
@@ -540,6 +681,11 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!status.ok()) {
     return status;
   }
+  if (slot.adaptive && !adaptive_greedy_sampling(input.sampling_params)) {
+    return invalid(
+        "Adaptive DSpark task pipeline requires greedy requests without "
+        "log probabilities, structured sampling or non-neutral penalties.");
+  }
 
   const auto& c = speculative_capacity_->common;
   const uint64_t count = host.q_seq_lens.size();
@@ -602,6 +748,14 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     auto& draft = *slot.drafts[step];
     draft.padded_batch_size = task_graph_batch_size(
         draft.input->model_params().parallel, draft.captured_graph_batch_sizes);
+  }
+  if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+      capacity_.max_graph_batch_size != 0 && slot.decode && count != 0 &&
+      !input.input_params.meta.is_graph_warmup &&
+      (slot.target_padded_batch_size == 0 ||
+       slot.drafts.front()->padded_batch_size == 0)) {
+    return invalid(
+        "DSpark graph task requires prewarmed Target and Draft batch buckets.");
   }
   slot.rows = static_cast<uint32_t>(count);
   slot.model_tokens = static_cast<uint32_t>(host.token_ids.size());
@@ -720,6 +874,176 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
       return status;
     }
   }
+  if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+      capacity_.max_graph_batch_size != 0) {
+    const auto& invocation = *slot.drafts.front();
+    const uint32_t graph_rows =
+        input.input_params.meta.is_graph_warmup
+            ? task_graph_batch_size(invocation.input->model_params().parallel,
+                                    invocation.graph_batch_sizes)
+            : invocation.padded_batch_size;
+    const auto captured =
+        invocation.captured_graph_kv_capacities.find(graph_rows);
+    const int32_t maximum_kv_length = *std::max_element(
+        invocation.input->input_scratch_->planned_.kv_seq_lens.begin(),
+        invocation.input->input_scratch_->planned_.kv_seq_lens.end());
+    if ((!input.input_params.meta.is_graph_warmup &&
+         captured == invocation.captured_graph_kv_capacities.end()) ||
+        (captured != invocation.captured_graph_kv_capacities.end() &&
+         static_cast<uint64_t>(maximum_kv_length) > captured->second)) {
+      return invalid(
+          "DSpark graph task KV length exceeds its first warmed compact "
+          "Draft table; a wider startup graph binding is required.");
+    }
+  }
+  if (slot.adaptive) {
+    if (input.input_params.meta.is_graph_warmup) {
+      slot.adaptive->plan = {
+          slot.rows * 7,
+          task_graph_batch_size(slot.validate_input->model_params().parallel,
+                                graph_batch_sizes_)};
+      slot.adaptive->max_kv_length =
+          static_cast<uint32_t>(*std::max_element(
+              slot.upper_kv_lengths.begin(), slot.upper_kv_lengths.end())) +
+          7;
+      return Status();
+    }
+    return plan_adaptive_dspark(slot, input);
+  }
+  return Status();
+}
+
+Status TaskExecutionPipeline::plan_adaptive_dspark(
+    SpeculativeSlot& slot,
+    const LlmForwardInput& input) {
+  CHECK(slot.adaptive != nullptr);
+  auto& adaptive = *slot.adaptive;
+  const uint64_t generation = next_task_id_;
+  const uint64_t eligible_generation = generation > 2 ? generation - 2 : 0;
+  // Engine coordinated submission retires n-2 on every sampling rank before
+  // Step(n) admission (ContinuousScheduler::step_with_schedule_overlap and
+  // LLMEngine::update_last_step_result). Never use opportunistic n-1 feedback:
+  // its availability can differ between rank-local state executors.
+  if (dspark_adaptive_->retired_generation < eligible_generation) {
+    return invalid(
+        "Adaptive DSpark requires coordinated retirement through Task n-2.");
+  }
+  const auto& embedding_ids = input.input_params.embedding.embedding_ids;
+  const auto& request_ids = input.input_params.embedding.request_ids;
+  adaptive.lagged_confidence.clear();
+  uint64_t rounds_since_full_width = 0;
+  bool complete_feedback = eligible_generation != 0;
+  for (uint32_t row = 0; row < slot.rows; ++row) {
+    const int32_t id = embedding_ids[row];
+    if (id <= 0 ||
+        static_cast<uint64_t>(id) >= dspark_adaptive_->histories.size()) {
+      complete_feedback = false;
+      continue;
+    }
+    const auto& history = dspark_adaptive_->histories[id];
+    const DSparkAdaptiveState::Feedback* feedback = nullptr;
+    for (const auto& version : history.versions) {
+      if (version.generation != 0 &&
+          version.generation <= eligible_generation &&
+          (feedback == nullptr || version.generation > feedback->generation)) {
+        feedback = &version;
+      }
+    }
+    if (history.request_id != request_ids[row] || feedback == nullptr) {
+      complete_feedback = false;
+      continue;
+    }
+    adaptive.lagged_confidence.insert(adaptive.lagged_confidence.end(),
+                                      feedback->confidence.begin(),
+                                      feedback->confidence.end());
+    rounds_since_full_width =
+        std::max(rounds_since_full_width, feedback->rounds_since_full_width);
+  }
+  if (!complete_feedback) {
+    adaptive.lagged_confidence.clear();
+  }
+  adaptive.max_kv_length =
+      static_cast<uint32_t>(*std::max_element(slot.upper_kv_lengths.begin(),
+                                              slot.upper_kv_lengths.end())) +
+      7;
+  std::vector<DSparkGraphCost> costs;
+  costs.reserve(captured_graph_batch_sizes_.size());
+  for (const int64_t graph_rows : captured_graph_batch_sizes_) {
+    costs.emplace_back(DSparkGraphCost{static_cast<uint32_t>(graph_rows), 0.0});
+  }
+  DSparkBudgetOptions options;
+  options.min_gain = speculative_capacity_->adaptive_min_gain;
+  const auto profile = speculative_capacity_->adaptive_costs->lookup(
+      slot.drafts.front()->padded_batch_size, adaptive.max_kv_length);
+  if (profile) {
+    options.cost_scope = profile->cost_scope;
+    options.fixed_draft_time_ms = profile->fixed_draft_time_ms;
+    options.commit_time_ms = profile->commit_time_ms;
+    for (auto& cost : costs) {
+      const auto profiled =
+          std::lower_bound(profile->target_graph_costs.begin(),
+                           profile->target_graph_costs.end(),
+                           cost.graph_rows,
+                           [](const DSparkGraphCost& candidate, uint32_t rows) {
+                             return candidate.graph_rows < rows;
+                           });
+      if (profiled != profile->target_graph_costs.end() &&
+          profiled->graph_rows == cost.graph_rows) {
+        cost.target_time_ms = profiled->target_time_ms;
+      }
+    }
+  }
+  std::optional<DSparkBudgetPlan> previous;
+  uint64_t previous_generation = 0;
+  for (const auto& retired : dspark_adaptive_->retired_plans) {
+    if (retired.generation != 0 && retired.generation <= eligible_generation &&
+        retired.generation > previous_generation &&
+        retired.embedding_ids == embedding_ids &&
+        retired.request_ids == request_ids) {
+      previous = retired.plan;
+      previous_generation = retired.generation;
+    }
+  }
+  std::optional<DSparkBudgetPlan> plan;
+  if (dspark_adaptive_->calibration_point) {
+    const uint32_t graph_rows =
+        dspark_adaptive_->calibration_point->target_graph_rows;
+    const uint32_t physical_requests =
+        slot.drafts.front()->padded_batch_size / 7;
+    plan = DSparkBudgetPlanner::calibration_plan(
+        slot.rows, physical_requests, graph_rows, costs);
+    if (!plan) {
+      return invalid(
+          "DSpark calibration requires a known G and prewarmed full-width "
+          "capacity for the physical draft request bucket.");
+    }
+  } else {
+    plan = DSparkBudgetPlanner::plan(slot.rows,
+                                     adaptive.lagged_confidence,
+                                     costs,
+                                     options,
+                                     previous,
+                                     rounds_since_full_width);
+  }
+  if (!plan) {
+    return invalid("Adaptive DSpark requires a prewarmed full-width graph.");
+  }
+  adaptive.plan = *plan;
+  adaptive.generation = generation;
+  adaptive.generated_draft_tokens = slot.rows * 7;
+  adaptive.selected_draft_tokens = plan->draft_budget;
+  VLOG(1) << "DSpark adaptive budget: B=" << slot.rows
+          << ", generated=" << adaptive.generated_draft_tokens
+          << ", selected_K=" << adaptive.selected_draft_tokens
+          << ", physical_G=" << plan->graph_rows;
+  adaptive.embedding_ids.assign(embedding_ids.begin(), embedding_ids.end());
+  adaptive.request_ids.assign(request_ids.begin(), request_ids.end());
+  slot.target_padded_batch_size = plan->graph_rows;
+  auto& parallel = slot.validate_input->model_params().parallel;
+  parallel.raw_dp_global_token_nums = {
+      static_cast<int32_t>(slot.rows + plan->draft_budget)};
+  parallel.dp_global_token_nums = {static_cast<int32_t>(plan->graph_rows)};
+  parallel.dp_is_decode = {1};
   return Status();
 }
 
@@ -738,6 +1062,18 @@ Status TaskExecutionPipeline::plan_sampling(SpeculativeSlot& slot,
     if (selected[row] != static_cast<int32_t>(row)) {
       return invalid("MTP Decode sampling rows must be in sequence order.");
     }
+  }
+  if (slot.adaptive) {
+    const auto indices =
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    const uint32_t graph_rows = slot.adaptive->plan.graph_rows;
+    slot.host_validate_sampling = SamplingParameters();
+    slot.host_validate_sampling.selected_token_idxes =
+        torch::arange(graph_rows, indices);
+    slot.host_validate_sampling.sample_idxes =
+        slot.host_validate_sampling.selected_token_idxes;
+    return slot.validate_input->validate_sampling(slot.host_validate_sampling,
+                                                  graph_rows);
   }
   const int64_t width = speculative_capacity_->num_speculative_tokens + 1;
   slot.host_validate_sampling = base;
@@ -822,6 +1158,15 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   if (graph_batch_sizes_.empty()) {
     return Status();
   }
+  if (dspark_adaptive_) {
+    // Scheduler startup runs Prefill warmup before the Decode bucket sweep.
+    // Preserve its normal context/bootstrap execution; only Decode owns the
+    // prepared Draft7/verify bindings and their adaptive cost measurements.
+    if (!batch.forward_type.is_decode()) {
+      return Status();
+    }
+    return warmup_adaptive_dspark_graphs(input);
+  }
   // Reuse scheduler-owned warmup KV and each SpeculativeSlot's final model
   // input views.
   for (auto& task_slot : slots_) {
@@ -889,16 +1234,28 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
       auto conservative = host;
       conservative.positions = slot.upper_positions;
       conservative.kv_seq_lens = slot.upper_kv_lengths;
+      auto& invocation = *slot.drafts.front();
+      const uint32_t draft_rows = task_graph_batch_size(
+          binding.model_params().parallel, invocation.graph_batch_sizes);
       const Status status = SlotBuffer::prepare_planned_mtp_decode(
-          binding, conservative, batch, prepare_stream_);
+          binding, conservative, batch, prepare_stream_, draft_rows);
       CHECK(status.ok()) << status.message();
       CHECK_EQ(prepare_stream_.synchronize(), 0);
+      pad_task_parallel(binding.model_params().parallel, draft_rows);
       draft_->executor.prepare_attention_metadata(draft_->kv_caches,
                                                   binding.model_params());
       draft_->executor.warmup_prepared_graph(binding.tokens(),
                                              binding.positions(),
                                              draft_->kv_caches,
                                              binding.model_params());
+      const int32_t maximum_kv_length = *std::max_element(
+          binding.model_params().attention.host.kv_seq_lens.begin(),
+          binding.model_params().attention.host.kv_seq_lens.end());
+      invocation.captured_graph_kv_capacities.try_emplace(
+          draft_rows,
+          dspark_graph_kv_capacity(capacity_,
+                                   binding.input_scratch_->rows_per_sequence_,
+                                   maximum_kv_length));
       // Warm every Slot's context binding, even if synthetic Tasks only
       // retire through the first Slot. No live or reserved KV row is written.
       auto& target_input = *slot.validate_input;
@@ -906,8 +1263,7 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
                                              target_input.positions(),
                                              kv_caches_,
                                              target_input.model_params());
-      const int64_t context_rows =
-          slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
+      const int64_t context_rows = target_input.tokens().numel();
       auto context_slots = prefix(slot.context_slots_storage, context_rows);
       context_slots.fill_(-1);
       // Slot inputs clear the output-only warmup marker. Context capture
@@ -923,9 +1279,223 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
           context_params);
       context_params.meta.is_graph_warmup = was_warmup;
       CHECK(context_output.hidden_states.defined());
+      auto& captured = invocation.captured_graph_batch_sizes;
+      const auto draft_bucket =
+          std::lower_bound(captured.begin(), captured.end(), draft_rows);
+      if (draft_bucket == captured.end() || *draft_bucket != draft_rows) {
+        captured.insert(draft_bucket, draft_rows);
+      }
     }
     CHECK_EQ(task_stream_.synchronize(), 0);
   }
+  return Status();
+}
+
+void TaskExecutionPipeline::bind_adaptive_dspark_views(SpeculativeSlot& slot) {
+  auto& adaptive = *slot.adaptive;
+  const int64_t proposal_bytes = static_cast<int64_t>(slot.rows) * 56;
+  const int64_t confidence_bytes = static_cast<int64_t>(slot.rows) * 28;
+  const int64_t feedback_bytes = static_cast<int64_t>(slot.rows) * 32;
+  slot.proposal = prefix(adaptive.arena_storage, proposal_bytes)
+                      .view(torch::kInt64)
+                      .view({slot.rows, 7});
+  adaptive.confidence =
+      adaptive.arena_storage.narrow(/*dim=*/0, proposal_bytes, confidence_bytes)
+          .view(torch::kFloat32)
+          .view({slot.rows, 7});
+  adaptive.widths =
+      adaptive.arena_storage
+          .narrow(/*dim=*/0, proposal_bytes + confidence_bytes, slot.rows * 4)
+          .view(torch::kInt32);
+  adaptive.consensus =
+      prefix(adaptive.arena_storage, proposal_bytes + confidence_bytes);
+  adaptive.feedback = adaptive.arena_storage.narrow(
+      /*dim=*/0, proposal_bytes, feedback_bytes);
+  adaptive.host_feedback =
+      prefix(adaptive.host_feedback_storage, feedback_bytes);
+  adaptive.host_confidence = prefix(adaptive.host_feedback, confidence_bytes)
+                                 .view(torch::kFloat32)
+                                 .view({slot.rows, 7});
+  adaptive.host_widths =
+      adaptive.host_feedback.narrow(/*dim=*/0, confidence_bytes, slot.rows * 4)
+          .view(torch::kInt32);
+  adaptive.previous_tokens = prefix(adaptive.previous_storage, slot.rows);
+  adaptive.offsets = prefix(adaptive.offsets_storage, slot.rows + 1);
+  adaptive.owners = prefix(adaptive.owners_storage, adaptive.plan.graph_rows);
+  adaptive.columns = prefix(adaptive.columns_storage, adaptive.plan.graph_rows);
+  slot.target_tokens =
+      prefix(slot.target_token_storage, adaptive.plan.graph_rows);
+  slot.context_slots =
+      prefix(slot.context_slots_storage, adaptive.plan.graph_rows);
+}
+
+void TaskExecutionPipeline::bind_adaptive_dspark_graph_input(
+    SpeculativeSlot& slot,
+    bool suppress_kv_writes) {
+  auto& adaptive = *slot.adaptive;
+  CHECK_GT(slot.rows, 0U);
+  CHECK_LE(slot.rows, capacity_.model.max_sequences);
+  CHECK_GE(adaptive.plan.graph_rows, slot.rows);
+  DSparkAdaptiveGraphInput input;
+  input.arena = adaptive.arena_storage;
+  input.control = adaptive.control;
+  input.anchors = slot.state->token_storage_;
+  input.base_positions = slot.state->storage_.positions;
+  input.base_kv_lengths = slot.state->storage_.kv_seq_lens;
+  input.base_block_table =
+      slot.drafts.front()->input->model_device_.block_tables.narrow(
+          /*dim=*/0, /*start=*/0, capacity_.model.max_sequences);
+  input.offsets = adaptive.offsets_storage;
+  input.owners = prefix(adaptive.owners_storage, adaptive.plan.graph_rows);
+  input.columns = prefix(adaptive.columns_storage, adaptive.plan.graph_rows);
+  input.block_size = capacity_.logical_block_size;
+  slot.validate_input->model_params().graph.dspark_adaptive = std::move(input);
+  // B and the startup write mask are Device values, not capture-time scalars.
+  // All sources retain their full Slot capacity so a G graph can serve any
+  // admitted B without changing pointers, strides or compact-arena bindings.
+  const uint64_t control = static_cast<uint64_t>(slot.rows) |
+                           (static_cast<uint64_t>(suppress_kv_writes) << 32);
+  adaptive.host_control.data_ptr<int64_t>()[0] = static_cast<int64_t>(control);
+  copy_input(adaptive.control, adaptive.host_control, prepare_stream_);
+}
+
+Status TaskExecutionPipeline::warmup_adaptive_dspark_graphs(
+    const LlmForwardInput& input) {
+  const auto host = SlotBuffer::model_input_view(input);
+  const auto batch = model_batch(input);
+  if (!batch.forward_type.is_decode() || host.q_seq_lens.empty()) {
+    return invalid("Adaptive DSpark graph warmup requires decode requests.");
+  }
+  for (auto& task_slot : slots_) {
+    const Status status = validate_input(*task_slot->speculative, input);
+    if (!status.ok()) {
+      return status;
+    }
+    const auto& slot = *task_slot->speculative;
+    if (slot.adaptive->plan.graph_rows == 0 ||
+        task_graph_batch_size(
+            slot.drafts.front()->input->model_params().parallel,
+            slot.drafts.front()->graph_batch_sizes) == 0) {
+      return invalid(
+          "Adaptive DSpark warmup exceeds Target/Draft graph capacity.");
+    }
+  }
+  c10::DeviceGuard device_guard(device_.unwrap());
+  auto guard = task_stream_.set_stream_guard();
+  // Prepared metadata binds the Draft's KV caches, including its context
+  // graph runner. Target warmup writes context before ordinary Draft execution.
+  for (auto& task_slot : slots_) {
+    auto& slot = *task_slot->speculative;
+    auto& invocation = *slot.drafts.front();
+    auto& binding = *invocation.input;
+    const uint32_t draft_rows = task_graph_batch_size(
+        binding.model_params().parallel, invocation.graph_batch_sizes);
+    if (draft_rows == 0) {
+      return invalid(
+          "Adaptive DSpark requires a warmed Draft7 request bucket.");
+    }
+    auto conservative = host;
+    conservative.positions = slot.upper_positions;
+    conservative.kv_seq_lens = slot.upper_kv_lengths;
+    const Status status = SlotBuffer::prepare_planned_mtp_decode(
+        binding, conservative, batch, prepare_stream_, draft_rows);
+    CHECK(status.ok()) << status.message();
+    CHECK_EQ(prepare_stream_.synchronize(), 0);
+    pad_task_parallel(binding.model_params().parallel, draft_rows);
+    draft_->executor.prepare_attention_metadata(draft_->kv_caches,
+                                                binding.model_params());
+    draft_->executor.warmup_prepared_graph(binding.tokens(),
+                                           binding.positions(),
+                                           draft_->kv_caches,
+                                           binding.model_params());
+    const int32_t maximum_kv_length = *std::max_element(
+        binding.model_params().attention.host.kv_seq_lens.begin(),
+        binding.model_params().attention.host.kv_seq_lens.end());
+    invocation.captured_graph_kv_capacities.try_emplace(
+        draft_rows,
+        dspark_graph_kv_capacity(capacity_,
+                                 binding.input_scratch_->rows_per_sequence_,
+                                 maximum_kv_length));
+    auto& captured = invocation.captured_graph_batch_sizes;
+    const auto bucket =
+        std::lower_bound(captured.begin(), captured.end(), draft_rows);
+    if (bucket == captured.end() || *bucket != draft_rows) {
+      captured.insert(bucket, draft_rows);
+    }
+    invocation.padded_batch_size = draft_rows;
+    bind_adaptive_dspark_views(slot);
+  }
+  CHECK_EQ(task_stream_.synchronize(), 0);
+  for (const int64_t graph_rows : graph_batch_sizes_) {
+    if (std::binary_search(captured_graph_batch_sizes_.begin(),
+                           captured_graph_batch_sizes_.end(),
+                           graph_rows)) {
+      continue;
+    }
+    for (auto& task_slot : slots_) {
+      auto& slot = *task_slot->speculative;
+      auto& binding = *slot.validate_input;
+      const uint32_t physical_rows = static_cast<uint32_t>(graph_rows);
+      const uint32_t original_rows = slot.rows;
+      const DSparkBudgetPlan original_plan = slot.adaptive->plan;
+      // The Device control selects a legal dummy batch even for G smaller than
+      // the scheduler's synthetic warmup. These are the same full-capacity
+      // sources used by serving; no bootstrap-only graph binding is created.
+      slot.rows = std::min(original_rows, physical_rows);
+      slot.adaptive->plan = {std::min(slot.rows * 7, physical_rows - slot.rows),
+                             physical_rows};
+      bind_adaptive_dspark_views(slot);
+      slot.adaptive->arena_storage.zero_();
+      slot.state->token_storage_.fill_(1);
+      slot.state->storage_.positions.zero_();
+      slot.state->storage_.kv_seq_lens.fill_(1);
+      slot.drafts.front()->input->model_device_.block_tables.zero_();
+      const uint32_t logical_rows =
+          slot.rows + slot.adaptive->plan.draft_budget;
+      const Status status = SlotBuffer::prepare_dspark_validate(
+          binding,
+          logical_rows,
+          physical_rows,
+          host.block_table_width,
+          static_cast<int32_t>(slot.adaptive->max_kv_length),
+          batch.batch_id,
+          prepare_stream_);
+      CHECK(status.ok()) << status.message();
+      bind_adaptive_dspark_graph_input(slot, /*suppress_kv_writes=*/true);
+      binding.model_params().parallel.raw_dp_global_token_nums = {
+          static_cast<int32_t>(logical_rows)};
+      pad_task_parallel(binding.model_params().parallel, physical_rows);
+      executor_.prepare_attention_metadata(kv_caches_, binding.model_params());
+      CHECK_EQ(prepare_stream_.synchronize(), 0);
+      executor_.warmup_prepared_graph(binding.tokens(),
+                                      binding.positions(),
+                                      kv_caches_,
+                                      binding.model_params());
+      slot.target_output = executor_.forward(binding.tokens(),
+                                             binding.positions(),
+                                             kv_caches_,
+                                             binding.model_params());
+      auto context_slots = prefix(slot.context_slots_storage, physical_rows);
+      context_slots.fill_(-1);
+      auto& context_params = binding.model_params();
+      context_params.meta.is_graph_warmup = true;
+      const auto context_output =
+          draft_->model.write_context_kv(slot.target_output.aux_hidden_states,
+                                         binding.positions(),
+                                         context_slots,
+                                         draft_->kv_caches,
+                                         context_params);
+      context_params.meta.is_graph_warmup = false;
+      CHECK(context_output.hidden_states.defined());
+      slot.rows = original_rows;
+      slot.adaptive->plan = original_plan;
+      bind_adaptive_dspark_views(slot);
+    }
+    CHECK_EQ(task_stream_.synchronize(), 0);
+    captured_graph_batch_sizes_.emplace_back(graph_rows);
+  }
+  std::sort(captured_graph_batch_sizes_.begin(),
+            captured_graph_batch_sizes_.end());
   return Status();
 }
 
@@ -1029,6 +1599,8 @@ Status TaskExecutionPipeline::prepare_speculative(
   slot.target_prefill->model_params().parallel.layer_synchronizer.reset();
   slot.draft_prefill->model_params().parallel.layer_synchronizer.reset();
 #endif
+  slot.target_prefill->model_params().graph.dspark_adaptive = {};
+  slot.validate_input->model_params().graph.dspark_adaptive = {};
   Status status = validate_input(slot, input);
   if (!status.ok()) {
     return status;
@@ -1036,6 +1608,9 @@ Status TaskExecutionPipeline::prepare_speculative(
   status = plan_sampling(slot, input);
   if (!status.ok()) {
     return status;
+  }
+  if (slot.adaptive) {
+    slot.adaptive->generation = next_task_id_;
   }
   c10::DeviceGuard guard(device_.unwrap());
   if (kv_caches_.empty() || kv_caches_.front().empty()) {
@@ -1059,6 +1634,9 @@ Status TaskExecutionPipeline::prepare_speculative(
     }
     // Views retain the storage object's address, not its allocation contents.
     *context_ = std::move(*context);
+    if (dspark_adaptive_) {
+      dspark_adaptive_->histories.resize(embedding_rows);
+    }
     LOG(INFO) << "Task pipeline embedding context: rows=" << embedding_rows
               << ", device_bytes=" << mtp_context_bytes(*context_);
   }
@@ -1082,6 +1660,19 @@ Status TaskExecutionPipeline::prepare_speculative(
   }
   if (!status.ok()) {
     return status;
+  }
+  if (slot.adaptive) {
+    const auto& ids = input.input_params.embedding.embedding_ids;
+    const auto& requests = input.input_params.embedding.request_ids;
+    for (uint32_t row = 0; row < ids.size(); ++row) {
+      auto& history = dspark_adaptive_->histories[ids[row]];
+      if (slot.decode && history.request_id == requests[row]) {
+        continue;
+      }
+      history = DSparkAdaptiveState::History();
+      history.request_id = requests[row];
+      history.request_generation = next_task_id_;
+    }
   }
   status = slot.target_prefill->prepare_sampling(
       input.sampling_params, slot.model_tokens, prepare_stream_);
@@ -1131,27 +1722,49 @@ Status TaskExecutionPipeline::prepare_speculative(
     auto conservative = host;
     conservative.positions = slot.upper_positions;
     conservative.kv_seq_lens = slot.upper_kv_lengths;
-    status =
-        SlotBuffer::prepare_planned_mtp_decode(*slot.validate_input,
-                                               conservative,
-                                               batch,
-                                               prepare_stream_,
-                                               slot.target_padded_batch_size);
+    if (slot.adaptive) {
+      status = SlotBuffer::prepare_dspark_validate(
+          *slot.validate_input,
+          slot.rows + slot.adaptive->plan.draft_budget,
+          slot.adaptive->plan.graph_rows,
+          host.block_table_width,
+          static_cast<int32_t>(slot.adaptive->max_kv_length),
+          batch.batch_id,
+          prepare_stream_);
+    } else {
+      status =
+          SlotBuffer::prepare_planned_mtp_decode(*slot.validate_input,
+                                                 conservative,
+                                                 batch,
+                                                 prepare_stream_,
+                                                 slot.target_padded_batch_size);
+    }
     CHECK(status.ok()) << status.message();
     status = slot.validate_input->prepare_sampling(
-        slot.host_validate_sampling, slot.rows * width, prepare_stream_);
+        slot.host_validate_sampling,
+        slot.adaptive ? slot.adaptive->plan.graph_rows : slot.rows * width,
+        prepare_stream_);
     CHECK(status.ok()) << status.message();
-    slot.proposal = prefix(slot.proposal_storage, slot.rows * (width - 1))
-                        .view({slot.rows, width - 1});
+    if (slot.adaptive) {
+      bind_adaptive_dspark_views(slot);
+    } else {
+      slot.proposal = prefix(slot.proposal_storage, slot.rows * (width - 1))
+                          .view({slot.rows, width - 1});
+    }
     slot.accepted_mask = prefix(slot.accepted_mask_storage, slot.rows * width)
                              .view({slot.rows, width});
     if (block_draft()) {
       slot.context_slots =
-          prefix(slot.context_slots_storage, slot.rows * width);
+          prefix(slot.context_slots_storage,
+                 speculative_capacity_->kind == SpeculativeTaskKind::DSPARK
+                     ? slot.validate_input->tokens().numel()
+                     : slot.rows * width);
     }
     const auto& base = slot.target_prefill->sampling_params();
-    slot.rejection = std::make_unique<RejectionSampler>(
-        base, base.logprobs, base.max_top_logprobs);
+    if (!slot.adaptive) {
+      slot.rejection = std::make_unique<RejectionSampler>(
+          base, base.logprobs, base.max_top_logprobs);
+    }
     for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
       auto& invocation = *slot.drafts[step];
       status =
@@ -1199,6 +1812,10 @@ Status TaskExecutionPipeline::prepare_speculative(
 
     pad_task_parallel(binding.model_params().parallel,
                       slot.target_padded_batch_size);
+    if (slot.adaptive) {
+      bind_adaptive_dspark_graph_input(slot,
+                                       /*suppress_kv_writes=*/slot.is_warmup);
+    }
     executor_.prepare_attention_metadata(kv_caches_, binding.model_params());
   } else {
     status = slot.target_prefill->prepare(host, batch, prepare_stream_);
@@ -1347,7 +1964,11 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
     sample(*slot.target_sampling, slot.target_logits);
     slot.target_prefill->device_result().lengths.fill_(1);
     if (block_draft() || capacity_.cp_sampling_group != nullptr) {
-      synchronize_samples(slot.target_prefill->device_result());
+      synchronize_samples(
+          slot.target_prefill->device_result(),
+          speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+              slot.target_prefill->sampling_params().sampling_mode ==
+                  SamplingMode::GREEDY);
     } else {
       auto tokens = slot.target_prefill->device_result().tokens;
       synchronize_tokens(tokens,
@@ -1381,6 +2002,10 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
 void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   context_gather(*slot.state);
   apply_bootstrap(slot);
+  if (slot.adaptive) {
+    launch_adaptive_dspark(slot);
+    return;
+  }
   if (launch_unified_block(slot)) {
     return;
   }
@@ -1451,9 +2076,11 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   slot.target_output.hidden_states = slot.target_output.hidden_states.narrow(
       /*dim=*/0, /*start=*/0, slot.rows * width);
   if (block_draft()) {
-    slot.target_output.aux_hidden_states =
-        slot.target_output.aux_hidden_states.narrow(
-            /*dim=*/0, /*start=*/0, slot.rows * width);
+    if (speculative_capacity_->kind != SpeculativeTaskKind::DSPARK) {
+      slot.target_output.aux_hidden_states =
+          slot.target_output.aux_hidden_states.narrow(
+              /*dim=*/0, /*start=*/0, slot.rows * width);
+    }
   }
   slot.target_logits = model_.logits(
       slot.target_output.hidden_states,
@@ -1488,7 +2115,10 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
     result.top_logprobs.copy_(accepted.top_logprobs);
   }
   if (block_draft() || capacity_.cp_sampling_group != nullptr) {
-    synchronize_samples(result);
+    synchronize_samples(
+        result,
+        speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+            base.sampling_mode == SamplingMode::GREEDY);
   } else {
     auto tokens = result.tokens;
     synchronize_tokens(tokens, base.sampling_mode == SamplingMode::GREEDY);
@@ -1502,10 +2132,12 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   }
   const auto& context = block_draft() ? slot.target_output.aux_hidden_states
                                       : slot.target_output.hidden_states;
-  context_advance(*slot.state,
-                  result.tokens,
-                  result.lengths,
-                  context.view({slot.rows, width, context_hidden_size()}));
+  context_advance(
+      *slot.state,
+      result.tokens,
+      result.lengths,
+      block_draft() ? torch::Tensor()
+                    : context.view({slot.rows, width, context_hidden_size()}));
   context_publish(*slot.state);
 }
 
@@ -1581,6 +2213,10 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
     slot.proposal.copy_(sampled.token_ids);
     invocation.sampled.draft_logits = std::move(sampled.draft_logits);
   } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK) {
+    if (slot.adaptive) {
+      generate_adaptive_dspark_proposals(slot, slot.state->tokens_);
+      return;
+    }
     auto sampled = sample_dspark_block(
         invocation.logits.view(
             {slot.rows, steps, speculative_capacity_->common.vocab_size}),
@@ -1603,6 +2239,90 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
   }
 }
 
+void TaskExecutionPipeline::generate_adaptive_dspark_proposals(
+    SpeculativeSlot& slot,
+    const torch::Tensor& anchors) {
+  auto& invocation = *slot.drafts.front();
+  auto& adaptive = *slot.adaptive;
+  // Admission checked every penalty is neutral and sampling is greedy. Use
+  // the same minimal sampler in serving and startup profiling; do not launch
+  // no-op penalty kernels merely because the client supplied neutral tensors.
+  SamplingParameters sampling;
+  const auto base_logits =
+      invocation.logits.view({slot.rows, 7, capacity_.vocab_size});
+  auto previous_tokens = anchors;
+  for (uint32_t column = 0; column < 7; ++column) {
+    auto logits = base_logits.select(/*dim=*/1, column) +
+                  draft_->model.dspark_markov_bias(previous_tokens);
+    const auto sampled = sampler_.forward(logits, sampling);
+    slot.proposal.select(/*dim=*/1, column).copy_(sampled.next_tokens);
+    previous_tokens = sampled.next_tokens;
+  }
+  invocation.sampled.probs = torch::Tensor();
+  adaptive.previous_tokens.select(/*dim=*/1, /*index=*/0).copy_(anchors);
+  adaptive.previous_tokens.narrow(/*dim=*/1, /*start=*/1, /*length=*/6)
+      .copy_(slot.proposal.narrow(/*dim=*/1, /*start=*/0, /*length=*/6));
+  const auto confidence = draft_->model.dspark_confidence_probs(
+      invocation.output.hidden_states
+          .narrow(/*dim=*/0, /*start=*/0, slot.rows * 7)
+          .view({slot.rows, 7, capacity_.hidden_size}),
+      adaptive.previous_tokens);
+  CHECK(confidence.defined());
+  CHECK(confidence.sizes() == adaptive.confidence.sizes());
+  CHECK_EQ(confidence.device(), device_.unwrap());
+  CHECK_EQ(confidence.scalar_type(), torch::kFloat32);
+  // Snapshot before write_context_kv can overwrite the borrowed draft output.
+  // ConfidenceHead consumes local hidden states, unlike full-vocabulary logits
+  // gathered across TP ranks. Keep leader-authoritative proposals and
+  // confidence until cross-rank bitwise parity is verified, even for greedy
+  // sampling.
+  adaptive.confidence.copy_(confidence);
+  synchronize_tokens(adaptive.consensus, /*all_greedy=*/false);
+}
+
+void TaskExecutionPipeline::launch_adaptive_dspark(SpeculativeSlot& slot) {
+#if defined(USE_NPU)
+  launch_block_draft(slot);
+  auto& adaptive = *slot.adaptive;
+  auto& validate = *slot.validate_input;
+  auto& attention = validate.model_params().attention.device;
+  // Proposal/confidence consensus is complete. The prepared Target graph owns
+  // Device allocation, packing and attention metadata refresh in that order.
+  slot.target_output = executor_.forward(validate.tokens(),
+                                         validate.positions(),
+                                         kv_caches_,
+                                         validate.model_params());
+  slot.target_logits =
+      model_.logits(slot.target_output.hidden_states,
+                    validate.sampling_params().selected_token_idxes);
+  torch::argmax_out(slot.target_tokens,
+                    slot.target_logits,
+                    /*dim=*/-1,
+                    /*keepdim=*/false);
+  // The admitted target is greedy too. Any required CP consensus must precede
+  // local acceptance/KV masking, not merely synchronize the final output.
+  synchronize_tokens(slot.target_tokens, /*all_greedy=*/true);
+  const auto& result = slot.target_prefill->device_result();
+  auto result_tokens = result.tokens;
+  auto result_lengths = result.lengths;
+  kernel::npu::tilelang::dspark_greedy_verify_commit(slot.proposal,
+                                                     slot.target_tokens,
+                                                     adaptive.widths,
+                                                     adaptive.offsets,
+                                                     adaptive.owners,
+                                                     adaptive.columns,
+                                                     attention.new_cache_slots,
+                                                     result_tokens,
+                                                     result_lengths,
+                                                     slot.context_slots);
+  write_block_context(slot, /*prefill=*/false);
+  context_advance(*slot.state, result.tokens, result.lengths, torch::Tensor());
+  context_publish(*slot.state);
+#else
+  LOG(FATAL) << "Adaptive DSpark task pipeline requires NPU kernels.";
+#endif
+}
+
 void TaskExecutionPipeline::synchronize_tokens(torch::Tensor& tokens,
                                                bool all_greedy) {
   if (all_greedy && capacity_.cp_sampling_group == nullptr) {
@@ -1619,14 +2339,15 @@ void TaskExecutionPipeline::synchronize_tokens(torch::Tensor& tokens,
 }
 
 void TaskExecutionPipeline::synchronize_samples(
-    const TokenResultTensors& result) {
+    const TokenResultTensors& result,
+    bool all_greedy) {
   for (const auto* tensor : {&result.tokens,
                              &result.logprobs,
                              &result.top_tokens,
                              &result.top_logprobs}) {
     if (tensor->defined()) {
       auto view = *tensor;
-      synchronize_tokens(view, /*all_greedy=*/false);
+      synchronize_tokens(view, all_greedy);
     }
   }
 }
@@ -1641,14 +2362,25 @@ void TaskExecutionPipeline::write_block_context(SpeculativeSlot& slot,
   torch::Tensor cache_slots =
       input.model_params().attention.device.new_cache_slots;
   torch::Tensor positions = input.positions();
-  if (!prefill) {
+  if (!prefill && !slot.adaptive) {
     const int64_t rows =
         slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
-    slot.context_slots.copy_(cache_slots.narrow(/*dim=*/0, /*start=*/0, rows));
-    slot.context_slots.view(slot.accepted_mask.sizes())
+    slot.context_slots.copy_(cache_slots.narrow(
+        /*dim=*/0, /*start=*/0, slot.context_slots.numel()));
+    slot.context_slots.narrow(/*dim=*/0, /*start=*/0, rows)
+        .view(slot.accepted_mask.sizes())
         .masked_fill_(slot.accepted_mask.logical_not(), /*value=*/-1);
+    slot.context_slots
+        .narrow(/*dim=*/0, rows, slot.context_slots.numel() - rows)
+        .fill_(/*value=*/-1);
     cache_slots = slot.context_slots;
-    positions = positions.narrow(/*dim=*/0, /*start=*/0, rows);
+    positions = positions.narrow(
+        /*dim=*/0, /*start=*/0, slot.context_slots.numel());
+  } else if (!prefill) {
+    // Ragged commit already produced the G-row accepted-context mapping.
+    // Keep borrowed target hidden states in physical order; never scatter them
+    // to a dense Bx8 tensor or reconstruct owners on the Host.
+    cache_slots = slot.context_slots;
   }
   // The serial task stream orders accepted-context publication before any
   // subsequent block reads the draft cache. Rejected rows disable the scatter;
@@ -1692,6 +2424,12 @@ void TaskExecutionPipeline::launch_speculative(uint32_t slot_id) {
     CHECK_EQ(hidden.nbytes(), slot.host_hidden.nbytes());
     slot.host_hidden.copy_(hidden, /*non_blocking=*/true);
   }
+  if (slot.adaptive && slot.decode && slot.rows != 0) {
+    CHECK(result_stream_.wait_event(slots_[slot_id]->output_ready));
+    auto result_guard = result_stream_.set_stream_guard();
+    slot.adaptive->host_feedback.copy_(slot.adaptive->feedback,
+                                       /*non_blocking=*/true);
+  }
   const Status status = slot.target_prefill->copy_result_to_host(
       result_stream_, slots_[slot_id]->output_ready);
   CHECK(status.ok()) << status.message();
@@ -1702,6 +2440,49 @@ ForwardOutput TaskExecutionPipeline::consume_speculative(uint32_t slot_id) {
   SpeculativeSlot& slot = *slots_[slot_id]->speculative;
   c10::DeviceGuard guard(device_.unwrap());
   auto tokens = slot.target_prefill->take_result();
+  uint64_t completed_ns = 0;
+  const bool record_calibration =
+      dspark_adaptive_ && dspark_adaptive_->calibration_session;
+  if (record_calibration) {
+    completed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  }
+  if (slot.adaptive) {
+    if (slot.decode && slot.rows != 0) {
+      consume_adaptive_dspark(slot);
+      if (VLOG_IS_ON(2)) {
+        trace_adaptive_dspark(slot, tokens.lengths);
+      }
+    }
+    dspark_adaptive_->retired_generation = slot.adaptive->generation;
+  }
+  if (record_calibration) {
+    DSparkSteadyStep step;
+    step.generation = slot.adaptive->generation;
+    step.completed_ns = completed_ns;
+    if (!slot.is_warmup && slot.decode && slot.rows != 0) {
+      step.logical_requests = slot.rows;
+      step.draft_requests = slot.drafts.front()->padded_batch_size / 7;
+      step.target_graph_rows = slot.adaptive->plan.graph_rows;
+      step.max_kv_length = slot.adaptive->max_kv_length;
+      step.draft_tokens = slot.adaptive->selected_draft_tokens;
+      step.request_ids = slot.adaptive->request_ids;
+      CHECK(tokens.lengths.defined() && tokens.lengths.device().is_cpu());
+      CHECK_EQ(tokens.lengths.scalar_type(), torch::kInt32);
+      CHECK_EQ(tokens.lengths.numel(), slot.rows);
+      const int32_t* lengths = tokens.lengths.const_data_ptr<int32_t>();
+      for (uint32_t row = 0; row < slot.rows; ++row) {
+        CHECK_GE(lengths[row], 1);
+        CHECK_LE(lengths[row], slot.adaptive->draft_counts[row] + 1);
+        step.accepted_tokens += static_cast<uint32_t>(lengths[row] - 1);
+      }
+    }
+    if (dspark_adaptive_->calibration_session) {
+      dspark_adaptive_->calibration_session->observe(step);
+    }
+  }
   ForwardOutput output;
   output.is_graph_warmup = slot.is_warmup;
   const bool prefill = !slot.decode;
@@ -1709,7 +2490,10 @@ ForwardOutput TaskExecutionPipeline::consume_speculative(uint32_t slot_id) {
     output.sample_output.next_tokens =
         prefill ? tokens.tokens.squeeze(1) : tokens.tokens;
     if (!prefill) {
-      output.spec_verify_layouts = make_verify_layouts(tokens.tokens);
+      output.spec_verify_layouts =
+          slot.adaptive ? make_verify_layouts(
+                              tokens.tokens, &slot.adaptive->draft_counts, {})
+                        : make_verify_layouts(tokens.tokens);
     }
     if (tokens.logprobs.defined()) {
       output.logprobs = true;
@@ -1735,11 +2519,113 @@ ForwardOutput TaskExecutionPipeline::consume_speculative(uint32_t slot_id) {
   return output;
 }
 
+void TaskExecutionPipeline::consume_adaptive_dspark(SpeculativeSlot& slot) {
+  auto& adaptive = *slot.adaptive;
+  const int32_t* widths = adaptive.host_widths.const_data_ptr<int32_t>();
+  const float* confidence = adaptive.host_confidence.const_data_ptr<float>();
+  adaptive.draft_counts.clear();
+  uint32_t selected = 0;
+  for (uint32_t row = 0; row < slot.rows; ++row) {
+    CHECK_GE(widths[row], 1);
+    CHECK_LE(widths[row], 8);
+    adaptive.draft_counts.emplace_back(widths[row] - 1);
+    selected += static_cast<uint32_t>(widths[row] - 1);
+  }
+  CHECK_EQ(selected, adaptive.plan.draft_budget);
+  if (slot.is_warmup) {
+    return;
+  }
+  const bool full_width = adaptive.plan.draft_budget == slot.rows * 7;
+  for (uint32_t row = 0; row < slot.rows; ++row) {
+    const int32_t id = adaptive.embedding_ids[row];
+    CHECK_GT(id, 0);
+    CHECK_LT(static_cast<uint64_t>(id), dspark_adaptive_->histories.size());
+    auto& history = dspark_adaptive_->histories[id];
+    // A newly prepared Prefill may already reuse this embedding row while
+    // an older Slot retires. Identity and generation both guard its feedback.
+    if (context_->request_ids_[id] != adaptive.request_ids[row] ||
+        history.request_id != adaptive.request_ids[row] ||
+        adaptive.generation < history.request_generation ||
+        adaptive.generation <= history.versions[0].generation) {
+      continue;
+    }
+    DSparkAdaptiveState::Feedback feedback;
+    feedback.generation = adaptive.generation;
+    feedback.rounds_since_full_width =
+        full_width ? 0 : history.versions[0].rounds_since_full_width + 1;
+    for (uint32_t column = 0; column < 7; ++column) {
+      const float probability = confidence[row * 7 + column];
+      CHECK(std::isfinite(probability));
+      CHECK_GE(probability, 0.0F);
+      CHECK_LE(probability, 1.0F);
+      feedback.confidence[column] = probability;
+    }
+    history.versions[1] = history.versions[0];
+    history.versions[0] = feedback;
+  }
+  auto& retired = dspark_adaptive_->retired_plans;
+  retired[1] = std::move(retired[0]);
+  retired[0].generation = adaptive.generation;
+  retired[0].embedding_ids = adaptive.embedding_ids;
+  retired[0].request_ids = adaptive.request_ids;
+  retired[0].plan = adaptive.plan;
+}
+
+void TaskExecutionPipeline::trace_adaptive_dspark(
+    const SpeculativeSlot& slot,
+    const torch::Tensor& accepted_lengths) const {
+  if (slot.is_warmup ||
+      (capacity_.sampling_group != nullptr &&
+       capacity_.sampling_group->rank() != 0) ||
+      (capacity_.cp_sampling_group != nullptr &&
+       capacity_.cp_sampling_group->rank() != 0)) {
+    return;
+  }
+  // Both arrays have already crossed the ordinary result-ready fence. This
+  // diagnostic must not read Device tensors or introduce another result copy.
+  CHECK(accepted_lengths.defined() && accepted_lengths.device().is_cpu());
+  CHECK_EQ(accepted_lengths.scalar_type(), torch::kInt32);
+  CHECK_EQ(accepted_lengths.numel(), slot.rows);
+  const auto& adaptive = *slot.adaptive;
+  const float* confidence = adaptive.host_confidence.const_data_ptr<float>();
+  const int32_t* lengths = accepted_lengths.const_data_ptr<int32_t>();
+  std::vector<int32_t> accepted;
+  accepted.reserve(slot.rows);
+  for (uint32_t row = 0; row < slot.rows; ++row) {
+    CHECK_GE(lengths[row], 1);
+    CHECK_LE(lengths[row], adaptive.draft_counts[row] + 1);
+    accepted.emplace_back(lengths[row] - 1);
+  }
+  VLOG(2)
+      << "DSpark confidence diagnostic: "
+      << nlohmann::json{{"generation", adaptive.generation},
+                        {"eligible_feedback_generation",
+                         adaptive.generation > 2 ? adaptive.generation - 2 : 0},
+                        {"request_ids", adaptive.request_ids},
+                        {"logical_requests", slot.rows},
+                        {"physical_requests",
+                         slot.drafts.front()->padded_batch_size / 7},
+                        {"target_graph_rows", adaptive.plan.graph_rows},
+                        {"max_kv_length", adaptive.max_kv_length},
+                        {"selected_draft_tokens", adaptive.plan.draft_budget},
+                        {"draft_counts", adaptive.draft_counts},
+                        {"accepted_counts", accepted},
+                        {"conditional_confidence",
+                         std::vector<float>(confidence,
+                                            confidence + slot.rows * 7)},
+                        {"lagged_conditional_confidence",
+                         adaptive.lagged_confidence}}
+             .dump();
+}
+
 void TaskExecutionPipeline::discard_speculative(uint32_t slot_id) {
   CHECK_LT(slot_id, slots_.size());
   SpeculativeSlot& slot = *slots_[slot_id]->speculative;
   c10::DeviceGuard guard(device_.unwrap());
   slot.target_prefill->discard_result();
+  if (dspark_adaptive_ && dspark_adaptive_->calibration_session) {
+    dspark_adaptive_->calibration_session->observe(DSparkSteadyStep{});
+  }
   release_outputs(slot);
   slots_[slot_id]->transfer_kv_infos.clear();
 }
@@ -1780,6 +2666,9 @@ uint64_t TaskExecutionPipeline::speculative_pinned_bytes() const {
     for (const auto& invocation : slot.drafts) {
       bytes += invocation->input->pinned_bytes();
     }
+    if (slot.adaptive) {
+      bytes += slot.adaptive->host_feedback_storage.nbytes();
+    }
   }
   return bytes;
 }
@@ -1788,15 +2677,19 @@ uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
   uint64_t bytes = mtp_context_bytes(*context_);
   for (const auto& task_slot : slots_) {
     const auto& slot = *task_slot->speculative;
-    bytes += slot.target_prefill->device_bytes() +
-             slot.draft_prefill->device_bytes() +
-             slot.validate_input->device_bytes() +
-             slot.proposal_storage.nbytes() +
-             slot.accepted_mask_storage.nbytes() +
-             context_device_bytes(*slot.state) +
-             slot.bootstrap.row_storage.nbytes() +
-             slot.bootstrap.token_storage.nbytes() +
-             state_bytes(slot.bootstrap.storage);
+    bytes +=
+        slot.target_prefill->device_bytes() +
+        slot.draft_prefill->device_bytes() +
+        slot.validate_input->device_bytes() +
+        (slot.target_token_storage.defined()
+             ? slot.target_token_storage.nbytes()
+             : 0) +
+        (slot.proposal_storage.defined() ? slot.proposal_storage.nbytes() : 0) +
+        slot.accepted_mask_storage.nbytes() +
+        context_device_bytes(*slot.state) +
+        slot.bootstrap.row_storage.nbytes() +
+        slot.bootstrap.token_storage.nbytes() +
+        state_bytes(slot.bootstrap.storage);
     for (const auto& invocation : slot.drafts) {
       bytes += invocation->input->device_bytes();
       bytes += invocation->token_storage.nbytes();
@@ -1810,6 +2703,15 @@ uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
                                &slot.draft_first_indices,
                                &slot.dummy_hidden}) {
       bytes += tensor->defined() ? tensor->nbytes() : 0;
+    }
+    if (slot.adaptive) {
+      for (const auto* tensor : {&slot.adaptive->arena_storage,
+                                 &slot.adaptive->previous_storage,
+                                 &slot.adaptive->offsets_storage,
+                                 &slot.adaptive->owners_storage,
+                                 &slot.adaptive->columns_storage}) {
+        bytes += tensor->nbytes();
+      }
     }
   }
   return bytes;

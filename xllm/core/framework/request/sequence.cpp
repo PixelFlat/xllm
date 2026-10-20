@@ -232,6 +232,8 @@ void Sequence::record_speculative_token_stats(
       stats.accepted_tokens;
   sequence_params_.speculative_token_stats->proposed_tokens +=
       stats.proposed_tokens;
+  sequence_params_.speculative_token_stats->verified_rounds +=
+      stats.verified_rounds;
 }
 
 // The first token will be only used in disagg pd mode.

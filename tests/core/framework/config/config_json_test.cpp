@@ -34,9 +34,86 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
 namespace {
+
+TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
+  google::FlagSaver flag_saver;
+  SpeculativeConfig speculative_config;
+  const JsonReader json = config::parse_json_string(R"json({
+    "adaptive_dspark_cost_table":"/tmp/dspark_sps.json",
+    "speculative_algorithm":"DSpark",
+    "num_speculative_tokens":7,
+    "enable_adaptive_speculative_decode":true
+  })json");
+  speculative_config.from_json(json);
+  speculative_config.validate();
+  EXPECT_EQ(speculative_config.adaptive_dspark_cost_table(),
+            "/tmp/dspark_sps.json");
+  nlohmann::ordered_json serialized;
+  speculative_config.append_config_json(serialized);
+  EXPECT_EQ(serialized.at("adaptive_dspark_cost_table"),
+            "/tmp/dspark_sps.json");
+  const auto& names = SpeculativeConfig::option_category().option_names;
+  EXPECT_NE(std::find(names.begin(), names.end(), "adaptive_dspark_cost_table"),
+            names.end());
+}
+
+TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveDsparkDraft7) {
+  google::FlagSaver flag_saver;
+  SpeculativeConfig speculative_config;
+  speculative_config.adaptive_dspark_cost_table("/tmp/dspark_sps.json");
+  EXPECT_DEATH(speculative_config.validate(),
+               "requires adaptive DSpark Draft7");
+  speculative_config.enable_adaptive_speculative_decode(true)
+      .speculative_algorithm("DSpark")
+      .num_speculative_tokens(5);
+  EXPECT_DEATH(speculative_config.validate(),
+               "requires adaptive DSpark Draft7");
+}
+
+TEST(SpeculativeConfigTest,
+     StartupDsparkCalibrationRoundTripsAndAppearsInHelp) {
+  google::FlagSaver flag_saver;
+  SpeculativeConfig config;
+  config.from_json(config::parse_json_string(R"json({
+    "adaptive_dspark_calibration":"/tmp/calibration.json",
+    "adaptive_dspark_cost_table_output":"/tmp/new-costs.json",
+    "speculative_algorithm":"DSpark",
+    "num_speculative_tokens":7,
+    "enable_adaptive_speculative_decode":true
+  })json"));
+  config.validate();
+  nlohmann::ordered_json serialized;
+  config.append_config_json(serialized);
+  EXPECT_EQ(serialized.at("adaptive_dspark_calibration"),
+            "/tmp/calibration.json");
+  EXPECT_EQ(serialized.at("adaptive_dspark_cost_table_output"),
+            "/tmp/new-costs.json");
+  const auto& names = SpeculativeConfig::option_category().option_names;
+  for (const std::string& name :
+       {"adaptive_dspark_calibration", "adaptive_dspark_cost_table_output"}) {
+    EXPECT_NE(std::find(names.begin(), names.end(), name), names.end());
+  }
+  config.adaptive_dspark_cost_table("/tmp/costs.json");
+  EXPECT_DEATH(config.validate(), "without a cost-table input");
+}
+
+TEST(SpeculativeConfigTest, StartupDsparkOutputAllowsDefaultCalibration) {
+  google::FlagSaver flag_saver;
+  SpeculativeConfig config;
+  config.adaptive_dspark_cost_table_output("/tmp/output.json");
+  EXPECT_DEATH(config.validate(), "requires startup calibration");
+  config.enable_adaptive_speculative_decode(true)
+      .speculative_algorithm("DSpark")
+      .num_speculative_tokens(7);
+  config.validate();
+  EXPECT_TRUE(config.adaptive_dspark_calibration().empty());
+  config.adaptive_dspark_cost_table("/tmp/saved.json");
+  EXPECT_DEATH(config.validate(), "requires startup calibration");
+}
 
 inline constexpr std::string_view kInlineConfig = R"json({
   "block_size": 16,

@@ -42,6 +42,7 @@ void accumulate_verify_rows(const TokenT* tokens,
     SpeculativeTokenStats& row_stats =
         metrics.sequence_stats[static_cast<size_t>(row)];
     row_stats.proposed_tokens = num_draft_tokens;
+    row_stats.verified_rounds = 1;
     metrics.num_draft_tokens += num_draft_tokens;
 
     const TokenT* row_tokens = tokens + row * token_width;

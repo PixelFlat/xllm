@@ -68,6 +68,25 @@ message SpeculativeValidateTimePredictor {
   double query_prefix_ms = 4;
 }
 
+// Startup-only DSpark calibration control. Each command is handled only after
+// all previously submitted task-pipeline results have been retired.
+message DSparkCalibrationRequest {
+  enum Action {
+    UNSPECIFIED = 0;
+    CAPABILITIES = 1;
+    BEGIN_SAMPLE = 2;
+    FINISH_SAMPLE = 3;
+    INSTALL_COSTS = 4;
+  }
+  Action action = 1;
+  string payload = 2;
+}
+
+message DSparkCalibrationResponse {
+  bool ok = 1;
+  string payload = 2;
+}
+
 message SleepRequest {
   MasterStatus master_status = 1;
 }
@@ -400,6 +419,7 @@ message Token {
 message SpeculativeTokenStats {
   int64 accepted_tokens = 1;
   int64 proposed_tokens = 2;
+  int64 verified_rounds = 3;
 }
 
 message SquenceOutput {
@@ -462,6 +482,8 @@ service DistributeWorker {
   rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
   rpc SetSpeculativeValidateTimePredictor(SpeculativeValidateTimePredictor)
       returns (Status) {}
+  rpc DSparkCalibration(DSparkCalibrationRequest)
+      returns (DSparkCalibrationResponse) {}
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
   rpc GetCacheInfo(Empty) returns (CacheInfo) {}

@@ -35,6 +35,7 @@ limitations under the License.
 
 namespace xllm {
 class VlmForwardInput;
+struct DSparkCalibrationCommand;
 
 class Worker {
  public:
@@ -72,6 +73,9 @@ class Worker {
 
   bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
+
+  std::optional<std::string> dspark_calibration(
+      const DSparkCalibrationCommand& command);
 
   void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
 

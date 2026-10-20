@@ -27,6 +27,7 @@ from xllm.python.attention.backend import (
     normalize_layer_caches,
 )
 from xllm.python.layers.attention import Attention
+from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 from xllm.python.model_executor.forward_context import (
     AclGraphCaptureContext,
     AclGraphExecutionState,
@@ -773,17 +774,32 @@ class ModelExecutor:
         expert_load_data: torch.Tensor | None = None,
         eplb_decode_token_mask: torch.Tensor | None = None,
         is_graph_warmup: bool = False,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> None:
         if self.prepared_graph_runner is None:
             raise RuntimeError("prepared ACL graph runner is not enabled")
+        if dspark_adaptive is not None:
+            self._validate_dspark_graph_metadata(metadata)
+        graph_kwargs = {} if dspark_adaptive is None else {"dspark_adaptive": dspark_adaptive}
         eplb = (
             None
             if expert_load_data is None
             else EplbRuntimeState(expert_load_data, eplb_decode_token_mask, is_graph_warmup)
         )
         self.prepared_graph_runner.warmup_prepared(
-            input_ids, positions, metadata, input_embedding, mtp_topk_indices, eplb=eplb
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, eplb=eplb, **graph_kwargs
         )
+
+    def _validate_dspark_graph_metadata(self, metadata: AttentionMetadata) -> None:
+        if (
+            not self._kv_bound
+            or not self._supports_prepared_metadata
+            or self.prepared_graph_runner is None
+            or self._prepared_block_draft
+            or getattr(metadata, "prepared_attention_state", None) is None
+        ):
+            raise ValueError("adaptive DSpark requires an initialized prepared target ACL graph executor")
 
     def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
         layer_caches = normalize_layer_caches(kv_caches)
@@ -827,9 +843,15 @@ class ModelExecutor:
         expert_load_data: torch.Tensor | None = None,
         eplb_decode_token_mask: torch.Tensor | None = None,
         is_graph_warmup: bool = False,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
+        if dspark_adaptive is not None:
+            if not enable_graph or layer_synchronizer is not None:
+                raise ValueError("adaptive DSpark requires ACL graph execution without layer synchronization")
+            self._validate_dspark_graph_metadata(metadata)
         if self.context_kv_graph_runner is not None and is_graph_warmup and self.prepared_graph_runner is None:
             # Startup draft inputs have N physical query rows per request.
             # Capture every accepted-row bucket up to the N+1 verify capacity,
@@ -863,7 +885,14 @@ class ModelExecutor:
                     # validation and replay failures propagate to the caller.
                     return self.eager_runner.execute(input_ids, positions, metadata, eplb=eplb)
                 return self.prepared_graph_runner.execute(
-                    input_ids, positions, metadata, input_embedding, layer_synchronizer, mtp_topk_indices, eplb=eplb
+                    input_ids,
+                    positions,
+                    metadata,
+                    input_embedding,
+                    layer_synchronizer,
+                    mtp_topk_indices,
+                    eplb=eplb,
+                    **({} if dspark_adaptive is None else {"dspark_adaptive": dspark_adaptive}),
                 )
             if self._prepared_mtp:
                 return self.eager_runner.execute(

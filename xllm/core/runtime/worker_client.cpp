@@ -48,6 +48,11 @@ bool WorkerClient::set_speculative_validate_time_predictor(
   return worker_->set_speculative_validate_time_predictor(predictor);
 }
 
+std::optional<std::string> WorkerClient::dspark_calibration(
+    const DSparkCalibrationCommand& command) {
+  return worker_->dspark_calibration(command);
+}
+
 void WorkerClient::get_cache_info(uint64_t& cluster_id,
                                   std::string& addr,
                                   uint16_t& port) {

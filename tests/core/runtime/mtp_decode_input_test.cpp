@@ -16,9 +16,13 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include <algorithm>
 #include <array>
 #include <limits>
+#include <numeric>
+#include <vector>
 
+#include "core/layers/common/attention_metadata.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "tests/core/runtime/task_pipeline_test_peer.h"
 
@@ -190,6 +194,173 @@ TEST_F(MtpDecodeInputTest, DSparkSamplesAnchorWithoutAnExtraQueryRow) {
                    .ok());
 }
 
+TEST_F(MtpDecodeInputTest, BlockDraftGraphPadsCompleteIsolatedRequests) {
+  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.enable_mla = false;
+  spec_.mask_token_id = 99;
+  spec_.model.max_sequences = 4;
+  for (const bool sample_from_anchor : {false, true}) {
+    SCOPED_TRACE(sample_from_anchor);
+    spec_.sample_from_anchor = sample_from_anchor;
+    std::unique_ptr<SlotBuffer> binding;
+    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                    spec_, torch::kBFloat16, device_, binding)
+                    .ok());
+    const uint32_t width =
+        TaskPipelineTestPeer::input_scratch(*binding).rows_per_sequence_;
+    const uint64_t pinned_bytes = binding->pinned_bytes();
+    const uint64_t device_bytes = binding->device_bytes();
+    const void* tokens_address = nullptr;
+    const void* blocks_address = nullptr;
+    for (const uint32_t physical_sequences : {2U, 3U, 4U, 2U, 3U}) {
+      SCOPED_TRACE(physical_sequences);
+      const uint32_t physical_rows = physical_sequences * width;
+      const uint32_t logical_tokens = 2 * width;
+      const uint32_t padding_tokens = physical_rows - logical_tokens;
+      run(*binding, physical_rows);
+      const auto& params = binding->model_params();
+      EXPECT_TRUE(params.enable_graph);
+      EXPECT_TRUE(params.meta.batch_forward_type.is_chunked_prefill());
+      EXPECT_EQ(params.meta.num_sequences, physical_sequences);
+      EXPECT_EQ(params.meta.actual_num_sequences, 2);
+      EXPECT_EQ(binding->tokens().numel(), physical_rows);
+      EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*binding).sequences_, 2U);
+      EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*binding)
+                    .planned_.q_seq_lens.size(),
+                2U);
+      EXPECT_TRUE(params.attention.device.block_tables.is_contiguous());
+      EXPECT_TRUE(torch::equal(
+          params.attention.device.block_tables.cpu().slice(/*dim=*/0,
+                                                           /*start=*/2),
+          torch::zeros({physical_sequences - 2, 4}, torch::kInt32)));
+      EXPECT_TRUE(
+          torch::equal(binding->tokens().cpu().slice(/*dim=*/0, logical_tokens),
+                       torch::full({padding_tokens}, 99, torch::kInt32)));
+      EXPECT_TRUE(torch::equal(
+          binding->positions().cpu().slice(/*dim=*/0, logical_tokens),
+          torch::zeros({padding_tokens}, torch::kInt32)));
+      EXPECT_TRUE(
+          torch::equal(params.attention.device.new_cache_slots.cpu().slice(
+                           /*dim=*/0, logical_tokens),
+                       torch::full({padding_tokens}, -1, torch::kInt32)));
+      EXPECT_TRUE(torch::equal(
+          params.attention.device.q_seq_lens.cpu(),
+          torch::full({physical_sequences}, width, torch::kInt32)));
+      EXPECT_TRUE(torch::equal(
+          params.attention.device.q_cu_seq_lens.cpu(),
+          torch::arange(width, physical_rows + width, width, torch::kInt32)));
+      EXPECT_TRUE(torch::equal(
+          params.attention.device.kv_seq_lens.cpu().slice(/*dim=*/0,
+                                                          /*start=*/2),
+          torch::full({physical_sequences - 2}, width, torch::kInt32)));
+      EXPECT_EQ(params.attention.host.q_cu_seq_lens.back(), physical_rows);
+      EXPECT_EQ(binding->pinned_bytes(), pinned_bytes);
+      EXPECT_EQ(binding->device_bytes(), device_bytes);
+      if (tokens_address == nullptr) {
+        tokens_address = binding->tokens().data_ptr();
+        blocks_address = params.attention.device.block_tables.data_ptr();
+      }
+      EXPECT_EQ(binding->tokens().data_ptr(), tokens_address);
+      EXPECT_EQ(params.attention.device.block_tables.data_ptr(),
+                blocks_address);
+    }
+    Stream prepare(device_);
+    ASSERT_TRUE(TaskPipelineTestPeer::prepare_mtp_decode(
+                    *binding, input(), batch_, prepare)
+                    .ok());
+    ASSERT_EQ(prepare.synchronize(), 0);
+    EXPECT_FALSE(binding->model_params().enable_graph);
+    EXPECT_EQ(binding->model_params().meta.num_sequences, 2);
+    EXPECT_EQ(binding->tokens().numel(), 2 * width);
+  }
+}
+
+TEST_F(MtpDecodeInputTest, BlockDraftStatePatchingLeavesPaddingUnmodified) {
+  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.enable_mla = false;
+  spec_.mask_token_id = 99;
+  spec_.sample_from_anchor = true;
+  spec_.model.max_sequences = 4;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding, /*padded_batch_size=*/12);
+  const auto tokens_before =
+      binding->tokens().cpu().slice(/*dim=*/0, /*start=*/6).clone();
+  const auto positions_before =
+      binding->positions().cpu().slice(/*dim=*/0, /*start=*/6).clone();
+  const auto slots_before = binding->model_params()
+                                .attention.device.new_cache_slots.cpu()
+                                .slice(
+                                    /*dim=*/0, /*start=*/6)
+                                .clone();
+  const auto lengths_before = binding->model_params()
+                                  .attention.device.kv_seq_lens.cpu()
+                                  .slice(
+                                      /*dim=*/0, /*start=*/2)
+                                  .clone();
+  state_->tokens_.copy_(torch::tensor({71, 81}, torch::kInt64));
+  state_->state_.positions.copy_(torch::tensor({9, 17}, torch::kInt32));
+  state_->state_.kv_seq_lens.copy_(torch::tensor({10, 18}, torch::kInt32));
+  ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
+  Stream task(device_);
+  {
+    auto guard = task.set_stream_guard();
+    TaskPipelineTestPeer::patch_mtp_decode(*binding, *state_);
+  }
+  ASSERT_EQ(task.synchronize(), 0);
+  EXPECT_TRUE(torch::equal(
+      binding->tokens().cpu().slice(/*dim=*/0, /*start=*/6), tokens_before));
+  EXPECT_TRUE(
+      torch::equal(binding->positions().cpu().slice(/*dim=*/0, /*start=*/6),
+                   positions_before));
+  EXPECT_TRUE(torch::equal(
+      binding->model_params().attention.device.new_cache_slots.cpu().slice(
+          /*dim=*/0, /*start=*/6),
+      slots_before));
+  EXPECT_TRUE(torch::equal(
+      binding->model_params().attention.device.kv_seq_lens.cpu().slice(
+          /*dim=*/0, /*start=*/2),
+      lengths_before));
+  EXPECT_TRUE(torch::equal(
+      binding->positions().cpu().slice(/*dim=*/0, /*start=*/0, /*end=*/6),
+      torch::tensor({9, 10, 11, 17, 18, 19}, torch::kInt32)));
+  EXPECT_EQ(state_->tokens_.numel(), 2);
+  EXPECT_EQ(binding->model_params().meta.actual_num_sequences, 2);
+}
+
+TEST_F(MtpDecodeInputTest, InvalidBlockDraftGraphBucketPreservesBinding) {
+  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.enable_mla = false;
+  spec_.mask_token_id = 99;
+  spec_.sample_from_anchor = true;
+  spec_.model.max_sequences = 4;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding, /*padded_batch_size=*/9);
+  const auto tokens_before = binding->tokens().cpu();
+  const auto positions_before = binding->positions().cpu();
+  const auto host_before = binding->model_params().attention.host.kv_seq_lens;
+  const void* address = binding->tokens().data_ptr();
+  Stream prepare(device_);
+  for (const uint32_t physical_rows : {3U, 5U, 7U, 13U, 15U}) {
+    SCOPED_TRACE(physical_rows);
+    EXPECT_FALSE(TaskPipelineTestPeer::prepare_planned_mtp_decode(
+                     *binding, input(), batch_, prepare, physical_rows)
+                     .ok());
+    EXPECT_TRUE(torch::equal(binding->tokens().cpu(), tokens_before));
+    EXPECT_TRUE(torch::equal(binding->positions().cpu(), positions_before));
+    EXPECT_EQ(binding->tokens().data_ptr(), address);
+    EXPECT_TRUE(binding->model_params().enable_graph);
+    EXPECT_EQ(binding->model_params().attention.host.kv_seq_lens, host_before);
+    EXPECT_EQ(binding->model_params().meta.num_sequences, 3);
+    EXPECT_EQ(binding->model_params().meta.actual_num_sequences, 2);
+  }
+}
+
 TEST_F(MtpDecodeInputTest, FirstDraftRepairsOnlyFullAcceptance) {
   std::unique_ptr<SlotBuffer> binding;
   ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
@@ -291,6 +462,234 @@ TEST_F(MtpDecodeInputTest, ValidatePatchesOnlyLogicalPrefixOfDpGraphBucket) {
   ASSERT_EQ(prepare.synchronize(), 0);
   EXPECT_FALSE(model.model_params().enable_graph);
   EXPECT_EQ(model.tokens().numel(), 8);
+}
+
+TEST_F(MtpDecodeInputTest, DSparkVerifyBindsFixedRowsWithoutRequestWidths) {
+  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.num_speculative_tokens = 7;
+  spec_.model.max_sequences = 4;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  const uint64_t pinned_bytes = binding->pinned_bytes();
+  const uint64_t device_bytes = binding->device_bytes();
+  const auto& scratch = TaskPipelineTestPeer::input_scratch(*binding);
+  const std::array<const void*, 7> scratch_addresses{
+      scratch.tokens_.data(),
+      scratch.positions_.data(),
+      scratch.slots_.data(),
+      scratch.q_lengths_.data(),
+      scratch.kv_lengths_.data(),
+      scratch.query_ends_.data(),
+      scratch.block_tables_.data()};
+  std::array<const void*, 7> device_addresses{};
+  std::array<const int32_t*, 2> host_addresses{};
+  Stream prepare(device_);
+  for (const auto geometry : {std::array<uint32_t, 4>{3, 8, 2, 16},
+                              std::array<uint32_t, 4>{7, 8, 2, 16},
+                              std::array<uint32_t, 4>{9, 16, 4, 32},
+                              std::array<uint32_t, 4>{13, 16, 4, 32},
+                              std::array<uint32_t, 4>{31, 32, 4, 32},
+                              std::array<uint32_t, 4>{32, 32, 4, 32},
+                              std::array<uint32_t, 4>{3, 8, 2, 16}}) {
+    const uint32_t logical_rows = geometry[0];
+    const uint32_t physical_rows = geometry[1];
+    const uint32_t block_table_width = geometry[2];
+    const int32_t max_kv_length = static_cast<int32_t>(geometry[3]);
+    SCOPED_TRACE(logical_rows);
+    ASSERT_TRUE(TaskPipelineTestPeer::prepare_dspark_validate(*binding,
+                                                              logical_rows,
+                                                              physical_rows,
+                                                              block_table_width,
+                                                              max_kv_length,
+                                                              /*batch_id=*/93,
+                                                              prepare)
+                    .ok());
+    ASSERT_EQ(prepare.synchronize(), 0);
+    const auto& params = binding->model_params();
+    EXPECT_TRUE(params.enable_graph);
+    EXPECT_FALSE(params.is_spec_verify);
+    EXPECT_TRUE(params.meta.batch_forward_type.is_decode());
+    EXPECT_EQ(params.meta.num_sequences, physical_rows);
+    EXPECT_EQ(params.meta.actual_num_sequences, logical_rows);
+    EXPECT_EQ(params.meta.batch_id, 93);
+    EXPECT_EQ(params.meta.q_max_seq_len, 1);
+    EXPECT_EQ(params.meta.kv_max_seq_len, max_kv_length);
+    EXPECT_FALSE(params.attn_metadata->is_prefill);
+    EXPECT_FALSE(params.attn_metadata->is_chunked_prefill);
+    EXPECT_EQ(binding->tokens().numel(), physical_rows);
+    EXPECT_TRUE(torch::equal(binding->tokens().cpu(),
+                             torch::ones({physical_rows}, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(binding->positions().cpu(),
+                             torch::zeros({physical_rows}, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(params.attention.device.new_cache_slots.cpu(),
+                             torch::full({physical_rows}, -1, torch::kInt32)));
+    EXPECT_TRUE(torch::equal(params.attention.device.q_seq_lens.cpu(),
+                             torch::ones({physical_rows}, torch::kInt32)));
+    EXPECT_TRUE(
+        torch::equal(params.attention.device.q_cu_seq_lens.cpu(),
+                     torch::arange(1, physical_rows + 1, torch::kInt32)));
+    std::vector<int32_t> expected_kv_lengths(physical_rows, 1);
+    std::fill_n(expected_kv_lengths.begin(), logical_rows, max_kv_length);
+    EXPECT_EQ(params.attention.host.kv_seq_lens, expected_kv_lengths);
+    EXPECT_TRUE(
+        torch::equal(params.attention.device.kv_seq_lens.cpu(),
+                     torch::tensor(expected_kv_lengths, torch::kInt32)));
+    EXPECT_TRUE(params.attention.device.block_tables.is_contiguous());
+    EXPECT_TRUE(torch::equal(params.attention.device.block_tables.cpu(),
+                             torch::zeros({physical_rows, 4}, torch::kInt32)));
+    std::vector<int32_t> expected_query_ends(physical_rows);
+    std::iota(expected_query_ends.begin(), expected_query_ends.end(), 1);
+    EXPECT_EQ(params.attention.host.q_cu_seq_lens, expected_query_ends);
+    EXPECT_EQ(params.attn_metadata->q_cu_seq_lens_host_vec,
+              std::vector<int64_t>(expected_query_ends.begin(),
+                                   expected_query_ends.end()));
+    const std::array<const void*, 7> current_device_addresses{
+        binding->tokens().data_ptr(),
+        binding->positions().data_ptr(),
+        params.attention.device.new_cache_slots.data_ptr(),
+        params.attention.device.q_seq_lens.data_ptr(),
+        params.attention.device.kv_seq_lens.data_ptr(),
+        params.attention.device.q_cu_seq_lens.data_ptr(),
+        params.attention.device.block_tables.data_ptr()};
+    const std::array<const int32_t*, 2> current_host_addresses{
+        params.attention.host.graph_q_seq_lens_data,
+        params.attention.host.graph_kv_seq_lens_data};
+    if (device_addresses[0] == nullptr) {
+      device_addresses = current_device_addresses;
+      host_addresses = current_host_addresses;
+    }
+    EXPECT_EQ(current_device_addresses, device_addresses);
+    EXPECT_EQ(current_host_addresses, host_addresses);
+    EXPECT_EQ((std::array<const void*, 7>{scratch.tokens_.data(),
+                                          scratch.positions_.data(),
+                                          scratch.slots_.data(),
+                                          scratch.q_lengths_.data(),
+                                          scratch.kv_lengths_.data(),
+                                          scratch.query_ends_.data(),
+                                          scratch.block_tables_.data()}),
+              scratch_addresses);
+    EXPECT_EQ(binding->pinned_bytes(), pinned_bytes);
+    EXPECT_EQ(binding->device_bytes(), device_bytes);
+    EXPECT_EQ(scratch.sequences_, 0U);
+    EXPECT_TRUE(scratch.planned_.token_ids.empty());
+  }
+}
+
+TEST_F(MtpDecodeInputTest, DSparkVerifyClearsPreviousUniformPatchViews) {
+  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.num_speculative_tokens = 7;
+  spec_.model.max_sequences = 4;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding, /*padded_batch_size=*/16);
+  const auto& scratch = TaskPipelineTestPeer::input_scratch(*binding);
+  ASSERT_EQ(scratch.sequences_, 2U);
+  ASSERT_TRUE(scratch.positions_view_.defined());
+  binding->model_params().is_spec_verify = true;
+  Stream prepare(device_);
+  ASSERT_TRUE(
+      TaskPipelineTestPeer::prepare_dspark_validate(*binding,
+                                                    /*logical_rows=*/9,
+                                                    /*physical_rows=*/16,
+                                                    /*block_table_width=*/4,
+                                                    /*max_kv_length=*/32,
+                                                    /*batch_id=*/94,
+                                                    prepare)
+          .ok());
+  ASSERT_EQ(prepare.synchronize(), 0);
+  EXPECT_FALSE(binding->model_params().is_spec_verify);
+  EXPECT_EQ(scratch.sequences_, 0U);
+  EXPECT_TRUE(scratch.planned_.token_ids.empty());
+  for (const auto* tensor : {&scratch.positions_view_,
+                             &scratch.kv_lengths_view_,
+                             &scratch.tokens_view_,
+                             &scratch.cache_positions_,
+                             &scratch.cache_first_column_,
+                             &scratch.model_first_column_,
+                             &scratch.block_indices_,
+                             &scratch.block_ids_,
+                             &scratch.cache_offsets_,
+                             &scratch.cache_offsets_flat_,
+                             &scratch.future_positions_}) {
+    EXPECT_FALSE(tensor->defined());
+  }
+  // Returning to ordinary uniform validation rebuilds its own patch views.
+  run(*binding, /*padded_batch_size=*/16);
+  EXPECT_EQ(scratch.sequences_, 2U);
+  EXPECT_TRUE(scratch.positions_view_.defined());
+}
+
+TEST_F(MtpDecodeInputTest, InvalidDSparkVerifyGeometryPreservesBinding) {
+  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.num_speculative_tokens = 7;
+  spec_.model.max_sequences = 4;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding, /*padded_batch_size=*/16);
+  const auto tokens_before = binding->tokens().cpu();
+  const auto positions_before = binding->positions().cpu();
+  const auto host_before = binding->model_params().attention.host.kv_seq_lens;
+  const auto& scratch = TaskPipelineTestPeer::input_scratch(*binding);
+  const auto scratch_tokens_before = scratch.tokens_;
+  const auto scratch_blocks_before = scratch.block_tables_;
+  const void* address = binding->tokens().data_ptr();
+  const void* patch_address = scratch.positions_view_.data_ptr();
+  Stream prepare(device_);
+  for (const auto geometry : {std::array<int32_t, 4>{0, 16, 4, 32},
+                              std::array<int32_t, 4>{17, 16, 4, 32},
+                              std::array<int32_t, 4>{1, 0, 4, 32},
+                              std::array<int32_t, 4>{1, 33, 4, 32},
+                              std::array<int32_t, 4>{1, 16, 0, 32},
+                              std::array<int32_t, 4>{1, 16, 5, 32},
+                              std::array<int32_t, 4>{1, 16, 4, 0},
+                              std::array<int32_t, 4>{1, 16, 4, -1},
+                              std::array<int32_t, 4>{1, 16, 2, 17}}) {
+    SCOPED_TRACE(geometry[3]);
+    EXPECT_FALSE(TaskPipelineTestPeer::prepare_dspark_validate(
+                     *binding,
+                     static_cast<uint32_t>(geometry[0]),
+                     static_cast<uint32_t>(geometry[1]),
+                     static_cast<uint32_t>(geometry[2]),
+                     geometry[3],
+                     /*batch_id=*/95,
+                     prepare)
+                     .ok());
+    EXPECT_TRUE(torch::equal(binding->tokens().cpu(), tokens_before));
+    EXPECT_TRUE(torch::equal(binding->positions().cpu(), positions_before));
+    EXPECT_EQ(binding->tokens().data_ptr(), address);
+    EXPECT_EQ(binding->model_params().attention.host.kv_seq_lens, host_before);
+    EXPECT_EQ(binding->model_params().meta.batch_id, batch_.batch_id);
+    EXPECT_EQ(scratch.tokens_, scratch_tokens_before);
+    EXPECT_EQ(scratch.block_tables_, scratch_blocks_before);
+    EXPECT_EQ(scratch.sequences_, 2U);
+    EXPECT_EQ(scratch.positions_view_.data_ptr(), patch_address);
+    EXPECT_EQ(scratch.planned_.q_seq_lens.size(), 16U);
+  }
+  // Reject the invocation kind without destroying a valid ordinary draft.
+  spec_.kind = MtpInvocationKind::DRAFT;
+  std::unique_ptr<SlotBuffer> draft;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, draft)
+                  .ok());
+  run(*draft);
+  EXPECT_FALSE(
+      TaskPipelineTestPeer::prepare_dspark_validate(*draft,
+                                                    /*logical_rows=*/1,
+                                                    /*physical_rows=*/1,
+                                                    /*block_table_width=*/4,
+                                                    /*max_kv_length=*/32,
+                                                    /*batch_id=*/95,
+                                                    prepare)
+          .ok());
+  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*draft).sequences_, 2U);
+  EXPECT_TRUE(
+      TaskPipelineTestPeer::input_scratch(*draft).positions_view_.defined());
 }
 
 TEST_F(MtpDecodeInputTest, LaterDraftLeavesSampledTokenToItsProducer) {

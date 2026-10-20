@@ -3371,7 +3371,8 @@ bool read_raw_sample_output(ShmOutputReader& reader, RawSampleOutput& sample) {
          read_embedding_output_metadata(reader,
                                         sample.mm_embeddings_metadata) &&
          reader.read(sample.speculative_token_stats.accepted_tokens) &&
-         reader.read(sample.speculative_token_stats.proposed_tokens);
+         reader.read(sample.speculative_token_stats.proposed_tokens) &&
+         reader.read(sample.speculative_token_stats.verified_rounds);
 }
 
 bool read_json_object_errors(ShmOutputReader& reader,
@@ -3967,7 +3968,7 @@ bool ForwardSharedMemoryManager::llm_output_write(
         row_index < static_cast<int64_t>(sampled.mm_embeddings.size())
             ? get_vector_tensor_size(sampled.mm_embeddings[row_index])
             : sizeof(int32_t);
-    payload_bytes += sizeof(uint64_t) + 2 * sizeof(int64_t);
+    payload_bytes += sizeof(uint64_t) + 3 * sizeof(int64_t);
   }
   payload_bytes += calculate_json_object_errors_size(output.json_object_errors);
   payload_bytes +=
@@ -4030,6 +4031,7 @@ bool ForwardSharedMemoryManager::llm_output_write(
                                         : speculative_token_stats[row_index];
     write_data(cursor, stats.accepted_tokens);
     write_data(cursor, stats.proposed_tokens);
+    write_data(cursor, stats.verified_rounds);
   }
   write_json_object_errors(cursor, output.json_object_errors);
   write_output_values(cursor,
@@ -4072,7 +4074,7 @@ bool ForwardSharedMemoryManager::llm_output_read(RawForwardOutput& output) {
   RawForwardOutput decoded;
   uint64_t rows = 0;
   constexpr uint64_t kMinimumRowBytes =
-      2 * sizeof(uint64_t) + sizeof(int32_t) + 2 * sizeof(int64_t);
+      2 * sizeof(uint64_t) + sizeof(int32_t) + 3 * sizeof(int64_t);
   if (!reader.read_count(rows, kMinimumRowBytes)) {
     return false;
   }
@@ -4225,7 +4227,7 @@ bool ForwardSharedMemoryManager::vlm_output_write(
         row_index < static_cast<int64_t>(sampled.mm_embeddings.size())
             ? get_vector_tensor_size(sampled.mm_embeddings[row_index])
             : sizeof(int32_t);
-    payload_bytes += sizeof(uint64_t) + 2 * sizeof(int64_t);
+    payload_bytes += sizeof(uint64_t) + 3 * sizeof(int64_t);
   }
   payload_bytes += calculate_json_object_errors_size(output.json_object_errors);
   payload_bytes +=
@@ -4288,6 +4290,7 @@ bool ForwardSharedMemoryManager::vlm_output_write(
                                         : speculative_token_stats[row_index];
     write_data(cursor, stats.accepted_tokens);
     write_data(cursor, stats.proposed_tokens);
+    write_data(cursor, stats.verified_rounds);
   }
   write_json_object_errors(cursor, output.json_object_errors);
   write_output_values(cursor,
@@ -4330,7 +4333,7 @@ bool ForwardSharedMemoryManager::vlm_output_read(RawForwardOutput& output) {
   RawForwardOutput decoded;
   uint64_t rows = 0;
   constexpr uint64_t kMinimumRowBytes =
-      2 * sizeof(uint64_t) + sizeof(int32_t) + 2 * sizeof(int64_t);
+      2 * sizeof(uint64_t) + sizeof(int32_t) + 3 * sizeof(int64_t);
   if (!reader.read_count(rows, kMinimumRowBytes)) {
     return false;
   }
@@ -4483,7 +4486,7 @@ bool ForwardSharedMemoryManager::rec_output_write(
         row_index < static_cast<int64_t>(sampled.mm_embeddings.size())
             ? get_vector_tensor_size(sampled.mm_embeddings[row_index])
             : sizeof(int32_t);
-    payload_bytes += sizeof(uint64_t) + 2 * sizeof(int64_t);
+    payload_bytes += sizeof(uint64_t) + 3 * sizeof(int64_t);
   }
   payload_bytes += calculate_json_object_errors_size(output.json_object_errors);
   payload_bytes +=
@@ -4546,6 +4549,7 @@ bool ForwardSharedMemoryManager::rec_output_write(
                                         : speculative_token_stats[row_index];
     write_data(cursor, stats.accepted_tokens);
     write_data(cursor, stats.proposed_tokens);
+    write_data(cursor, stats.verified_rounds);
   }
   write_json_object_errors(cursor, output.json_object_errors);
   write_output_values(cursor,
@@ -4588,7 +4592,7 @@ bool ForwardSharedMemoryManager::rec_output_read(RawForwardOutput& output) {
   RawForwardOutput decoded;
   uint64_t rows = 0;
   constexpr uint64_t kMinimumRowBytes =
-      2 * sizeof(uint64_t) + sizeof(int32_t) + 2 * sizeof(int64_t);
+      2 * sizeof(uint64_t) + sizeof(int32_t) + 3 * sizeof(int64_t);
   if (!reader.read_count(rows, kMinimumRowBytes)) {
     return false;
   }

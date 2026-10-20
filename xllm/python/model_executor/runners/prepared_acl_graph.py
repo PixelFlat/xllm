@@ -21,9 +21,40 @@ import torch.nn as nn
 
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
+
+
+class _PreparedBlockGraphEntry(AclGraphEntry):
+    """Retain the Slot table source for an in-graph compact metadata copy."""
+
+    __slots__ = ("source_block_table",)
+
+    source_block_table: torch.Tensor
+
+
+class _PreparedDSparkGraphEntry(AclGraphEntry):
+    """Capture adaptive packing into the target's borrowed input views."""
+
+    __slots__ = ("dspark_adaptive",)
+
+    dspark_adaptive: DSparkAdaptiveGraphInputs
+
+
+def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tensor, ...]:
+    return (
+        inputs.arena,
+        inputs.control,
+        inputs.anchors,
+        inputs.base_positions,
+        inputs.base_kv_lengths,
+        inputs.base_block_table,
+        inputs.offsets,
+        inputs.owners,
+        inputs.columns,
+    )
 
 
 class PreparedAclGraphRunner(AclGraphRunner):
@@ -33,6 +64,12 @@ class PreparedAclGraphRunner(AclGraphRunner):
     Native Slots own bucket selection and padding. Launch looks up the captured
     binding, uses the caller's task stream and returns a borrowed output whose
     readers must retire before reuse. A missing binding never captures at runtime.
+
+    Block drafts contain one complete equal-width query per request row.
+    Native padding must use reserved cache rows with valid device KV lengths;
+    zero-length dummy requests are not an attention padding representation.
+    A strided multi-request page-table slice uses a small contiguous table
+    allocated at warmup and refreshed inside the captured forward.
     """
 
     def __init__(
@@ -62,6 +99,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> tuple[object, ...]:
         tensors = (
             input_ids,
@@ -74,6 +113,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
             input_embedding,
             mtp_topk_indices,
         )
+        if dspark_adaptive is not None:
+            tensors += _dspark_graph_tensors(dspark_adaptive)
         addresses = tuple(
             None
             if tensor is None
@@ -89,7 +130,70 @@ class PreparedAclGraphRunner(AclGraphRunner):
 
         counts = tuple(getattr(metadata, "dp_execution_token_counts", ()))
         phases = tuple(getattr(metadata, "dp_is_decode", ()))
-        return addresses + ((counts, phases) if len(counts) > 1 else ())
+        dspark_binding = () if dspark_adaptive is None else ("adaptive_dspark", dspark_adaptive.block_size)
+        return addresses + dspark_binding + ((counts, phases) if len(counts) > 1 else ())
+
+    def _validate_dspark_graph_inputs(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+        inputs: DSparkAdaptiveGraphInputs,
+    ) -> None:
+        if not isinstance(inputs, DSparkAdaptiveGraphInputs):
+            raise ValueError("adaptive DSpark requires a DSparkAdaptiveGraphInputs descriptor")
+        if any(not isinstance(tensor, torch.Tensor) for tensor in _dspark_graph_tensors(inputs)):
+            raise ValueError("adaptive DSpark descriptor fields must be tensors")
+        if input_ids.device != self.device:
+            raise ValueError("adaptive DSpark inputs must use the graph runner device")
+        if inputs.anchors.ndim != 1 or not 1 <= inputs.anchors.numel() <= 128:
+            raise ValueError("adaptive DSpark requires request capacity in [1, 128]")
+        capacity = inputs.anchors.numel()
+        graph_rows = input_ids.numel()
+        if graph_rows > 1024:
+            raise ValueError("adaptive DSpark graph capacity exceeds 1024 rows")
+        if inputs.base_block_table.ndim != 2 or inputs.base_block_table.shape[0] != capacity:
+            raise ValueError("adaptive DSpark requires a block table per request-capacity row")
+        table_width = inputs.base_block_table.shape[1]
+        if (
+            table_width == 0
+            or not isinstance(inputs.block_size, int)
+            or isinstance(inputs.block_size, bool)
+            or inputs.block_size <= 0
+            or table_width * inputs.block_size > 2**31 - 1
+            or max(capacity, graph_rows) * table_width > 2**31 - 1
+        ):
+            raise ValueError("adaptive DSpark requires positive INT32 cache-page geometry")
+        if inputs.block_size != self.attention_backend.logical_page_size:
+            raise ValueError("adaptive DSpark block size must match the target attention backend")
+        for name, tensor, shape, dtype in (
+            ("arena", inputs.arena, (88 * capacity,), torch.uint8),
+            ("control", inputs.control, (1,), torch.int64),
+            ("anchors", inputs.anchors, (capacity,), torch.int64),
+            ("base positions", inputs.base_positions, (capacity,), torch.int32),
+            ("base KV lengths", inputs.base_kv_lengths, (capacity,), torch.int32),
+            ("base block table", inputs.base_block_table, (capacity, table_width), torch.int32),
+            ("offsets", inputs.offsets, (capacity + 1,), torch.int32),
+            ("owners", inputs.owners, (graph_rows,), torch.int32),
+            ("columns", inputs.columns, (graph_rows,), torch.int32),
+            ("tokens", input_ids, (graph_rows,), torch.int32),
+            ("positions", positions, (graph_rows,), torch.int32),
+            ("KV lengths", metadata.kv_seq_lens, (graph_rows,), torch.int32),
+            ("cache slots", metadata.slot_mapping, (graph_rows,), torch.int32),
+            ("block table", metadata.block_table, (graph_rows, table_width), torch.int32),
+            ("query lengths", metadata.q_seq_lens, (graph_rows,), torch.int32),
+            ("query ends", getattr(metadata, "q_cu_seq_lens", None), (graph_rows,), torch.int32),
+        ):
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tuple(tensor.shape) != shape
+                or tensor.dtype != dtype
+                or tensor.device != input_ids.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"adaptive DSpark requires contiguous {dtype} {name} with shape {shape} on the input device"
+                )
 
     def _validate_prepared_dp(self, input_ids: torch.Tensor, metadata: AttentionMetadata) -> None:
         if self.dp_size == 1:
@@ -110,16 +214,26 @@ class PreparedAclGraphRunner(AclGraphRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> None:
         batch_size = input_ids.numel()
         if not 0 < batch_size <= self.max_batch:
             raise ValueError("prepared ACL graph batch size exceeds capacity or is empty")
+        if dspark_adaptive is not None and (
+            self.dp_size != 1
+            or self._block_draft
+            or not self.attention_backend.is_mla
+            or input_embedding is not None
+            or mtp_topk_indices is not None
+        ):
+            raise ValueError("adaptive DSpark requires an ordinary MLA target graph with DP=1 and token-only inputs")
         self._validate_prepared_dp(input_ids, metadata)
         if self._block_draft:
             if metadata.is_prefill or not metadata.is_chunked_prefill or metadata.is_spec_verify:
                 raise ValueError("prepared block graph requires non-causal chunked-prefill queries")
-            if self.dp_size != 1 or input_embedding is not None or mtp_topk_indices is not None:
-                raise ValueError("prepared block graph requires DP=1 and ordinary token inputs")
+            if input_embedding is not None or mtp_topk_indices is not None:
+                raise ValueError("prepared block graph requires ordinary token inputs")
         elif metadata.is_prefill or metadata.is_chunked_prefill or metadata.is_spec_verify:
             raise ValueError("prepared ACL graph requires ordinary decode")
         if getattr(metadata, "prepared_attention_state", None) is None:
@@ -128,15 +242,43 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if block_table is None or block_table.dim() != 2:
             raise ValueError("prepared ACL graph requires a block table per metadata row")
         if self._block_draft:
+            request_count = block_table.shape[0]
+            query_width = batch_size // request_count if request_count else 0
             if (
                 input_ids.dim() != 1
                 or positions.shape != input_ids.shape
                 or metadata.slot_mapping.shape != input_ids.shape
-                or block_table.shape[0] != 1
+                or query_width == 0
+                or batch_size != request_count * query_width
+                or block_table.shape[1] == 0
                 or not block_table.is_contiguous()
-                or metadata.q_cu_seq_lens_host_values != [batch_size]
+                or block_table.dtype != torch.int32
+                or block_table.device != input_ids.device
+                or metadata.q_cu_seq_lens_host_values != [query_width * (index + 1) for index in range(request_count)]
             ):
-                raise ValueError("prepared block graph requires a single fixed-width request")
+                raise ValueError(
+                    "prepared block graph requires equal positive query widths and contiguous request rows"
+                )
+            kv_bounds = metadata.kv_seq_lens_host_values
+            if kv_bounds is None or len(kv_bounds) != request_count or any(bound < query_width for bound in kv_bounds):
+                raise ValueError("prepared block graph requires a conservative KV bound per request")
+            if max(kv_bounds) > block_table.shape[1] * self.attention_backend.page_size:
+                raise ValueError("prepared block graph KV bounds exceed block-table capacity")
+            for name, tensor, rows in (
+                ("positions", positions, batch_size),
+                ("cache slots", metadata.slot_mapping, batch_size),
+                ("query ends", metadata.q_cu_seq_lens, request_count),
+                ("KV lengths", metadata.kv_seq_lens, request_count),
+            ):
+                if (
+                    tensor is None
+                    or tensor.ndim != 1
+                    or tensor.numel() != rows
+                    or not tensor.is_contiguous()
+                    or tensor.dtype != torch.int32
+                    or tensor.device != input_ids.device
+                ):
+                    raise ValueError(f"prepared block graph requires contiguous int32 {name} on the input device")
         else:
             self._validate_decode_token_layout(input_ids, positions, metadata.slot_mapping, block_table.shape[0])
         expected_rows = block_table.shape[0] if self._block_draft else batch_size
@@ -149,6 +291,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 raise ValueError(f"prepared ACL graph requires {name} on the input device with one row per token")
         if mtp_topk_indices is not None and input_embedding is None:
             raise ValueError("prepared MTP top-k requires hidden state")
+        if dspark_adaptive is not None:
+            self._validate_dspark_graph_inputs(input_ids, positions, metadata, dspark_adaptive)
 
     @torch.inference_mode()
     def warmup_prepared(
@@ -160,13 +304,22 @@ class PreparedAclGraphRunner(AclGraphRunner):
         mtp_topk_indices: torch.Tensor | None = None,
         *,
         eplb: EplbRuntimeState | None = None,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> None:
-        self._validate_prepared_input(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
-        binding = self._prepared_binding(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+        self._validate_prepared_input(
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+        )
+        binding = self._prepared_binding(
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+        )
         if binding in self._prepared_graphs:
             return
         self._initialize_task_updates()
-        entry = AclGraphEntry()
+        if dspark_adaptive is not None:
+            entry = _PreparedDSparkGraphEntry()
+            entry.dspark_adaptive = dspark_adaptive
+        else:
+            entry = _PreparedBlockGraphEntry() if self._block_draft else AclGraphEntry()
         entry.batch_size = input_ids.numel()
         entry.graph = None
         entry.static_output = None
@@ -209,13 +362,20 @@ class PreparedAclGraphRunner(AclGraphRunner):
             # 16-page context plus the query. Keep the FIA bound constant;
             # live device lengths, not captured Host lists, mask the prefix.
             page_size = self.attention_backend.page_size
+            request_count = metadata.block_table.shape[0]
+            query_width = entry.batch_size // request_count
             required_pages = (max(metadata.kv_seq_lens_host_values) + page_size - 1) // page_size
-            minimum_pages = 16 + (entry.batch_size + page_size - 1) // page_size
+            minimum_pages = 16 + (query_width + page_size - 1) // page_size
             pages = min(1 << (max(required_pages, minimum_pages) - 1).bit_length(), metadata.block_table.shape[1])
             static = entry.static_metadata
-            static.block_table = metadata.block_table[:, :pages]
+            # Multiple narrowed rows are strided. Allocate only this small
+            # metadata table at warmup; refresh it inside the captured forward
+            # so replay has no extra Host launch and never scans full-context
+            # padding just to preserve contiguity.
+            entry.source_block_table = metadata.block_table[:, :pages]
+            static.block_table = entry.source_block_table.contiguous()
             static.q_cu_seq_lens_host_values = list(metadata.q_cu_seq_lens_host_values)
-            static.kv_seq_lens_host_values = [pages * page_size]
+            static.kv_seq_lens_host_values = [pages * page_size] * request_count
             static.is_chunked_prefill = True
             static.prepared_attention_state = self.attention_backend.prepare_metadata(static, device_kv_lengths=True)
         if mega_moe_token_mask is not None:
@@ -232,16 +392,51 @@ class PreparedAclGraphRunner(AclGraphRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> AclGraphEntry:
-        self._validate_prepared_input(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+        self._validate_prepared_input(
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+        )
         entry = self._prepared_graphs.get(
-            self._prepared_binding(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+            self._prepared_binding(
+                input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+            )
         )
         if entry is None:
             # Native admission already selected a captured bucket for every
             # rank. A missing Slot binding is an error, never a local fallback.
             raise RuntimeError("prepared ACL replay requires a warmed Slot binding")
         return entry
+
+    def _forward_static(self, entry: AclGraphEntry) -> ModelExecutionOutput:
+        if isinstance(entry, _PreparedDSparkGraphEntry):
+            inputs = entry.dspark_adaptive
+            metadata = entry.static_metadata
+            torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(inputs.arena, inputs.control, entry.batch_size)
+            torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(
+                inputs.anchors,
+                inputs.arena,
+                inputs.base_positions,
+                inputs.base_kv_lengths,
+                inputs.base_block_table,
+                inputs.control,
+                inputs.offsets,
+                entry.static_input_ids,
+                entry.static_positions,
+                metadata.kv_seq_lens,
+                metadata.slot_mapping,
+                metadata.block_table,
+                metadata.q_seq_lens,
+                inputs.owners,
+                inputs.columns,
+                inputs.block_size,
+            )
+        if isinstance(entry, _PreparedBlockGraphEntry):
+            table = entry.static_metadata.block_table
+            if table.data_ptr() != entry.source_block_table.data_ptr():
+                table.copy_(entry.source_block_table)
+        return super()._forward_static(entry)
 
     def execute(
         self,
@@ -253,10 +448,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
         mtp_topk_indices: torch.Tensor | None = None,
         *,
         eplb: EplbRuntimeState | None = None,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
     ) -> ModelExecutionOutput:
         if layer_synchronizer is not None:
             raise ValueError("prepared ACL replay does not support layer synchronization")
-        entry = self._resolve_entry(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
+        entry = self._resolve_entry(
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+        )
         return self._execute_entry(entry, input_ids, metadata, input_embedding, mtp_topk_indices, eplb=eplb)
 
     def execute_block(
@@ -302,13 +500,14 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if not entry.replay_logged:
             logger.info(
                 "Python prepared ACL graph first replay: model=%s bucket=%d physical_rows=%d "
-                "mtp_topk=%s hidden_shape=%s topk_shape=%s",
+                "mtp_topk=%s hidden_shape=%s topk_shape=%s adaptive_dspark=%s",
                 type(self.model).__name__,
                 entry.batch_size,
                 input_ids.numel(),
                 mtp_topk_indices is not None,
                 None if input_embedding is None else tuple(input_embedding.shape),
                 None if mtp_topk_indices is None else tuple(mtp_topk_indices.shape),
+                isinstance(entry, _PreparedDSparkGraphEntry),
             )
             entry.replay_logged = True
         return entry.static_output

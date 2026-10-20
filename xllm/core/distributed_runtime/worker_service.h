@@ -71,6 +71,11 @@ class WorkerService : public proto::DistributeWorker {
       proto::Status* response,
       ::google::protobuf::Closure* done) override;
 
+  void DSparkCalibration(::google::protobuf::RpcController* controller,
+                         const proto::DSparkCalibrationRequest* request,
+                         proto::DSparkCalibrationResponse* response,
+                         ::google::protobuf::Closure* done) override;
+
   void AllocateKVCacheWithTransfer(
       ::google::protobuf::RpcController* controller,
       const proto::AllocateKVCacheRequest* req,

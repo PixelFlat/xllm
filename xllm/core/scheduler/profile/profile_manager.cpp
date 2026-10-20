@@ -78,7 +78,36 @@ int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len) {
       max_context_len);
 }
 
+bool should_profile_legacy_speculative_validate(
+    const SpeculativeConfig& speculative_config,
+    bool enable_task_pipeline) {
+  const std::string& algorithm = speculative_config.speculative_algorithm();
+  const bool is_supported_algo =
+      SpeculativeConfig::is_mtp_algorithm(algorithm) ||
+      SpeculativeConfig::is_block_diffusion_algorithm(algorithm);
+  // Worker admission validates adaptive DSpark graph capabilities before the
+  // scheduler starts. That pipeline never creates the legacy Host controller.
+  const bool uses_dspark_pipeline =
+      enable_task_pipeline && SpeculativeConfig::is_dspark_algorithm(algorithm);
+  return speculative_config.enable_adaptive_speculative_decode() &&
+         speculative_config.num_speculative_tokens() > 1 && is_supported_algo &&
+         !uses_dspark_pipeline;
+}
 namespace {
+
+void configure_profile_sampling(RequestSamplingParam& sampling,
+                                const SpeculativeConfig& speculative_config,
+                                bool enable_task_pipeline) {
+  if (enable_task_pipeline &&
+      speculative_config.enable_adaptive_speculative_decode() &&
+      SpeculativeConfig::is_dspark_algorithm(
+          speculative_config.speculative_algorithm())) {
+    // Synthetic profiling requests use the same admission as serving. The
+    // adaptive pipeline supports greedy execution only, including startup.
+    sampling.temperature = 0.0F;
+    sampling.do_sample = false;
+  }
+}
 
 int32_t decode_warmup_token_bucket(const DecodeGraphWarmupPlan& plan,
                                    int32_t global_batch_size,
@@ -193,6 +222,11 @@ ProfileManager::ProfileManager(
     }
   }
 #endif
+  if (options_.enable_adaptive_dspark() ||
+      !options_.adaptive_dspark_calibration().empty() ||
+      !options_.adaptive_dspark_cost_table().empty()) {
+    calibrate_dspark_startup();
+  }
 }
 
 // --------------------- for test only ---------------------------
@@ -534,17 +568,8 @@ void ProfileManager::train_speculative_validate_time_predictor(
 }
 
 bool ProfileManager::should_profile_speculative_validate() const {
-  // The predictor feeds only the adaptive controller; the sweep is wasted
-  // startup time without it.
-  const SpeculativeConfig& speculative_config =
-      ::xllm::SpeculativeConfig::get_instance();
-  const std::string& speculative_algorithm =
-      speculative_config.speculative_algorithm();
-  const bool is_supported_algo =
-      SpeculativeConfig::supports_adaptive_speculative_decode(
-          speculative_algorithm);
-  return speculative_config.enable_adaptive_speculative_decode() &&
-         speculative_config.num_speculative_tokens() > 1 && is_supported_algo;
+  return should_profile_legacy_speculative_validate(
+      SpeculativeConfig::get_instance(), options_.enable_task_pipeline());
 }
 
 void ProfileManager::profile_speculative_validate_time() {
@@ -878,6 +903,9 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
   });
 
   RequestState req_state(token_ids);
+  configure_profile_sampling(req_state.sampling_param,
+                             SpeculativeConfig::get_instance(),
+                             options_.enable_task_pipeline());
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   req_state.is_graph_warmup = is_graph_warmup;
   auto request = std::make_shared<Request>(
@@ -949,6 +977,9 @@ std::shared_ptr<Request> ProfileManager::try_generate_single_decode_request(
   });
 
   RequestState req_state(prompt_token_ids);
+  configure_profile_sampling(req_state.sampling_param,
+                             SpeculativeConfig::get_instance(),
+                             options_.enable_task_pipeline());
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   req_state.is_graph_warmup = is_graph_warmup;
   const int32_t num_speculative_tokens =
@@ -1434,10 +1465,11 @@ void ProfileManager::warmup_decode_for_graph() {
                                       .acl_graph_decode_batch_size_limit())),
             static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()))));
   }
-  const int32_t decode_seq_len = warmup_decode_seq_len(
-      Platform::is_npu() &&
-          ::xllm::ExecutionConfig::get_instance().enable_fia_decode(),
-      max_context_len);
+  const int32_t decode_seq_len =
+      dspark_calibration_warmup_seq_len(warmup_decode_seq_len(
+          Platform::is_npu() &&
+              ::xllm::ExecutionConfig::get_instance().enable_fia_decode(),
+          max_context_len));
 
   const int32_t allocatable_sequences =
       measure_graph_decode_capacity(max_decode_batch_size, decode_seq_len);

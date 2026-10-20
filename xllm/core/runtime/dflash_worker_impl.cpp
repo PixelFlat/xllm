@@ -342,8 +342,19 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
   // Adaptive per-seq validate pruning. DP is supported: the worker gathers
   // each rank's true validate token count over the DP group before the target
   // forward (see sync_dp_global_token_nums_after_prune).
+  CHECK((options.adaptive_dspark_cost_table().empty() &&
+         options.adaptive_dspark_calibration().empty()) ||
+        (options.enable_task_pipeline() &&
+         options.enable_adaptive_speculative_decode() &&
+         SpeculativeConfig::is_dspark_algorithm(
+             options.speculative_algorithm()) &&
+         options.num_speculative_tokens() == 7))
+      << "DSpark startup calibration options require an adaptive DSpark Draft7 "
+         "task "
+         "pipeline.";
   const bool enable_adaptive = options.enable_adaptive_speculative_decode() &&
-                               options.num_speculative_tokens() > 1;
+                               options.num_speculative_tokens() > 1 &&
+                               !options.enable_task_pipeline();
   if (enable_adaptive) {
     adaptive_spec_controller_ =
         std::make_unique<AdaptiveSpeculativeController>(options);
@@ -353,11 +364,13 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      options_.enable_adaptive_speculative_decode() ||
+      (options_.enable_adaptive_speculative_decode() &&
+       !SpeculativeConfig::is_dspark_algorithm(
+           options_.speculative_algorithm())) ||
       options_.num_speculative_tokens() <= 0 || target_is_hybrid_recurrent_) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
-                          "Block task pipeline requires fixed-width, "
-                          "full-attention Target/Draft models.");
+                          "Block task pipeline requires fixed-width or "
+                          "adaptive DSpark full-attention models.");
   }
   SpeculativeTaskCapacity capacity;
   ::xllm::Status status = impl_->task_capacity(options_, capacity.common);
@@ -402,6 +415,24 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
        draft_args.model_type() == "DSparkDraftModel") &&
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
+  capacity.adaptive_dspark = options_.enable_adaptive_speculative_decode();
+  capacity.adaptive_min_gain = options_.adaptive_speculative_min_gain();
+  capacity.startup_calibration = capacity.adaptive_dspark;
+  capacity.calibration_leader = parallel_args_.rank() == 0;
+  if (capacity.startup_calibration &&
+      (!options_.enable_graph() || !options_.enable_schedule_overlap() ||
+       ExecutionConfig::get_instance().disable_graph_warmup() ||
+       (!options_.adaptive_dspark_calibration().empty() &&
+        !options_.adaptive_dspark_cost_table().empty()))) {
+    return ::xllm::Status(
+        StatusCode::INVALID_ARGUMENT,
+        "Adaptive DSpark calibration requires graph warmup, schedule overlap "
+        "and at most one calibration-config or saved-table input.");
+  }
+  const auto& target_args = impl_->context_.get_model_args();
+  capacity.sparse_dsa_target = target_args.model_type() == "glm_moe_dsa" &&
+                               target_args.enable_mla() &&
+                               target_args.index_topk() > 0;
   status = TaskExecutionPipeline::create(threadpool_,
                                          impl_->task_model(),
                                          draft_impl_->task_model(),

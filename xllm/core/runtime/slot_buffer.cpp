@@ -1563,6 +1563,58 @@ Status SlotBuffer::prepare_mtp_decode(SlotBuffer& input,
   return prepare_planned_mtp_decode(input, base, batch, stream);
 }
 
+Status SlotBuffer::prepare_block_draft_padded(SlotBuffer& input,
+                                              const ModelInputBatch& batch,
+                                              uint32_t physical_rows,
+                                              const Stream& stream) {
+  auto& view = *input.input_scratch_;
+  Status status = input.validate(view.planned_, batch);
+  if (!status.ok()) {
+    return status;
+  }
+  const uint32_t width = view.rows_per_sequence_;
+  const uint32_t logical_rows =
+      static_cast<uint32_t>(view.planned_.q_seq_lens.size());
+  if (width == 0 || physical_rows == 0 || physical_rows % width != 0 ||
+      physical_rows < view.planned_.token_ids.size() ||
+      physical_rows > input.capacity_.model.max_tokens ||
+      physical_rows / width > view.spec_.model.max_sequences ||
+      batch.num_actual_sequences != logical_rows ||
+      !batch.forward_type.is_chunked_prefill() ||
+      stream.get_stream()->device_index() != input.device_.index()) {
+    return invalid("Invalid fixed-width block draft graph batch or stream.");
+  }
+  const uint32_t physical_sequences = physical_rows / width;
+  // Scratch was reserved at creation. Extend only the inactive suffix; the
+  // usual single staging copy binds final contiguous Slot views. Reserved
+  // block zero supplies readable padding KV, while slot -1 prevents writes.
+  view.tokens_.resize(physical_rows, view.spec_.mask_token_id);
+  view.positions_.resize(physical_rows, 0);
+  view.slots_.resize(physical_rows, -1);
+  view.q_lengths_.resize(physical_sequences, static_cast<int32_t>(width));
+  view.kv_lengths_.resize(physical_sequences, static_cast<int32_t>(width));
+  view.query_ends_.resize(physical_sequences);
+  for (uint32_t row = logical_rows; row < physical_sequences; ++row) {
+    view.query_ends_[row] = static_cast<int32_t>((row + 1) * width);
+  }
+  view.block_tables_.resize(static_cast<uint64_t>(physical_sequences) *
+                                view.planned_.block_table_width,
+                            0);
+  const ModelInputHostView padded{view.tokens_,
+                                  view.positions_,
+                                  view.slots_,
+                                  view.q_lengths_,
+                                  view.kv_lengths_,
+                                  view.query_ends_,
+                                  view.block_tables_,
+                                  view.planned_.block_table_width};
+  status = input.prepare(padded, batch, stream);
+  if (status.ok()) {
+    input.model_params().enable_graph = true;
+  }
+  return status;
+}
+
 Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
                                               const ModelInputHostView& base,
                                               const ModelInputBatch& batch,
@@ -1575,10 +1627,15 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
   }
   expanded.num_actual_sequences =
       static_cast<uint32_t>(view.planned_.q_seq_lens.size());
-  Status status = physical_rows == 0
-                      ? input.prepare(view.planned_, expanded, stream)
-                      : input.prepare_decode_padded(
-                            view.planned_, expanded, physical_rows, stream);
+  Status status;
+  if (physical_rows == 0) {
+    status = input.prepare(view.planned_, expanded, stream);
+  } else if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+    status = prepare_block_draft_padded(input, expanded, physical_rows, stream);
+  } else {
+    status = input.prepare_decode_padded(
+        view.planned_, expanded, physical_rows, stream);
+  }
   if (!status.ok()) {
     return status;
   }
@@ -1620,6 +1677,77 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
   view.cache_offsets_flat_ = view.cache_offsets_.view({rows});
   view.future_positions_ =
       view.repair_scratch_storage_.narrow(/*dim=*/0, /*start=*/0, count);
+  return Status();
+}
+
+Status SlotBuffer::prepare_dspark_validate(SlotBuffer& input,
+                                           uint32_t logical_rows,
+                                           uint32_t physical_rows,
+                                           uint32_t block_table_width,
+                                           int32_t max_kv_length,
+                                           uint64_t batch_id,
+                                           const Stream& stream) {
+  if (!input.input_scratch_ ||
+      input.input_scratch_->spec_.kind != MtpInvocationKind::VALIDATE) {
+    return invalid("DSpark verification requires a VALIDATE model input.");
+  }
+  auto& view = *input.input_scratch_;
+  const uint64_t kv_capacity =
+      static_cast<uint64_t>(block_table_width) * view.spec_.logical_block_size;
+  if (logical_rows == 0 || logical_rows > physical_rows ||
+      physical_rows > input.capacity_.model.max_tokens ||
+      physical_rows > input.capacity_.model.max_sequences ||
+      block_table_width == 0 ||
+      block_table_width > input.capacity_.model.max_blocks_per_sequence ||
+      max_kv_length <= 0 ||
+      static_cast<uint64_t>(max_kv_length) > kv_capacity ||
+      stream.get_stream()->device_index() != input.device_.index()) {
+    return invalid("Invalid DSpark verification graph geometry or stream.");
+  }
+  // Creation reserves the expanded VALIDATE capacity. Prepare knows only
+  // M=B+K and the warmed physical graph size, not this round's request owners
+  // or widths. The ordered device packer replaces every placeholder row.
+  view.tokens_.assign(logical_rows, 1);
+  view.positions_.assign(logical_rows, 0);
+  view.slots_.assign(logical_rows, -1);
+  view.q_lengths_.assign(logical_rows, 1);
+  view.kv_lengths_.assign(logical_rows, max_kv_length);
+  view.query_ends_.resize(logical_rows);
+  std::iota(view.query_ends_.begin(), view.query_ends_.end(), 1);
+  view.block_tables_.assign(
+      static_cast<uint64_t>(logical_rows) * block_table_width, 0);
+  const ModelInputHostView placeholders{view.tokens_,
+                                        view.positions_,
+                                        view.slots_,
+                                        view.q_lengths_,
+                                        view.kv_lengths_,
+                                        view.query_ends_,
+                                        view.block_tables_,
+                                        block_table_width};
+  Status status = input.prepare_decode_padded(
+      placeholders,
+      {BatchForwardType::DECODE, logical_rows, batch_id, false},
+      physical_rows,
+      stream);
+  if (!status.ok()) {
+    return status;
+  }
+  input.model_params().is_spec_verify = false;
+  view.planned_ = {};
+  view.sequences_ = 0;
+  for (auto* tensor : {&view.positions_view_,
+                       &view.kv_lengths_view_,
+                       &view.tokens_view_,
+                       &view.cache_positions_,
+                       &view.cache_first_column_,
+                       &view.model_first_column_,
+                       &view.block_indices_,
+                       &view.block_ids_,
+                       &view.cache_offsets_,
+                       &view.cache_offsets_flat_,
+                       &view.future_positions_}) {
+    *tensor = torch::Tensor();
+  }
   return Status();
 }
 
@@ -1665,7 +1793,8 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
     auto ids_matrix =
         view.block_ids_.view({view.sequences_, view.rows_per_sequence_});
     torch::gather_out(ids_matrix,
-                      input.model_params().attention.device.block_tables,
+                      input.model_params().attention.device.block_tables.narrow(
+                          /*dim=*/0, /*start=*/0, view.sequences_),
                       /*dim=*/1,
                       indices_matrix);
   } else {

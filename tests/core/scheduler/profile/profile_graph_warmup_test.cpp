@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/request/incremental_decoder.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
@@ -76,6 +77,102 @@ class ScopedVmmConfigSnapshot final {
   bool enabled_;
   bool elastic_;
 };
+
+class ScopedSpeculativeSamplingConfigSnapshot final {
+ public:
+  ScopedSpeculativeSamplingConfigSnapshot()
+      : adaptive_(SpeculativeConfig::get_instance()
+                      .enable_adaptive_speculative_decode()),
+        algorithm_(SpeculativeConfig::get_instance().speculative_algorithm()) {}
+
+  ~ScopedSpeculativeSamplingConfigSnapshot() {
+    SpeculativeConfig::get_instance()
+        .enable_adaptive_speculative_decode(adaptive_)
+        .speculative_algorithm(algorithm_);
+  }
+
+ private:
+  bool adaptive_;
+  std::string algorithm_;
+};
+
+TEST(SpeculativeValidateProfileGateTest, AdaptiveAndTaskPipelineRemainOptIn) {
+  SpeculativeConfig speculative;
+  const ProfileManager::Options options;
+
+  EXPECT_FALSE(speculative.enable_adaptive_speculative_decode());
+  EXPECT_FALSE(options.enable_task_pipeline());
+  EXPECT_FALSE(should_profile_legacy_speculative_validate(
+      speculative, options.enable_task_pipeline()));
+
+  speculative.speculative_algorithm("DSpark").num_speculative_tokens(7);
+  EXPECT_FALSE(should_profile_legacy_speculative_validate(
+      speculative, /*enable_task_pipeline=*/true));
+  EXPECT_FALSE(should_profile_legacy_speculative_validate(
+      speculative, /*enable_task_pipeline=*/false));
+}
+
+TEST(SpeculativeValidateProfileGateTest,
+     DSparkPipelineUsesOwnGraphBucketCosts) {
+  SpeculativeConfig speculative;
+  speculative.enable_adaptive_speculative_decode(true).num_speculative_tokens(
+      7);
+  ProfileManager::Options options;
+  options.enable_profile_step_time(true);
+
+  for (const std::string algorithm : {"DSpark", "dspark", "DSPARK", "dSpArK"}) {
+    SCOPED_TRACE(algorithm);
+    speculative.speculative_algorithm(algorithm);
+    options.enable_task_pipeline(true);
+    EXPECT_FALSE(should_profile_legacy_speculative_validate(
+        speculative, options.enable_task_pipeline()));
+    // The separate scheduler prefill/decode profiling flag stays enabled.
+    EXPECT_TRUE(options.enable_profile_step_time());
+
+    options.enable_task_pipeline(false);
+    EXPECT_TRUE(should_profile_legacy_speculative_validate(
+        speculative, options.enable_task_pipeline()));
+  }
+}
+
+TEST(SpeculativeValidateProfileGateTest, OtherAlgorithmsKeepLegacyRouting) {
+  SpeculativeConfig speculative;
+  speculative.enable_adaptive_speculative_decode(true).num_speculative_tokens(
+      3);
+  for (const std::string algorithm : {"MTP", "mtp", "DFlash", "DFlash2"}) {
+    speculative.speculative_algorithm(algorithm);
+    for (bool enable_task_pipeline : {false, true}) {
+      EXPECT_TRUE(should_profile_legacy_speculative_validate(
+          speculative, enable_task_pipeline))
+          << algorithm;
+    }
+  }
+}
+
+TEST(SpeculativeValidateProfileGateTest, UnsupportedOrNonPrunableSkipsSweep) {
+  SpeculativeConfig speculative;
+  speculative.enable_adaptive_speculative_decode(true);
+  for (const std::string algorithm : {"MTP", "DFlash", "DFlash2", "DSpark"}) {
+    speculative.speculative_algorithm(algorithm);
+    for (const int32_t num_speculative_tokens : {0, 1}) {
+      speculative.num_speculative_tokens(num_speculative_tokens);
+      for (bool enable_task_pipeline : {false, true}) {
+        EXPECT_FALSE(should_profile_legacy_speculative_validate(
+            speculative, enable_task_pipeline))
+            << algorithm;
+      }
+    }
+  }
+  speculative.num_speculative_tokens(7);
+  for (const std::string algorithm : {"Eagle3", "Suffix", "unknown"}) {
+    speculative.speculative_algorithm(algorithm);
+    for (bool enable_task_pipeline : {false, true}) {
+      EXPECT_FALSE(should_profile_legacy_speculative_validate(
+          speculative, enable_task_pipeline))
+          << algorithm;
+    }
+  }
+}
 
 TEST(DecodeGraphWarmupConfigTest, OrdinaryTargetUsesSingleTokenShape) {
   ExecutionConfig config;
@@ -230,6 +327,7 @@ class RecordingProfileEngine final : public Engine {
     observed_batches_.reserve(options.max_seqs_per_batch());
     observed_kv_capacities_.reserve(options.max_seqs_per_batch());
     observed_bootstrap_embeddings_.reserve(options.max_seqs_per_batch());
+    observed_greedy_samples_.reserve(options.max_seqs_per_batch());
     model_args_.vocab_size(128)
         .eos_token_id(2)
         .max_position_embeddings(16)
@@ -250,6 +348,13 @@ class RecordingProfileEngine final : public Engine {
             sequence->kv_state().current_max_tokens_capacity());
         observed_bootstrap_embeddings_.emplace_back(
             sequence->get_mtp_bootstrap_embedding().defined());
+        // Follow the real request-to-sampler conversion rather than assuming
+        // the presence of a per-row sampling tensor implies greedy admission.
+        SamplingParameters sampling;
+        sampling.init({sequence->sampling_param()}, {0}, {0}, {}, {}, {});
+        observed_greedy_samples_.emplace_back(
+            sampling.sampling_mode == SamplingMode::GREEDY &&
+            !sampling.do_sample.defined());
       }
     }
     observed_batches_.emplace_back(sequence_count);
@@ -291,6 +396,9 @@ class RecordingProfileEngine final : public Engine {
   const std::vector<std::vector<int32_t>>& observed_dp_ranks() const {
     return observed_dp_ranks_;
   }
+  const std::vector<bool>& observed_greedy_samples() const {
+    return observed_greedy_samples_;
+  }
 
  private:
   std::unique_ptr<BlockManagerPool> block_manager_;
@@ -302,7 +410,57 @@ class RecordingProfileEngine final : public Engine {
   std::vector<size_t> observed_kv_capacities_;
   std::vector<bool> observed_bootstrap_embeddings_;
   std::vector<std::vector<int32_t>> observed_dp_ranks_;
+  std::vector<bool> observed_greedy_samples_;
 };
+
+TEST(GraphWarmupTest, OnlyAdaptiveDsparkPipelineUsesGreedySyntheticRequests) {
+  ScopedDecodeGraphConfigSnapshot execution_snapshot;
+  ScopedSpeculativeSamplingConfigSnapshot sampling_snapshot;
+  ExecutionConfig::get_instance().enable_graph(false);
+  for (const bool adaptive : {false, true}) {
+    for (const bool pipeline : {false, true}) {
+      for (const std::string algorithm :
+           {"DSpark", "dspark", "MTP", "DFlash", "DFlash2"}) {
+        SCOPED_TRACE(algorithm);
+        SCOPED_TRACE(adaptive);
+        SCOPED_TRACE(pipeline);
+        SpeculativeConfig::get_instance()
+            .enable_adaptive_speculative_decode(adaptive)
+            .speculative_algorithm(algorithm);
+        RecordingProfileEngine engine;
+        ProfileManager::Options options;
+        options.max_tokens_per_batch(8)
+            .max_seqs_per_batch(2)
+            .dp_size(1)
+            .enable_task_pipeline(pipeline)
+            .instance_role(InstanceRole::DECODE);
+        ProfileManager profile_manager(&engine, options);
+
+        // Exercise both synthetic factories, including non-capture profiling
+        // requests that still execute through the same worker admission.
+        profile_manager.run_request(/*token_length=*/4,
+                                    /*prefix_length=*/0,
+                                    /*batch_size=*/2,
+                                    /*extra_token_length=*/0,
+                                    /*is_graph_warmup=*/false);
+        profile_manager.profile_decode_step_time(/*token_length=*/5,
+                                                 /*batch_size=*/2,
+                                                 /*min_context_len=*/5,
+                                                 /*max_context_len=*/5);
+
+        const bool expected_greedy =
+            adaptive && pipeline &&
+            SpeculativeConfig::is_dspark_algorithm(algorithm);
+        ASSERT_EQ(engine.observed_greedy_samples().size(), 8);
+        for (const bool greedy : engine.observed_greedy_samples()) {
+          EXPECT_EQ(greedy, expected_greedy);
+        }
+      }
+    }
+  }
+  // Serving request defaults are independent of synthetic profile requests.
+  EXPECT_FLOAT_EQ(RequestSamplingParam().temperature, 1.0F);
+}
 
 TEST(GraphWarmupTest, BuildsCanonicalBuckets) {
   const DecodeGraphWarmupPlan plan = get_compatibility_decode_graph_warmup_plan(

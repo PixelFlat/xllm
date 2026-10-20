@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
 #include "core/platform/platform.h"
 #include "core/runtime/task_execution_pipeline.h"
 #if defined(USE_NPU)
@@ -112,7 +113,10 @@ Worker::Worker(const ParallelArgs& parallel_args,
           (!options.enable_speculative_decode() ||
            (SpeculativeConfig::supports_task_pipeline(
                 options.speculative_algorithm()) &&
-            !options.enable_adaptive_speculative_decode())) &&
+            (!options.enable_adaptive_speculative_decode() ||
+             (SpeculativeConfig::is_dspark_algorithm(
+                  options.speculative_algorithm()) &&
+              options.enable_graph() && parallel_args.dp_size() == 1)))) &&
           !options.enable_prefill_piecewise_graph() &&
           options.host_blocks_factor() <= 1.0 &&
           !options.enable_kvcache_store() &&
@@ -121,8 +125,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !KVCacheConfig::get_instance().enable_virtual_memory() &&
           !LoadConfig::get_instance().enable_rolling_load() &&
           parallel_args.layerwise_split_size() == 1)
-        << "Task pipeline requires Python LLM or fixed "
-           "MTP/DFlash/DFlash2/DSpark with "
+        << "Task pipeline requires Python LLM, fixed "
+           "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs with DP=1 and "
            "a layerwise split of one, without offload.";
   }
   if (options.enable_speculative_decode()) {
@@ -237,6 +241,14 @@ bool Worker::set_speculative_validate_time_predictor(
   SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
       predictor);
   return true;
+}
+
+std::optional<std::string> Worker::dspark_calibration(
+    const DSparkCalibrationCommand& command) {
+  if (!task_pipeline_) {
+    return std::nullopt;
+  }
+  return task_pipeline_->dspark_calibration(command);
 }
 
 void Worker::get_cache_info(uint64_t& cluster_id,

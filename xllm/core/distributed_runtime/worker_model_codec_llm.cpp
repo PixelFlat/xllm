@@ -149,6 +149,8 @@ bool decode_llm_output(const proto::LLMForwardResponse& response,
         sequence.speculative_token_stats().accepted_tokens();
     sample.speculative_token_stats.proposed_tokens =
         sequence.speculative_token_stats().proposed_tokens();
+    sample.speculative_token_stats.verified_rounds =
+        sequence.speculative_token_stats().verified_rounds();
     decoded_output.outputs.emplace_back(std::move(sample));
   }
   output = std::move(decoded_output);
@@ -302,6 +304,7 @@ bool encode_llm_output(
           pb_seq_out->mutable_speculative_token_stats();
       pb_stats->set_accepted_tokens(stats.accepted_tokens);
       pb_stats->set_proposed_tokens(stats.proposed_tokens);
+      pb_stats->set_verified_rounds(stats.verified_rounds);
     }
   }
 

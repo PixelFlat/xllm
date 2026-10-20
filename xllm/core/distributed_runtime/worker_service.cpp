@@ -33,7 +33,10 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/distributed_runtime/comm_channel.h"
 #include "core/distributed_runtime/worker_model_codec.h"
+#include "core/framework/config/eplb_config.h"
+#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
@@ -1125,6 +1128,29 @@ void WorkerService::SetSpeculativeValidateTimePredictor(
         worker_->set_speculative_validate_time_predictor(predictor));
   });
   return;
+}
+
+void WorkerService::DSparkCalibration(
+    ::google::protobuf::RpcController* controller,
+    const proto::DSparkCalibrationRequest* request,
+    proto::DSparkCalibrationResponse* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, request, response, done]() {
+    brpc::ClosureGuard done_guard(done);
+    if (request->action() < proto::DSparkCalibrationRequest::CAPABILITIES ||
+        request->action() > proto::DSparkCalibrationRequest::INSTALL_COSTS) {
+      response->set_ok(false);
+      return;
+    }
+    const DSparkCalibrationCommand command{
+        static_cast<DSparkCalibrationAction>(request->action()),
+        request->payload()};
+    const auto result = worker_->dspark_calibration(command);
+    response->set_ok(result.has_value());
+    if (result) {
+      response->set_payload(*result);
+    }
+  });
 }
 
 void WorkerService::AllocateKVCacheWithTransfer(

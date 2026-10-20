@@ -61,6 +61,7 @@ cc_library(
     worker_rendezvous.h
   SRCS
     decode_graph_bucket.cpp
+    dspark_startup_calibration.cpp
     executor.cpp
     task_execution_pipeline.cpp
     slot_buffer.cpp

@@ -91,6 +91,21 @@ bool DistributedWorkerManager::set_speculative_validate_time_predictor(
   return success;
 }
 
+std::optional<std::vector<std::string>>
+DistributedWorkerManager::dspark_calibration(
+    const DSparkCalibrationCommand& command) {
+  std::vector<std::string> results;
+  results.reserve(worker_clients_.size());
+  for (const auto& worker : worker_clients_) {
+    auto result = worker->dspark_calibration(command);
+    if (!result) {
+      return std::nullopt;
+    }
+    results.emplace_back(std::move(*result));
+  }
+  return results;
+}
+
 DistributedWorkerManager::~DistributedWorkerManager() {
   std::lock_guard<std::mutex> lock(link_mutex_);
   // Drain connection work while the worker clients and servers are still alive.

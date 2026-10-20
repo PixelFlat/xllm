@@ -76,6 +76,15 @@ class Request : public RequestBase {
 
   void log_statistic(double total_latency);
 
+  void log_statistic(double total_latency,
+                     const SpeculativeTokenStats& speculative_stats);
+
+  // Called by the scheduler before dispatching a completed response. The
+  // returned value must not observe later retirement of an overlapped step.
+  SpeculativeTokenStats speculative_token_stats_snapshot() const {
+    return *speculative_token_stats_;
+  }
+
   // Rebase local elapsed time with cumulative upstream latency at handoff.
   void set_upstream_latency_seconds(double upstream_latency_seconds);
 

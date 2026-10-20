@@ -105,6 +105,11 @@ double Request::end_to_end_latency_seconds() const {
 }
 
 void Request::log_statistic(double total_latency) {
+  log_statistic(total_latency, speculative_token_stats_snapshot());
+}
+
+void Request::log_statistic(double total_latency,
+                            const SpeculativeTokenStats& speculative_stats) {
   // log the request statistics
   int idx = 0;
   for (const auto& seq : sequences()) {
@@ -118,17 +123,22 @@ void Request::log_statistic(double total_latency) {
       gen_speed = gen_tokens / generation_latency;
     }
     std::string speculative_stats_log;
-    if (speculative_token_stats_->proposed_tokens > 0) {
-      const double acceptance_rate =
-          static_cast<double>(speculative_token_stats_->accepted_tokens) /
-          static_cast<double>(speculative_token_stats_->proposed_tokens);
+    if (speculative_stats.verified_rounds > 0 ||
+        speculative_stats.proposed_tokens > 0) {
       std::ostringstream stream;
       stream << ", speculative_accepted_tokens: "
-             << speculative_token_stats_->accepted_tokens
+             << speculative_stats.accepted_tokens
              << ", speculative_proposed_tokens: "
-             << speculative_token_stats_->proposed_tokens << std::fixed
-             << std::setprecision(4)
-             << ", speculative_token_acceptance_rate: " << acceptance_rate;
+             << speculative_stats.proposed_tokens
+             << ", speculative_verified_rounds: "
+             << speculative_stats.verified_rounds;
+      if (speculative_stats.proposed_tokens > 0) {
+        const double acceptance_rate =
+            static_cast<double>(speculative_stats.accepted_tokens) /
+            static_cast<double>(speculative_stats.proposed_tokens);
+        stream << std::fixed << std::setprecision(4)
+               << ", speculative_token_acceptance_rate: " << acceptance_rate;
+      }
       speculative_stats_log = stream.str();
     }
     LOG(INFO) << "x-request-id: " << x_request_id_ << ", "

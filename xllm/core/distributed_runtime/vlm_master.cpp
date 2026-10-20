@@ -247,6 +247,8 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
         .enable_adaptive_speculative_decode(
             options_.enable_adaptive_speculative_decode())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
+        .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
+        .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())
         .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
         .transfer_listen_port(options_.transfer_listen_port())
         .host_blocks_factor(options_.host_blocks_factor())

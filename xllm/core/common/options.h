@@ -101,6 +101,10 @@ class Options {
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
 
+  PROPERTY(std::string, adaptive_dspark_cost_table);
+  PROPERTY(std::string, adaptive_dspark_calibration);
+  PROPERTY(std::string, adaptive_dspark_cost_table_output);
+
   // thread num to handle requests
   PROPERTY(size_t, num_request_handling_threads) = 4;
 

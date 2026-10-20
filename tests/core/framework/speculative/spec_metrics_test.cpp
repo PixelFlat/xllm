@@ -53,6 +53,8 @@ TEST(SpeculativeTokenStatsTest, CountsTokensPerSequence) {
   ASSERT_EQ(metrics.sequence_stats.size(), 2);
   EXPECT_EQ(metrics.sequence_stats[0].accepted_tokens, 2);
   EXPECT_EQ(metrics.sequence_stats[1].accepted_tokens, 5);
+  EXPECT_EQ(metrics.sequence_stats[0].verified_rounds, 1);
+  EXPECT_EQ(metrics.sequence_stats[1].verified_rounds, 1);
 }
 
 TEST(SpeculativeTokenStatsTest, CountsAdaptiveTokensPerSequence) {
@@ -71,6 +73,33 @@ TEST(SpeculativeTokenStatsTest, CountsAdaptiveTokensPerSequence) {
   EXPECT_EQ(aggregate.sequence_stats[1].proposed_tokens, 2);
   EXPECT_EQ(aggregate.sequence_stats[2].accepted_tokens, 0);
   EXPECT_EQ(aggregate.sequence_stats[2].proposed_tokens, 0);
+  for (const SpeculativeTokenStats& row_stats : aggregate.sequence_stats) {
+    EXPECT_EQ(row_stats.verified_rounds, 1);
+  }
+}
+
+TEST(SpeculativeTokenStatsTest, DefaultsDoNotInferRoundsFromTokenCounts) {
+  const SpeculativeTokenStats empty;
+  EXPECT_EQ(empty.verified_rounds, 0);
+  const SpeculativeTokenStats legacy{2, 7};
+  EXPECT_EQ(legacy.verified_rounds, 0);
+}
+
+TEST(SpeculativeTokenStatsTest, CountsOneRoundForEveryVerifiedRowAndBudget) {
+  for (const torch::ScalarType dtype : {torch::kInt32, torch::kInt64}) {
+    const auto tokens = torch::tensor({{10, -1, -1, -1, -1, -1, -1, -1},
+                                       {20, 21, -1, -1, -1, -1, -1, -1},
+                                       {30, 31, 32, 33, 34, 35, 36, 37},
+                                       {40, -1, -1, -1, -1, -1, -1, -1}},
+                                      dtype);
+    const auto metrics = calculate_from_widths(tokens, {7, 2, 7, 0});
+    ASSERT_EQ(metrics.sequence_stats.size(), 4U);
+    const std::vector<int64_t> accepted{0, 1, 7, 0};
+    for (size_t row = 0; row < accepted.size(); ++row) {
+      EXPECT_EQ(metrics.sequence_stats[row].accepted_tokens, accepted[row]);
+      EXPECT_EQ(metrics.sequence_stats[row].verified_rounds, 1);
+    }
+  }
 }
 
 TEST(SpeculativeTokenStatsTest, GreedyExcludesTargetTokens) {
@@ -106,6 +135,7 @@ TEST(SpeculativeTokenStatsTest, GreedyExcludesTargetTokens) {
   for (size_t row = 0; row < stats.size(); ++row) {
     EXPECT_EQ(stats[row].accepted_tokens, static_cast<int64_t>(row));
     EXPECT_EQ(stats[row].proposed_tokens, 3);
+    EXPECT_EQ(stats[row].verified_rounds, 1);
   }
   EXPECT_EQ(output_stats.num_committed_tokens, 10);
   EXPECT_EQ(output_stats.num_accepted_tokens_per_pos,
@@ -147,6 +177,7 @@ TEST(SpeculativeTokenStatsTest, BlockRandomExcludesTargetTokens) {
   for (size_t row = 0; row < stats.size(); ++row) {
     EXPECT_EQ(stats[row].accepted_tokens, static_cast<int64_t>(row));
     EXPECT_EQ(stats[row].proposed_tokens, 3);
+    EXPECT_EQ(stats[row].verified_rounds, 1);
   }
 }
 
@@ -190,6 +221,7 @@ TEST(SpeculativeTokenStatsTest, BlockHandlesSingleAndZeroDrafts) {
   for (const SpeculativeTokenStats& row_stats : zero_stats) {
     EXPECT_EQ(row_stats.accepted_tokens, 0);
     EXPECT_EQ(row_stats.proposed_tokens, 0);
+    EXPECT_EQ(row_stats.verified_rounds, 1);
   }
 }
 

@@ -41,10 +41,16 @@ struct TaskPipelineTestPeer {
   static constexpr auto input_scratch = [](SlotBuffer& input) -> auto& {
     return *input.input_scratch_;
   };
+  static constexpr auto adaptive_costs =
+      [](const TaskExecutionPipeline& pipeline) -> const auto& {
+    return *pipeline.speculative_capacity_->adaptive_costs;
+  };
   static constexpr auto plan_mtp_decode = SlotBuffer::plan_mtp_decode;
   static constexpr auto prepare_mtp_decode = SlotBuffer::prepare_mtp_decode;
   static constexpr auto prepare_planned_mtp_decode =
       SlotBuffer::prepare_planned_mtp_decode;
+  static constexpr auto prepare_dspark_validate =
+      SlotBuffer::prepare_dspark_validate;
   static constexpr auto patch_mtp_decode = SlotBuffer::patch_mtp_decode;
   static constexpr auto prepare_mtp_prefill = SlotBuffer::prepare_mtp_prefill;
   static constexpr auto patch_mtp_prefill = SlotBuffer::patch_mtp_prefill;

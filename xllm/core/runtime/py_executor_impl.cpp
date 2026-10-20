@@ -67,6 +67,25 @@ py::object mtp_topk_indices(const ModelParamsView& params) {
   return py::none();
 }
 
+py::object dspark_adaptive_graph_input(const ModelParamsView& params) {
+  const auto& input = params.graph.dspark_adaptive;
+  if (!input.arena.defined()) {
+    return py::none();
+  }
+  return py::module_::import("xllm.python.model_executor.dspark_graph_input")
+      .attr("DSparkAdaptiveGraphInputs")(
+          py::arg("arena") = input.arena,
+          py::arg("control") = input.control,
+          py::arg("anchors") = input.anchors,
+          py::arg("base_positions") = input.base_positions,
+          py::arg("base_kv_lengths") = input.base_kv_lengths,
+          py::arg("base_block_table") = input.base_block_table,
+          py::arg("offsets") = input.offsets,
+          py::arg("owners") = input.owners,
+          py::arg("columns") = input.columns,
+          py::arg("block_size") = input.block_size);
+}
+
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
 
@@ -408,6 +427,10 @@ void PyExecutorImpl::warmup_prepared_graph(const torch::Tensor& tokens,
   py::gil_scoped_acquire gil;
   bind_kv_caches(kv_caches);
   PyCausalLM::set_active_instance(py_causal_lm_);
+  py::kwargs graph_kwargs;
+  if (params.graph.dspark_adaptive.arena.defined()) {
+    graph_kwargs["dspark_adaptive"] = dspark_adaptive_graph_input(params);
+  }
   py_executor_.attr("warmup_prepared_graph")(
       tokens,
       positions,
@@ -416,7 +439,8 @@ void PyExecutorImpl::warmup_prepared_graph(const torch::Tensor& tokens,
       mtp_topk_indices(params),
       optional_tensor(params.expert.expert_load_data),
       optional_tensor(params.expert.eplb_decode_token_mask),
-      params.meta.is_graph_warmup);
+      params.meta.is_graph_warmup,
+      **graph_kwargs);
 }
 
 ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
@@ -584,6 +608,10 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // get_input_embeddings above), so the runner takes the 2-arg model() branch
   // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
   // mRoPE [3,N]->1-D decode collapse.
+  py::kwargs graph_kwargs;
+  if (params.graph.dspark_adaptive.arena.defined()) {
+    graph_kwargs["dspark_adaptive"] = dspark_adaptive_graph_input(params);
+  }
   py::object hidden_obj =
       py_executor_.attr("execute")(execution_tokens,
                                    positions_arg,
@@ -594,7 +622,8 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    prepared_graph,
                                    expert_load_data,
                                    eplb_decode_token_mask,
-                                   params.meta.is_graph_warmup);
+                                   params.meta.is_graph_warmup,
+                                   **graph_kwargs);
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK(output.size() == 2 || output.size() == 3)

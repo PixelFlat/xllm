@@ -5,6 +5,11 @@ cc_library(
     speculative
   HDRS
     adaptive_speculative_controller.h
+    dspark/dspark_budget_planner.h
+    dspark/dspark_adaptive_cost_cache.h
+    dspark/dspark_sps_cost_model.h
+    dspark/dspark_window_collector.h
+    dspark/dspark_startup_calibration.h
     speculative_profile_registry.h
     adaptive_pruning_helpers.h
     draft_config.h
@@ -20,6 +25,11 @@ cc_library(
     spec_verify.h
   SRCS
     adaptive_speculative_controller.cpp
+    dspark/dspark_budget_planner.cpp
+    dspark/dspark_adaptive_cost_cache.cpp
+    dspark/dspark_sps_cost_model.cpp
+    dspark/dspark_window_collector.cpp
+    dspark/dspark_startup_calibration.cpp
     speculative_profile_registry.cpp
     adaptive_pruning_helpers.cpp
     draft_config.cpp
@@ -32,6 +42,7 @@ cc_library(
     verify_layout.cpp
     spec_verify.cpp
   DEPS
+    Threads::Threads
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common
@@ -41,5 +52,6 @@ cc_library(
     :common_layers
     $<$<BOOL:${USE_NPU}>:xllm_ops>
     glog::glog
+    nlohmann_json::nlohmann_json
     proto::xllm_proto
 )

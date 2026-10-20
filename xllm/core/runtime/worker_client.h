@@ -64,6 +64,9 @@ class WorkerClient {
   virtual bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
 
+  virtual std::optional<std::string> dspark_calibration(
+      const DSparkCalibrationCommand& command);
+
   virtual void get_cache_info(uint64_t& cluster_id,
                               std::string& addr,
                               uint16_t& port);

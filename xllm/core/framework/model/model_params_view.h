@@ -65,7 +65,8 @@ class GraphInputView final {
         spec_verify_source_addresses_stable(
             spec.spec_verify_source_addresses_stable),
         spec_verify_static_graph_tasks_prepared(
-            spec.spec_verify_static_graph_tasks_prepared)
+            spec.spec_verify_static_graph_tasks_prepared),
+        dspark_adaptive(spec.dspark_adaptive)
 #if defined(USE_DCU)
         ,
         use_dense_flash_attention(common.use_dense_flash_attention)
@@ -90,6 +91,7 @@ class GraphInputView final {
   std::vector<torch::Tensor>& spec_verify_draft_token_sources;
   bool& spec_verify_source_addresses_stable;
   bool& spec_verify_static_graph_tasks_prepared;
+  DSparkAdaptiveGraphInput& dspark_adaptive;
 
 #if defined(USE_DCU)
   bool& use_dense_flash_attention;

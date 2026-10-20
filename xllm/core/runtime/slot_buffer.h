@@ -195,6 +195,25 @@ class SlotBuffer final {
                                            const ModelInputBatch& batch,
                                            const Stream& stream,
                                            uint32_t physical_rows = 0);
+  // Block draft graph rows contain complete fixed-width request chunks, not
+  // one-token decode rows. Padding never joins the logical state binding.
+  static Status prepare_block_draft_padded(SlotBuffer& input,
+                                           const ModelInputBatch& batch,
+                                           uint32_t physical_rows,
+                                           const Stream& stream);
+  // Bind fixed q=1 graph rows before device-side DSpark packing. Host KV
+  // lengths are safe upper bounds, not true per-request lengths. Only sparse
+  // DSA paths with device-authoritative lengths may use this binding; dense
+  // MLA paths requiring true Host KV lengths must not use it. The packer must
+  // overwrite all physical rows before execution. No uniform MTP patch views
+  // are prepared, and no per-request draft widths are read from the device.
+  static Status prepare_dspark_validate(SlotBuffer& input,
+                                        uint32_t logical_rows,
+                                        uint32_t physical_rows,
+                                        uint32_t block_table_width,
+                                        int32_t max_kv_length,
+                                        uint64_t batch_id,
+                                        const Stream& stream);
   static void patch_mtp_decode(SlotBuffer& input,
                                const MtpContextView& binding);
 

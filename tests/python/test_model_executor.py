@@ -2467,6 +2467,63 @@ def test_executor_preserves_block_draft_admission_and_runner_arguments() -> None
     assert output is runner.execute.return_value
 
 
+def test_executor_binds_borrowed_context_caches_before_any_draft_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = _PreparedStubAttentionBackend()
+    model = _FakeModel()
+    model.model.register_buffer("context_projection_weight", torch.ones(2, 4))
+    model.write_context_kv = MagicMock(side_effect=lambda hidden, *_: hidden[:, :2].clone())
+    config = {
+        "model_type": "DSparkDraftModel",
+        "enable_task_pipeline": True,
+        "python_graph_backend": "aclgraph",
+        "num_speculative_tokens": 7,
+    }
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(model, config, max_seqs_per_batch=2)
+    runner = executor.context_kv_graph_runner
+    assert runner is not None
+    assert runner._kv_caches is None
+    caches = [LayerCache(torch.full((2, 4, 2, 64), 41.0), torch.full((2, 4, 2, 64), 43.0)) for _ in range(2)]
+    executor.bind_kv_caches(caches)
+    bound = backend._kv_caches
+    context_bound = runner._kv_caches
+    assert len(context_bound) == len(bound) == 2
+    assert bound is executor.eager_runner.layer_caches is executor.prepared_graph_runner.layer_caches
+    assert all(actual is expected for actual, expected in zip(bound, caches))
+    assert all(key is cache.key and value is cache.value for (key, value), cache in zip(context_bound, bound))
+    npu = SimpleNamespace(
+        current_stream=MagicMock(return_value=MagicMock()),
+        Stream=MagicMock(return_value=MagicMock()),
+        stream=MagicMock(side_effect=lambda *_: nullcontext()),
+        NPUGraph=MagicMock(side_effect=MagicMock),
+        graph=MagicMock(side_effect=lambda *args, **kwargs: nullcontext()),
+    )
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    monkeypatch.setattr("xllm.python.model_executor.runners.context_kv_acl_graph._get_graph_pool", lambda: (0, 1))
+    hidden = torch.ones(3, 4)
+    positions = torch.arange(3, dtype=torch.int32)
+    slots = torch.full((3,), -1, dtype=torch.int32)
+    with patch.object(executor.eager_runner, "execute", wraps=executor.eager_runner.execute) as draft_execute:
+        output = runner.execute_borrowed(hidden, positions, slots, warmup=True)
+        assert len(runner._borrowed_graphs) == 1
+        entry = next(iter(runner._borrowed_graphs.values()))
+        assert output is entry.output
+        assert all(call.args[3] is context_bound for call in model.write_context_kv.call_args_list)
+        capture_calls = npu.graph.call_count
+        forward_calls = model.write_context_kv.call_count
+        for value in (2.0, 3.0):
+            hidden.fill_(value)
+            positions.add_(1)
+            assert runner.execute_borrowed(hidden, positions, slots, warmup=False) is output
+        draft_execute.assert_not_called()
+    assert npu.graph.call_count == capture_calls == 1
+    assert model.write_context_kv.call_count == forward_calls
+    assert entry.graph.replay.call_count == 3
+    assert runner._kv_caches is context_bound
+    assert backend._kv_caches is executor.eager_runner.layer_caches is bound
+    assert all(key is cache.key and value is cache.value for (key, value), cache in zip(context_bound, bound))
+
+
 def test_eager_runner_skips_cp_for_empty_rank() -> None:
     runner = _make_eager_runner()
     metadata = SimpleNamespace(

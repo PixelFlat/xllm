@@ -1,5 +1,7 @@
 include(cc_test)
 
+add_subdirectory(dspark)
+
 cc_test(
   NAME
     draft_config_test

@@ -28,6 +28,77 @@ namespace xllm::kernel::npu::tilelang {
 
 // Public TileLang kernel APIs exported to the xLLM NPU runtime.
 
+// Fixed Draft7 adaptive verification. All buffers are preallocated contiguous
+// tensors on one NPU; these APIs enqueue on its current stream without copying
+// tensor values to Host. Admission validates the supported geometry first.
+// Allocation distributes exactly budget candidates into anchor-inclusive
+// widths [B]. TP consensus must precede packing.
+void dspark_allocate_verify_prefixes(const torch::Tensor& confidence,
+                                     torch::Tensor& widths,
+                                     int64_t budget);
+
+// Fixed-capacity graph ABI. The compact arena retains proposal/confidence/
+// width packing for the live Device count B. The control word's low 32 bits
+// contain B, and its high 32 bits suppress KV writes during cold profiling.
+// Host admission guarantees 0 <= B <= min(batch_capacity, capacity). The
+// allocator selects K=min(7*B, capacity-B) without a Host confidence read.
+void dspark_allocate_verify_prefixes_graph(torch::Tensor& arena,
+                                           const torch::Tensor& control,
+                                           int64_t capacity);
+
+// Pack request-contiguous prefixes into a known physical graph capacity G.
+// Cache slots use base_positions, while base_kv_lengths already includes the
+// anchor. Padding has token/KV/query length 1, slot/owner/column -1 and table
+// 0. Outputs include offsets [B+1], G-row int32 inputs and block_table [G,W].
+void dspark_pack_verify_inputs(const torch::Tensor& anchors,
+                               const torch::Tensor& proposals,
+                               const torch::Tensor& base_positions,
+                               const torch::Tensor& base_kv_lengths,
+                               const torch::Tensor& base_block_table,
+                               const torch::Tensor& widths,
+                               torch::Tensor& offsets,
+                               torch::Tensor& tokens,
+                               torch::Tensor& positions,
+                               torch::Tensor& kv_seq_lens,
+                               torch::Tensor& slot_mapping,
+                               torch::Tensor& block_table,
+                               torch::Tensor& q_seq_lens,
+                               torch::Tensor& owners,
+                               torch::Tensor& columns,
+                               int64_t block_size);
+
+void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
+                                     const torch::Tensor& arena,
+                                     const torch::Tensor& base_positions,
+                                     const torch::Tensor& base_kv_lengths,
+                                     const torch::Tensor& base_block_table,
+                                     const torch::Tensor& control,
+                                     torch::Tensor& offsets,
+                                     torch::Tensor& tokens,
+                                     torch::Tensor& positions,
+                                     torch::Tensor& kv_seq_lens,
+                                     torch::Tensor& slot_mapping,
+                                     torch::Tensor& block_table,
+                                     torch::Tensor& q_seq_lens,
+                                     torch::Tensor& owners,
+                                     torch::Tensor& columns,
+                                     int64_t block_size);
+
+// Exact greedy verification at each request's own cut boundary. Proposals,
+// widths and packed target IDs must already agree across sampling ranks.
+// Results [B,8], accepted lengths [B] and context slots [G] are written in
+// place; context masking never reads another core's newly written result.
+void dspark_greedy_verify_commit(const torch::Tensor& proposals,
+                                 const torch::Tensor& target_tokens,
+                                 const torch::Tensor& widths,
+                                 const torch::Tensor& offsets,
+                                 const torch::Tensor& owners,
+                                 const torch::Tensor& columns,
+                                 const torch::Tensor& source_slots,
+                                 torch::Tensor& result_tokens,
+                                 torch::Tensor& result_lengths,
+                                 torch::Tensor& context_slots);
+
 // Verify greedy token IDs without changing input layouts. Each input is int32
 // or int64 with values representable as int32. The device kernel converts int64
 // IDs in UB; the output is int32. Inputs are on the same NPU:

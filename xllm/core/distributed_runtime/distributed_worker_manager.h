@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,9 @@ class DistributedWorkerManager final {
   // Broadcasts the predictor to every worker in global rank order.
   bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
+
+  std::optional<std::vector<std::string>> dspark_calibration(
+      const DSparkCalibrationCommand& command);
 
   // Appends the transport endpoints in global worker rank order.
   void get_cache_info(std::vector<uint64_t>& cluster_ids,

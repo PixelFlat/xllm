@@ -59,6 +59,9 @@ class RemoteWorker : public WorkerClient {
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
       override;
 
+  std::optional<std::string> dspark_calibration(
+      const DSparkCalibrationCommand& command) override;
+
   void get_cache_info(uint64_t& cluster_id,
                       std::string& addr,
                       uint16_t& port) override;

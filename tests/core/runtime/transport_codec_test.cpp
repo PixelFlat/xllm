@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 #include <torch/torch.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstdint>
@@ -23,13 +24,31 @@ limitations under the License.
 #include <vector>
 
 #include "core/distributed_runtime/worker_model_codec.h"
+#include "core/framework/config/execution_config.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
 #include "core/kv_cache/transfer/prefetch_result.h"
 #include "core/runtime/forward_params.h"
+#include "core/runtime/forward_shared_memory_manager.h"
 #include "worker.pb.h"
 
 namespace xllm {
 namespace {
+
+class ScopedRawOutputTransport final {
+ public:
+  ScopedRawOutputTransport()
+      : previous_(
+            ExecutionConfig::get_instance().use_contiguous_input_buffer()) {
+    // RAW_OUTPUT serialization uses Host tensors and needs no Device stream.
+    ExecutionConfig::get_instance().use_contiguous_input_buffer(false);
+  }
+  ~ScopedRawOutputTransport() {
+    ExecutionConfig::get_instance().use_contiguous_input_buffer(previous_);
+  }
+
+ private:
+  bool previous_;
+};
 
 BlockTransferInfo make_block(int32_t src_id = 7,
                              TransferType transfer_type = TransferType::G2H,
@@ -49,6 +68,19 @@ StoragePrefetchRequest make_prefetch_request() {
   request.unit_end_offsets = {1};
   request.batch_end_unit_offsets = {1};
   return request;
+}
+
+bool write_shared_tokens(
+    ForwardSharedMemoryManager& writer,
+    const torch::Tensor& tokens,
+    const std::vector<SpeculativeTokenStats>& stats,
+    int64_t prepared_token = -1,
+    const std::vector<JsonObjectOutputError>& errors = {}) {
+  ForwardOutput output;
+  output.sample_output.next_tokens = tokens;
+  output.prepared_token = prepared_token;
+  output.json_object_errors = errors;
+  return writer.llm_output_write(output, stats);
 }
 
 void expect_original_output(const RawForwardOutput& output) {
@@ -292,7 +324,9 @@ TEST(TransportCodecTest, OutputRoundTripPreservesTokenAndTensorPayloads) {
   source.beam_search_output.out_logprobs = torch::tensor({-1.0f, -0.5f});
   source.json_object_errors = {{"sequence-0", "invalid JSON"}};
   proto::VLMForwardResponse encoded;
-  ASSERT_TRUE(encode_vlm_output(source, {{1, 2}, {2, 3}}, &encoded));
+  constexpr int64_t kLargeRoundCount = (int64_t{1} << 33) + 5;
+  ASSERT_TRUE(encode_vlm_output(
+      source, {{1, 2, kLargeRoundCount}, {2, 3, 1}}, &encoded));
   RawForwardOutput decoded;
   ASSERT_TRUE(decode_vlm_output(encoded, decoded));
 
@@ -307,6 +341,9 @@ TEST(TransportCodecTest, OutputRoundTripPreservesTokenAndTensorPayloads) {
   EXPECT_EQ(token.embeddings, (std::vector<float>{1.0f, 2.0f}));
   EXPECT_EQ(decoded.outputs[0].speculative_token_stats.accepted_tokens, 1);
   EXPECT_EQ(decoded.outputs[1].speculative_token_stats.proposed_tokens, 3);
+  EXPECT_EQ(decoded.outputs[0].speculative_token_stats.verified_rounds,
+            kLargeRoundCount);
+  EXPECT_EQ(decoded.outputs[1].speculative_token_stats.verified_rounds, 1);
   ASSERT_EQ(decoded.outputs[0].mm_embeddings.size(), 1);
   EXPECT_TRUE(torch::equal(decoded.outputs[0].mm_embeddings[0],
                            source.sample_output.mm_embeddings[0][0]));
@@ -367,6 +404,96 @@ TEST(TransportCodecTest, SpeculativeOutputStopsAtPaddingAndPreservesPayloads) {
   EXPECT_EQ(token.top_logprobs, (std::vector<float>{-1.5f}));
   EXPECT_EQ(token.embeddings, (std::vector<float>{5.0f}));
   EXPECT_EQ(decoded.outputs[1].speculative_token_stats.accepted_tokens, 2);
+}
+
+TEST(TransportCodecTest, MissingLegacyVerifiedRoundsDecodeAsZeroOnReuse) {
+  proto::LLMForwardResponse encoded;
+  auto* row = encoded.add_outputs();
+  row->add_tokens()->set_id(7);
+  auto* stats = row->mutable_speculative_token_stats();
+  stats->set_accepted_tokens(2);
+  stats->set_proposed_tokens(7);
+  stats->set_verified_rounds(9);
+  RawForwardOutput decoded;
+  ASSERT_TRUE(decode_llm_output(encoded, decoded));
+  ASSERT_EQ(decoded.outputs.size(), 1U);
+  EXPECT_EQ(decoded.outputs[0].speculative_token_stats.verified_rounds, 9);
+
+  // A legacy wire message has only fields 1 and 2 in its stats submessage.
+  stats->clear_verified_rounds();
+  std::string wire;
+  ASSERT_TRUE(encoded.SerializeToString(&wire));
+  proto::LLMForwardResponse legacy;
+  ASSERT_TRUE(legacy.ParseFromString(wire));
+  ASSERT_TRUE(decode_llm_output(legacy, decoded));
+  ASSERT_EQ(decoded.outputs.size(), 1U);
+  EXPECT_EQ(decoded.outputs[0].speculative_token_stats.accepted_tokens, 2);
+  EXPECT_EQ(decoded.outputs[0].speculative_token_stats.proposed_tokens, 7);
+  EXPECT_EQ(decoded.outputs[0].speculative_token_stats.verified_rounds, 0);
+}
+
+TEST(TransportCodecTest,
+     SharedOutputPreservesVerifiedRoundsAndFollowingFields) {
+  const ScopedRawOutputTransport host_only;
+  const std::string name = ForwardSharedMemoryManager::create_unique_name(
+      "verified_rounds_" + std::to_string(static_cast<int64_t>(getpid())),
+      /*dp_group=*/0,
+      ForwardType::RAW_OUTPUT,
+      /*rank=*/0);
+  bool writer_is_creator = false;
+  ForwardSharedMemoryManager writer(
+      name, /*size=*/4096, writer_is_creator, ForwardType::RAW_OUTPUT);
+  bool reader_is_creator = false;
+  ForwardSharedMemoryManager reader(
+      name, /*size=*/4096, reader_is_creator, ForwardType::RAW_OUTPUT);
+  constexpr int64_t kLargeRoundCount = (int64_t{1} << 33) + 7;
+  const std::vector<SpeculativeTokenStats> stats{
+      {1, 3, 1}, {0, 0, 1}, {2, 7, kLargeRoundCount}};
+  ASSERT_TRUE(write_shared_tokens(
+      writer,
+      torch::tensor({{30, 31, -1}, {40, -1, -1}, {50, 51, 52}}, torch::kInt64),
+      stats,
+      /*prepared_token=*/37,
+      {{"sequence-2", "error after round stats"}}));
+  RawForwardOutput decoded;
+  ASSERT_TRUE(reader.llm_output_read(decoded));
+  ASSERT_EQ(decoded.outputs.size(), stats.size());
+  for (size_t row = 0; row < stats.size(); ++row) {
+    EXPECT_EQ(decoded.outputs[row].speculative_token_stats.accepted_tokens,
+              stats[row].accepted_tokens);
+    EXPECT_EQ(decoded.outputs[row].speculative_token_stats.proposed_tokens,
+              stats[row].proposed_tokens);
+    EXPECT_EQ(decoded.outputs[row].speculative_token_stats.verified_rounds,
+              stats[row].verified_rounds);
+  }
+  ASSERT_EQ(decoded.outputs[1].tokens.size(), 1U);
+  EXPECT_EQ(decoded.outputs[1].tokens[0].id, 40);
+  EXPECT_EQ(decoded.prepared_token, 37);
+  ASSERT_EQ(decoded.json_object_errors.size(), 1U);
+  EXPECT_EQ(decoded.json_object_errors[0].message, "error after round stats");
+}
+
+TEST(TransportCodecTest, SharedOutputSizeIncludesVerifiedRoundWord) {
+  const ScopedRawOutputTransport host_only;
+  // One token, twelve container lengths (one is INT32), five INT64 values
+  // (id, three stats, prepared token), and two optional-payload flags.
+  constexpr size_t kRequiredBytes = sizeof(ControlMetadata) +
+                                    11 * sizeof(uint64_t) + sizeof(int32_t) +
+                                    5 * sizeof(int64_t) + 2 * sizeof(bool);
+  const auto tokens = torch::tensor({7}, torch::kInt64);
+  for (const size_t bytes : {kRequiredBytes - 1, kRequiredBytes}) {
+    const std::string name = ForwardSharedMemoryManager::create_unique_name(
+        "round_size_" + std::to_string(static_cast<int64_t>(getpid())) + "_" +
+            std::to_string(bytes),
+        /*dp_group=*/0,
+        ForwardType::RAW_OUTPUT,
+        /*rank=*/0);
+    bool is_creator = false;
+    ForwardSharedMemoryManager writer(
+        name, bytes, is_creator, ForwardType::RAW_OUTPUT);
+    EXPECT_EQ(write_shared_tokens(writer, tokens, {{0, 0, 1}}),
+              bytes == kRequiredBytes);
+  }
 }
 
 TEST(TransportCodecTest, EmbeddingOnlyOutputUsesPlaceholderToken) {

@@ -14,7 +14,14 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+
+#include <array>
+#include <unordered_map>
+
 #include "core/framework/sampling/rejection_sampler.h"
+#include "core/framework/speculative/dspark/dspark_adaptive_cost_cache.h"
+#include "core/framework/speculative/dspark/dspark_budget_planner.h"
+#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
 #include "core/runtime/task_execution_pipeline.h"
 
 namespace xllm {
@@ -79,9 +86,46 @@ struct MtpContextView {
 // Fixed storage for the forwards in one speculative round. No scheduler,
 // streams or independently retiring execution object lives here.
 struct TaskExecutionPipeline::SpeculativeSlot {
+  struct Adaptive {
+    DSparkBudgetPlan plan;
+    uint64_t generation = 0;
+    uint32_t max_kv_length = 0;
+    uint32_t generated_draft_tokens = 0;
+    uint32_t selected_draft_tokens = 0;
+    std::vector<int32_t> embedding_ids;
+    std::vector<std::string> request_ids;
+    std::vector<double> lagged_confidence;
+    std::vector<int32_t> draft_counts;
+    // Proposal IDs, confidence and widths share an owned arena. Proposal +
+    // confidence consensus is one broadcast; confidence + width feedback is
+    // one tiny D2H copy covered by the ordinary result-ready fence.
+    torch::Tensor arena_storage;
+    // Control aliases otherwise-unused adaptive rejection-mask storage. The
+    // pinned source borrows retired feedback until the next result D2H starts.
+    torch::Tensor control;
+    torch::Tensor host_control;
+    torch::Tensor consensus;
+    torch::Tensor confidence;
+    torch::Tensor widths;
+    torch::Tensor feedback;
+    torch::Tensor host_feedback_storage;
+    torch::Tensor host_feedback;
+    torch::Tensor host_confidence;
+    torch::Tensor host_widths;
+    torch::Tensor previous_storage;
+    torch::Tensor previous_tokens;
+    torch::Tensor offsets_storage;
+    torch::Tensor offsets;
+    torch::Tensor owners_storage;
+    torch::Tensor owners;
+    torch::Tensor columns_storage;
+    torch::Tensor columns;
+  };
   struct Draft {
     std::vector<int64_t> graph_batch_sizes;
     std::vector<int64_t> captured_graph_batch_sizes;
+    // First warmed compact FIA table bound for each physical draft bucket.
+    std::unordered_map<uint32_t, uint64_t> captured_graph_kv_capacities;
     uint32_t padded_batch_size = 0;
     std::unique_ptr<SlotBuffer> input;
     std::optional<Sampling> sampling;
@@ -108,6 +152,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   };
 
   bool decode = false;
+  std::unique_ptr<Adaptive> adaptive;
   bool run_models = false;
   torch::Tensor dummy_hidden;
   bool is_warmup = false;
@@ -129,6 +174,8 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   Bootstrap bootstrap;
   torch::Tensor draft_first_indices;
   torch::Tensor draft_block_indices;
+  torch::Tensor target_token_storage;
+  torch::Tensor target_tokens;
   torch::Tensor proposal_storage;
   torch::Tensor accepted_mask_storage;
   torch::Tensor host_hidden_storage;
@@ -140,6 +187,32 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   torch::Tensor host_hidden;
   ModelOutput target_output;
   torch::Tensor target_logits;
+};
+
+struct TaskExecutionPipeline::DSparkAdaptiveState {
+  struct Feedback {
+    uint64_t generation = 0;
+    uint64_t rounds_since_full_width = 0;
+    std::array<double, 7> confidence{};
+  };
+  struct History {
+    std::string request_id;
+    uint64_t request_generation = 0;
+    std::array<Feedback, 2> versions;
+  };
+  struct RetiredPlan {
+    uint64_t generation = 0;
+    std::vector<int32_t> embedding_ids;
+    std::vector<std::string> request_ids;
+    DSparkBudgetPlan plan;
+  };
+  uint64_t retired_generation = 0;
+  std::vector<History> histories;
+  std::array<RetiredPlan, 2> retired_plans;
+  std::shared_ptr<DSparkAdaptiveCostCache> owned_costs;
+  std::optional<DSparkCalibrationPoint> calibration_point;
+  std::unique_ptr<DSparkCalibrationSession> calibration_session;
+  bool startup_calibration_complete = false;
 };
 
 }  // namespace xllm

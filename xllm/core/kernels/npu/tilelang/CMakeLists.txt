@@ -138,6 +138,21 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME dspark_allocate_verify_prefixes
+  WRAPPER_SRCS dspark_allocate_verify_prefixes_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME dspark_pack_verify_inputs
+  WRAPPER_SRCS dspark_pack_verify_inputs_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME dspark_greedy_verify_commit
+  WRAPPER_SRCS dspark_greedy_verify_commit_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME spec_verify_attention_tiling_update
   WRAPPER_SRCS spec_verify_attention_tiling_update_wrapper.cpp
 )

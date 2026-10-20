@@ -60,6 +60,11 @@ struct SchedulerOptions {
   // the maximum number of sequences per batch
   PROPERTY(int32_t, max_seqs_per_batch) = 256;
   PROPERTY(bool, enable_task_pipeline) = false;
+  PROPERTY(std::string, adaptive_dspark_calibration);
+  PROPERTY(bool, enable_adaptive_dspark) = false;
+  PROPERTY(std::string, adaptive_dspark_cost_table);
+  PROPERTY(std::string, adaptive_dspark_cost_table_output);
+  PROPERTY(std::string, dspark_calibration_compatibility);
 
   // the capacity of the request queue; requests arriving while it is full
   // are rejected at admission.

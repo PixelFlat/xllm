@@ -124,7 +124,10 @@ class SpeculativeConfig final {
          "enable_mtp_draft_body_tp1",
          "enable_atb_spec_kernel",
          "enable_adaptive_speculative_decode",
-         "adaptive_speculative_min_gain"}};
+         "adaptive_speculative_min_gain",
+         "adaptive_dspark_cost_table",
+         "adaptive_dspark_calibration",
+         "adaptive_dspark_cost_table_output"}};
     return kOptionCategory;
   }
 
@@ -155,6 +158,10 @@ class SpeculativeConfig final {
   PROPERTY(bool, enable_adaptive_speculative_decode) = false;
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+
+  PROPERTY(std::string, adaptive_dspark_cost_table);
+  PROPERTY(std::string, adaptive_dspark_calibration);
+  PROPERTY(std::string, adaptive_dspark_cost_table_output);
 };
 
 }  // namespace xllm

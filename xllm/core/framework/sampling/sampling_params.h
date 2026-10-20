@@ -343,6 +343,8 @@ void prepare_draft_sampling(DraftSamplingMode mode,
 struct SpeculativeTokenStats {
   int64_t accepted_tokens = 0;
   int64_t proposed_tokens = 0;
+  // Actual verifier invocations, including rounds with no selected drafts.
+  int64_t verified_rounds = 0;
 };
 
 class SampleOutput final {

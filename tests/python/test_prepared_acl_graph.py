@@ -15,6 +15,7 @@
 """Prepared ACL graph address binding and admission contracts."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,15 +23,18 @@ import pytest
 import torch
 
 from xllm.python.attention.backend import AttentionBackend
+from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
+from xllm.python.model_executor.dspark_ragged import allocate_verify_prefixes, create_verify_buffers, pack_verify_inputs
 from xllm.python.model_executor.executor import ModelExecutor
-from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
+from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner
 from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
 
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
+@pytest.mark.parametrize("request_count", [1, 2, 3])
 @torch.inference_mode()
-def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths() -> None:
+def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(request_count: int) -> None:
     from xllm.python.attention.backend import LayerCache
     from xllm.python.layers.embedding import HiddenParallelEmbedding
     from xllm.python.model_executor.runners.acl_graph import StaticGraphAttentionMetadata
@@ -62,26 +66,27 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths()
     model.model._build_context_kv_buffers()
     caches = [
         (
-            torch.randn(1, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
-            torch.randn(1, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
+            torch.randn(request_count, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
+            torch.randn(request_count, 128, 1, 64, dtype=torch.bfloat16, device="npu:0"),
         )
         for _ in range(2)
     ]
-    executor = ModelExecutor(model, config, max_seqs_per_batch=1)
+    executor = ModelExecutor(model, config, max_seqs_per_batch=request_count)
     executor.bind_kv_caches([LayerCache(*pair) for pair in caches])
-    tokens = torch.tensor([1, 0, 0], dtype=torch.int32, device="npu:0")
-    positions = torch.arange(3, dtype=torch.int32, device="npu:0")
+    tokens = torch.tensor([1, 0, 0], dtype=torch.int32, device="npu:0").repeat(request_count)
+    positions = torch.arange(3, dtype=torch.int32, device="npu:0").repeat(request_count)
+    page_offsets = torch.arange(request_count, dtype=torch.int32, device="npu:0").view(-1, 1) * 128
     metadata = StaticGraphAttentionMetadata(
-        slot_mapping=positions.clone(),
+        slot_mapping=(positions.view(request_count, 3) + page_offsets).flatten(),
         paged_kv_indptr=None,
         paged_kv_indices=None,
         paged_kv_last_page_len=None,
-        block_table=torch.zeros(1, 1, dtype=torch.int32, device="npu:0"),
-        q_seq_lens=torch.tensor([3], dtype=torch.int32),
-        q_cu_seq_lens=torch.tensor([3], dtype=torch.int32, device="npu:0"),
-        q_cu_seq_lens_host_values=[3],
-        kv_seq_lens=torch.tensor([8], dtype=torch.int32, device="npu:0"),
-        kv_seq_lens_host_values=[16],
+        block_table=torch.arange(request_count, dtype=torch.int32, device="npu:0").view(-1, 1),
+        q_seq_lens=torch.full((request_count,), 3, dtype=torch.int32),
+        q_cu_seq_lens=torch.arange(3, request_count * 3 + 1, 3, dtype=torch.int32, device="npu:0"),
+        q_cu_seq_lens_host_values=list(range(3, request_count * 3 + 1, 3)),
+        kv_seq_lens=torch.full((request_count,), 8, dtype=torch.int32, device="npu:0"),
+        kv_seq_lens_host_values=[16] * request_count,
         is_chunked_prefill=True,
     )
     stream = torch.npu.Stream(device="npu:0")
@@ -91,9 +96,11 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths()
         executor.warmup_prepared_graph(tokens, positions, metadata)
         entries = len(executor.prepared_graph_runner._prepared_graphs)
         for length in (8, 13, 6, 16):
-            positions.copy_(torch.arange(length - 3, length, dtype=torch.int32, device="npu:0"))
-            metadata.slot_mapping.copy_(positions)
-            metadata.kv_seq_lens.fill_(length)
+            lengths = torch.arange(request_count, dtype=torch.int32, device="npu:0") + length
+            positions.copy_((lengths.view(-1, 1) - 3 + torch.arange(3, device="npu:0")).flatten())
+            metadata.slot_mapping.copy_((positions.view(request_count, 3) + page_offsets).flatten())
+            metadata.kv_seq_lens.copy_(lengths)
+            metadata.kv_seq_lens_host_values[:] = [length + index for index in range(request_count)]
             executor.prepare_metadata(metadata)
             reference = executor.execute(tokens, positions, metadata).clone()
             actual = executor.execute(tokens, positions, metadata, enable_graph=True)
@@ -101,6 +108,17 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths()
             torch.testing.assert_close(actual, reference)
         assert len(executor.prepared_graph_runner._prepared_graphs) == entries
         assert executor.prepared_graph_runner.prepared_replays == 4
+        if request_count > 1:
+            previous = actual.clone()
+            for keys, values in caches:
+                keys[0].zero_()
+                values[0].zero_()
+            reference = executor.execute(tokens, positions, metadata).clone()
+            actual = executor.execute(tokens, positions, metadata, enable_graph=True)
+            torch.npu.synchronize()
+            torch.testing.assert_close(actual, reference)
+            torch.testing.assert_close(actual.view(request_count, 3, -1)[1:], previous.view(request_count, 3, -1)[1:])
+            assert len(executor.prepared_graph_runner._prepared_graphs) == entries
 
 
 def _metadata(rows: int) -> SimpleNamespace:
@@ -120,6 +138,70 @@ def _metadata(rows: int) -> SimpleNamespace:
         is_chunked_prefill=False,
         is_spec_verify=False,
         prepared_attention_state=object(),
+    )
+
+
+def _block_metadata(request_count: int, query_width: int, pages: int = 64) -> SimpleNamespace:
+    metadata = _metadata(request_count)
+    metadata.slot_mapping = torch.arange(request_count * query_width, dtype=torch.int32)
+    metadata.block_table = torch.arange(request_count * pages, dtype=torch.int32).view(request_count, pages)
+    metadata.q_seq_lens = torch.full((request_count,), query_width, dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = list(range(query_width, request_count * query_width + 1, query_width))
+    metadata.q_cu_seq_lens = torch.tensor(metadata.q_cu_seq_lens_host_values, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = [2048] * request_count
+    metadata.kv_seq_lens = torch.full((request_count,), 2048, dtype=torch.int32)
+    metadata.is_chunked_prefill = True
+    return metadata
+
+
+def _adaptive_inputs(
+    device: torch.device, table_width: int = 2, graph_rows: int = 8
+) -> tuple[torch.Tensor, torch.Tensor, SimpleNamespace, DSparkAdaptiveGraphInputs]:
+    capacity = 3
+    metadata = _metadata(graph_rows)
+    for name in ("slot_mapping", "q_seq_lens", "q_cu_seq_lens", "kv_seq_lens"):
+        setattr(metadata, name, getattr(metadata, name).to(device))
+    metadata.block_table = torch.zeros(graph_rows, table_width, dtype=torch.int32, device=device)
+    tokens = torch.zeros(graph_rows, dtype=torch.int32, device=device)
+    positions = torch.zeros_like(tokens)
+    inputs = DSparkAdaptiveGraphInputs(
+        arena=torch.zeros(88 * capacity, dtype=torch.uint8, device=device),
+        control=torch.tensor([1], dtype=torch.int64, device=device),
+        anchors=torch.arange(100, 100 + capacity, dtype=torch.int64, device=device),
+        base_positions=torch.full((capacity,), 1, dtype=torch.int32, device=device),
+        base_kv_lengths=torch.full((capacity,), 2, dtype=torch.int32, device=device),
+        base_block_table=torch.arange(capacity * table_width, dtype=torch.int32, device=device).view(
+            capacity, table_width
+        )
+        + 10,
+        offsets=torch.full((capacity + 1,), -99, dtype=torch.int32, device=device),
+        owners=torch.full((graph_rows,), -99, dtype=torch.int32, device=device),
+        columns=torch.full((graph_rows,), -99, dtype=torch.int32, device=device),
+        block_size=128,
+    )
+    return tokens, positions, metadata, inputs
+
+
+def _adaptive_tensors(
+    tokens: torch.Tensor, positions: torch.Tensor, metadata: SimpleNamespace, inputs: DSparkAdaptiveGraphInputs
+) -> tuple[torch.Tensor, ...]:
+    return (
+        tokens,
+        positions,
+        metadata.slot_mapping,
+        metadata.block_table,
+        metadata.q_seq_lens,
+        metadata.q_cu_seq_lens,
+        metadata.kv_seq_lens,
+        inputs.arena,
+        inputs.control,
+        inputs.anchors,
+        inputs.base_positions,
+        inputs.base_kv_lengths,
+        inputs.base_block_table,
+        inputs.offsets,
+        inputs.owners,
+        inputs.columns,
     )
 
 
@@ -144,6 +226,132 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> PreparedAclGraphRunner:
     result._allocate_entry = Mock(side_effect=AssertionError("owned input allocation"))
     result._fill_entry = Mock(side_effect=AssertionError("whole input copy"))
     return result
+
+
+def test_adaptive_prepared_binding_ignores_live_device_control(runner: PreparedAclGraphRunner) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    binding = runner._prepared_binding(tokens, positions, metadata, dspark_adaptive=inputs)
+    entry = runner._prepared_graphs[binding]
+    for count, suppress in ((3, False), (2, True), (1, False)):
+        inputs.control.fill_(count | (int(suppress) << 32))
+        inputs.arena.fill_(count)
+        inputs.anchors.add_(1)
+        inputs.base_positions.add_(1)
+        inputs.base_kv_lengths.add_(1)
+        inputs.base_block_table.add_(1)
+        runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+        runner.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+        assert runner._prepared_binding(tokens, positions, metadata, dspark_adaptive=inputs) == binding
+        assert runner._prepared_graphs[binding] is entry
+    assert runner._capture.call_count == 1
+    assert runner.prepared_replays == 3
+    runner._allocate_entry.assert_not_called()
+    runner._fill_entry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "arena",
+        "control",
+        "anchors",
+        "base_positions",
+        "base_kv_lengths",
+        "base_block_table",
+        "offsets",
+        "owners",
+        "columns",
+        "block_size",
+        "missing",
+    ],
+)
+def test_adaptive_prepared_binding_rejects_replaced_producers(runner: PreparedAclGraphRunner, field: str) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    if field == "missing":
+        replacement = None
+    elif field == "block_size":
+        replacement = replace(inputs, block_size=64)
+    else:
+        replacement = replace(inputs, **{field: getattr(inputs, field).clone()})
+    runner.attention_backend.prepare.reset_mock()
+    runner.attention_backend.prepare_graph_replay.reset_mock()
+    with pytest.raises((RuntimeError, ValueError), match="warmed Slot binding|block size"):
+        runner.execute(tokens, positions, metadata, dspark_adaptive=replacement)
+    runner.attention_backend.prepare.assert_not_called()
+    runner.attention_backend.prepare_graph_replay.assert_not_called()
+    assert runner._capture.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "arena",
+        "control",
+        "anchors",
+        "base_positions",
+        "base_kv_lengths",
+        "base_block_table",
+        "offsets",
+        "owners",
+        "columns",
+    ],
+)
+def test_adaptive_prepared_rejects_invalid_capacity_layout_before_capture(
+    runner: PreparedAclGraphRunner, field: str
+) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    malformed = replace(inputs, **{field: getattr(inputs, field).to(torch.float64)})
+    with pytest.raises(ValueError, match="adaptive DSpark requires contiguous"):
+        runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=malformed)
+    runner._capture.assert_not_called()
+    runner.attention_backend.prepare.assert_not_called()
+
+
+def test_adaptive_and_ordinary_prepared_bindings_can_coexist(runner: PreparedAclGraphRunner) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    runner.warmup_prepared(tokens, positions, metadata)
+    runner.execute(tokens, positions, metadata)
+    runner.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+    assert runner._capture.call_count == 2
+    assert len(runner._prepared_graphs) == 2
+
+
+@pytest.mark.parametrize("case", ["dp", "draft", "attention", "hidden", "topk"])
+def test_adaptive_prepared_rejects_non_target_contract(runner: PreparedAclGraphRunner, case: str) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
+    hidden = topk = None
+    if case == "dp":
+        runner.dp_size = 2
+    elif case == "draft":
+        runner._block_draft = True
+    elif case == "attention":
+        runner.attention_backend.is_mla = False
+    elif case == "hidden":
+        hidden = torch.zeros(8, 4)
+    else:
+        topk = torch.zeros(8, 1, 2, dtype=torch.int32)
+    with pytest.raises(ValueError, match="ordinary MLA target graph"):
+        runner.warmup_prepared(tokens, positions, metadata, hidden, topk, dspark_adaptive=inputs)
+    runner._capture.assert_not_called()
+    runner.attention_backend.prepare.assert_not_called()
 
 
 @pytest.fixture
@@ -278,6 +486,129 @@ def test_block_replay_failure_propagates(
         runner.execute_block(tokens, positions, metadata)
     assert runner.prepared_replays == 0
     assert runner._capture.call_count == 1
+
+
+@pytest.mark.parametrize("request_count", [2, 3, 4])
+@pytest.mark.parametrize("query_width", [1, 3, 7])
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_block_graph_binds_isolated_request_rows_without_recapture(
+    runner: PreparedAclGraphRunner, request_count: int, query_width: int, dp_size: int
+) -> None:
+    runner._block_draft = True
+    runner.dp_size = dp_size
+    rows = request_count * query_width
+    runner.max_batch = rows
+    runner.attention_backend.page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(
+        side_effect=lambda metadata, **_: SimpleNamespace(
+            device_kv_lengths=metadata.kv_seq_lens,
+            block_table=metadata.block_table,
+            query_lengths=[query_width] * request_count,
+        )
+    )
+    entries = []
+    for slot_index in range(2):
+        tokens = torch.arange(rows, dtype=torch.int32)
+        positions = torch.zeros_like(tokens)
+        metadata = _block_metadata(request_count, query_width)
+        metadata.dp_execution_token_counts = (rows,) * dp_size
+        metadata.dp_is_decode = (1,) * dp_size
+        runner.warmup_prepared(tokens, positions, metadata)
+        entry = runner._prepared_graphs[runner._prepared_binding(tokens, positions, metadata)]
+        entries.append(entry)
+        static = entry.static_metadata
+        assert static.block_table.is_contiguous()
+        assert static.block_table.shape == (request_count, 32)
+        assert static.block_table.data_ptr() != metadata.block_table.data_ptr()
+        torch.testing.assert_close(static.block_table, metadata.block_table[:, :32])
+        assert static.kv_seq_lens_host_values == [4096] * request_count
+        assert static.q_cu_seq_lens_host_values == [query_width * (index + 1) for index in range(request_count)]
+        assert static.prepared_attention_state.device_kv_lengths is metadata.kv_seq_lens
+        for base_length in (2048, 2200, 4000):
+            lengths = [base_length + index + slot_index for index in range(request_count)]
+            metadata.kv_seq_lens_host_values[:] = lengths
+            metadata.kv_seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+            assert runner.can_execute_block(tokens, positions, metadata)
+            runner.execute(tokens, positions, metadata)
+            assert runner.attention_backend.prepare_graph_replay.call_args.args[0] is static
+            assert static.kv_seq_lens.tolist() == lengths
+            assert static.kv_seq_lens_host_values == [4096] * request_count
+        table_address = static.block_table.data_ptr()
+        metadata.block_table.add_(100)
+        with torch.inference_mode(), patch.object(AclGraphRunner, "_forward_static", return_value=torch.empty(0)):
+            runner._forward_static(entry)
+        torch.testing.assert_close(static.block_table, metadata.block_table[:, :32])
+        assert static.block_table.data_ptr() == table_address
+        assert entry.graph.replay.call_count == 3
+    assert entries[0] is not entries[1]
+    assert entries[0].static_metadata.block_table.data_ptr() != entries[1].static_metadata.block_table.data_ptr()
+    assert entries[0].static_metadata.kv_seq_lens.data_ptr() != entries[1].static_metadata.kv_seq_lens.data_ptr()
+    assert runner._capture.call_count == 2
+    runner._allocate_entry.assert_not_called()
+    runner._fill_entry.assert_not_called()
+
+
+@pytest.mark.parametrize("query_ends", [[3, 5], [3], [0, 3, 6], [0, 6], [6, 6], [3, 6, 9]])
+def test_block_graph_rejects_invalid_request_query_ends_before_capture(
+    runner: PreparedAclGraphRunner, query_ends: list[int]
+) -> None:
+    runner._block_draft = True
+    runner.max_batch = 6
+    runner.attention_backend.page_size = 128
+    metadata = _block_metadata(2, 3)
+    metadata.q_cu_seq_lens_host_values = query_ends
+    tokens = torch.arange(6, dtype=torch.int32)
+    with pytest.raises(ValueError, match="equal positive query widths"):
+        runner.warmup_prepared(tokens, torch.zeros_like(tokens), metadata)
+    runner._capture.assert_not_called()
+    runner.attention_backend.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("kv_bounds", [[2048], [2048, 0], [2048, 2], [8193, 2048]])
+def test_block_graph_rejects_invalid_per_request_kv_bounds_before_capture(
+    runner: PreparedAclGraphRunner, kv_bounds: list[int]
+) -> None:
+    runner._block_draft = True
+    runner.max_batch = 6
+    runner.attention_backend.page_size = 128
+    metadata = _block_metadata(2, 3)
+    metadata.kv_seq_lens_host_values = kv_bounds
+    tokens = torch.arange(6, dtype=torch.int32)
+    with pytest.raises(ValueError, match="KV bound"):
+        runner.warmup_prepared(tokens, torch.zeros_like(tokens), metadata)
+    runner._capture.assert_not_called()
+
+
+def test_block_graph_rejects_strided_request_rows_without_input_copy(runner: PreparedAclGraphRunner) -> None:
+    runner._block_draft = True
+    runner.max_batch = 6
+    runner.attention_backend.page_size = 128
+    metadata = _block_metadata(2, 3)
+    metadata.block_table = metadata.block_table[:, :32]
+    tokens = torch.arange(6, dtype=torch.int32)
+    with pytest.raises(ValueError, match="contiguous request rows"):
+        runner.warmup_prepared(tokens, torch.zeros_like(tokens), metadata)
+    runner._capture.assert_not_called()
+    runner._allocate_entry.assert_not_called()
+    runner._fill_entry.assert_not_called()
+
+
+@pytest.mark.parametrize("counts,phases", [((6, 3), (1, 1)), ((6, 6), (1, 0)), ((6, 0), (1, 1))])
+def test_block_graph_rejects_nonuniform_dp_geometry_before_capture(
+    runner: PreparedAclGraphRunner, counts: tuple[int, ...], phases: tuple[int, ...]
+) -> None:
+    runner._block_draft = True
+    runner.max_batch = 6
+    runner.dp_size = 2
+    runner.attention_backend.page_size = 128
+    metadata = _block_metadata(2, 3)
+    metadata.dp_execution_token_counts = counts
+    metadata.dp_is_decode = phases
+    tokens = torch.arange(6, dtype=torch.int32)
+    with pytest.raises(ValueError, match="prepared DP"):
+        runner.warmup_prepared(tokens, torch.zeros_like(tokens), metadata)
+    runner._capture.assert_not_called()
+    runner.attention_backend.prepare.assert_not_called()
 
 
 def test_capture_shares_one_lazy_pool_across_runners_and_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -816,6 +1147,133 @@ def test_mtp_real_graph_replays_live_inputs_across_slots(reuse_topk: bool, dp_si
         assert metadata.kv_seq_lens_host_values == [1] * tokens.numel()
     assert len(runner._prepared_graphs) == 6
     assert runner.prepared_replays == 9
+
+
+@pytest.mark.parametrize("table_width", [8192, 8195])
+@pytest.mark.parametrize("graph_rows", [8, 16])
+@torch.inference_mode()
+def test_adaptive_target_graph_packs_live_control_without_recapture(table_width: int, graph_rows: int) -> None:
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    from xllm.python.model_executor.forward_context import get_forward_context
+
+    class PackedInputTarget(torch.nn.Module):
+        def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+            metadata = get_forward_context().metadata
+            # This target observes the packer-to-model dependency inside the
+            # actual prepared graph; it is not a GLM/SFA numerical oracle.
+            return torch.stack(
+                (tokens, positions, metadata.kv_seq_lens, metadata.slot_mapping, metadata.q_seq_lens), dim=1
+            )
+
+    device = torch.device("npu:0")
+    backend = SimpleNamespace(
+        prepare=lambda *args, **kwargs: None,
+        prepare_graph_replay=lambda metadata: None,
+        is_mla=True,
+        logical_page_size=128,
+    )
+    prepared = PreparedAclGraphRunner(PackedInputTarget(), backend, device, graph_rows)
+    stream = torch.npu.Stream(device=device)
+    slots = [_adaptive_inputs(device, table_width, graph_rows) for _ in range(2)]
+    for tokens, positions, metadata, inputs in slots:
+        # Startup writes are suppressed by the same captured device control
+        # later used for normal serving, not by a second capture variant.
+        inputs.control.fill_(1 | (1 << 32))
+        stream.wait_stream(torch.npu.current_stream(device))
+        with torch.npu.stream(stream):
+            prepared.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    torch.npu.current_stream(device).wait_stream(stream)
+    addresses = [tuple(tensor.data_ptr() for tensor in _adaptive_tensors(*slot)) for slot in slots]
+    assert all(first != second for first, second in zip(*addresses))
+    assert len(prepared._prepared_graphs) == 2
+    output_addresses = tuple(entry.static_output.data_ptr() for entry in prepared._prepared_graphs.values())
+    assert output_addresses[0] != output_addresses[1]
+    prepared._capture = Mock(side_effect=AssertionError("runtime recapture"))
+
+    for phase, (slot_id, batch_size, suppress) in enumerate(
+        ((0, 1, False), (1, 3, False), (0, 2, True), (1, 1, True), (0, 3, False), (1, 2, False))
+    ):
+        tokens, positions, metadata, inputs = slots[slot_id]
+        inactive = _adaptive_tensors(*slots[1 - slot_id])
+        untouched = [tensor.cpu().clone() for tensor in inactive]
+        arena = torch.full_like(inputs.arena, 199, device="cpu")
+        proposals = torch.arange(batch_size * 7, dtype=torch.int64).view(batch_size, 7) + 1000 + phase * 20
+        confidence = torch.full((batch_size, 7), 0.05)
+        confidence[phase % batch_size].fill_(0.99)
+        if phase == 4:
+            confidence.fill_(1)
+        arena[: 56 * batch_size].copy_(proposals.view(torch.uint8).flatten())
+        arena[56 * batch_size : 84 * batch_size].copy_(confidence.view(torch.uint8).flatten())
+        inputs.arena.copy_(arena)
+        inputs.control.fill_(batch_size | (int(suppress) << 32))
+        inputs.anchors.copy_(torch.arange(100 + phase, 103 + phase, dtype=torch.int64))
+        # Exercise page 4096 and the final page, including a non-tile-aligned
+        # table tail. KV attention length is deliberately not cache position.
+        base_positions = torch.tensor([4096 * 128 - 4, 4096 * 128, table_width * 128 - 8], dtype=torch.int32)
+        inputs.base_positions.copy_(base_positions)
+        inputs.base_kv_lengths.copy_(base_positions + 1 + phase % 2)
+        inputs.base_block_table.copy_(
+            torch.arange(3 * table_width, dtype=torch.int32).view(3, table_width) + 10 + phase
+        )
+
+        budget = min(7 * batch_size, graph_rows - batch_size)
+        widths = torch.empty(batch_size, dtype=torch.int32)
+        offsets = torch.empty(batch_size + 1, dtype=torch.int32)
+        allocate_verify_prefixes(confidence, budget, widths, offsets)
+        reference = create_verify_buffers(graph_rows, table_width, "cpu")
+        pack_verify_inputs(
+            anchors=inputs.anchors.cpu()[:batch_size],
+            proposals=proposals,
+            base_positions=inputs.base_positions.cpu()[:batch_size],
+            base_kv_lengths=inputs.base_kv_lengths.cpu()[:batch_size],
+            base_block_table=inputs.base_block_table.cpu()[:batch_size],
+            widths=widths,
+            offsets=offsets,
+            logical_rows=batch_size + budget,
+            block_size=128,
+            outputs=reference,
+        )
+        if suppress:
+            reference.slot_mapping.fill_(-1)
+        stream.wait_stream(torch.npu.current_stream(device))
+        with torch.npu.stream(stream):
+            prepared.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+            output = prepared.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+        torch.npu.current_stream(device).wait_stream(stream)
+        actual_widths = inputs.arena[84 * batch_size : 88 * batch_size].cpu().view(torch.int32)
+        torch.testing.assert_close(actual_widths, widths)
+        torch.testing.assert_close(inputs.offsets[: batch_size + 1].cpu(), offsets)
+        for actual, name in (
+            (tokens, "tokens"),
+            (positions, "positions"),
+            (metadata.kv_seq_lens, "kv_seq_lens"),
+            (metadata.slot_mapping, "slot_mapping"),
+            (metadata.block_table, "block_table"),
+            (metadata.q_seq_lens, "q_seq_lens"),
+            (inputs.owners, "owners"),
+            (inputs.columns, "columns"),
+        ):
+            torch.testing.assert_close(actual.cpu(), getattr(reference, name), rtol=0, atol=0)
+        expected_output = torch.stack(
+            (
+                reference.tokens,
+                reference.positions,
+                reference.kv_seq_lens,
+                reference.slot_mapping,
+                reference.q_seq_lens,
+            ),
+            dim=1,
+        )
+        torch.testing.assert_close(output.cpu(), expected_output, rtol=0, atol=0)
+        assert output.data_ptr() in output_addresses
+        for actual, expected in zip(inactive, untouched):
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        assert tuple(tensor.data_ptr() for tensor in _adaptive_tensors(*slots[slot_id])) == addresses[slot_id]
+        assert len(prepared._prepared_graphs) == 2
+    prepared._capture.assert_not_called()
+    assert prepared.prepared_replays == 6
 
 
 @pytest.mark.parametrize("dcp_rank", [0, 3])

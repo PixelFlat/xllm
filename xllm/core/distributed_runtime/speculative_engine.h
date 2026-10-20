@@ -66,6 +66,11 @@ class SpeculativeEngineBase : public Engine {
     return engine_->tokenizer_args();
   }
 
+  // Target and draft share workers, so profile their processes only once.
+  bool start_profile() override { return engine_->start_profile(); }
+
+  bool stop_profile() override { return engine_->stop_profile(); }
+
   void update_last_step_result(BatchGroup& batch);
 
  protected:

@@ -20,6 +20,7 @@ limitations under the License.
 #include <folly/futures/Future.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,7 @@ limitations under the License.
 namespace xllm {
 class RecForwardInput;
 class VlmForwardInput;
+struct DSparkCalibrationCommand;
 
 class CommChannel {
  public:
@@ -48,6 +50,9 @@ class CommChannel {
 
   virtual bool set_speculative_validate_time_predictor(
       const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
+
+  virtual std::optional<std::string> dspark_calibration(
+      const DSparkCalibrationCommand& command);
 
   virtual bool get_cache_info(uint64_t& cluster_id,
                               std::string& addr,

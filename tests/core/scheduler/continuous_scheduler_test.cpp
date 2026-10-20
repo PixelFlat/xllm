@@ -1,15 +1,19 @@
 #include "continuous_scheduler.h"
 
 #include <absl/time/clock.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +24,7 @@
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/scheduler/request_output_dispatcher.h"
 #include "core/scheduler/scheduler_notifier_test_peer.h"
 #include "distributed_runtime/engine.h"
 #include "scheduler_factory.h"
@@ -93,6 +98,83 @@ class FakeTokenizer : public Tokenizer {
   std::unique_ptr<Tokenizer> clone() const {
     return std::make_unique<FakeTokenizer>();
   }
+};
+
+class ResponseDecodeGate final {
+ public:
+  void wait_until_released() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this]() { return released_; });
+  }
+
+  bool wait_for_decode() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(
+        lock, std::chrono::seconds(10), [this]() { return entered_; });
+  }
+
+  void release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+class GatedResponseTokenizer final : public Tokenizer {
+ public:
+  explicit GatedResponseTokenizer(std::shared_ptr<ResponseDecodeGate> gate)
+      : gate_(std::move(gate)) {}
+
+  std::string decode(const Slice<int32_t>& ids,
+                     bool /*skip_special_tokens*/) const override {
+    gate_->wait_until_released();
+    return std::string(ids.size(), 'x');
+  }
+
+  std::unique_ptr<Tokenizer> clone() const override {
+    return std::make_unique<GatedResponseTokenizer>(gate_);
+  }
+
+ private:
+  std::shared_ptr<ResponseDecodeGate> gate_;
+};
+
+class SpeculativeStatsLogCapture final : public google::LogSink {
+ public:
+  SpeculativeStatsLogCapture() { google::AddLogSink(this); }
+  ~SpeculativeStatsLogCapture() override { google::RemoveLogSink(this); }
+
+  void send(google::LogSeverity severity,
+            const char* /*full_filename*/,
+            const char* /*base_filename*/,
+            int /*line*/,
+            const google::LogMessageTime& /*logmsgtime*/,
+            const char* message,
+            size_t message_len) override {
+    if (severity != google::GLOG_INFO) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    messages_.append(message, message_len);
+    messages_ += '\n';
+  }
+
+  std::string messages() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return messages_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::string messages_;
 };
 
 class FakeEngine : public Engine {
@@ -457,6 +539,88 @@ void set_chunk_kv(const std::shared_ptr<Request>& request, size_t kv_tokens) {
 }
 
 }  // namespace
+
+TEST(RequestOutputDispatcherTest,
+     CompletedResponsesLogOneDispatchTimeSpeculativeSnapshot) {
+  for (bool batch_response : {false, true}) {
+    SCOPED_TRACE(batch_response);
+    for (const SpeculativeTokenStats stats : {SpeculativeTokenStats{2, 5, 2},
+                                              SpeculativeTokenStats{0, 0, 1},
+                                              SpeculativeTokenStats{0, 0, 0}}) {
+      SCOPED_TRACE(stats.verified_rounds);
+      auto gate = std::make_shared<ResponseDecodeGate>();
+      GatedResponseTokenizer tokenizer(gate);
+      RequestOutputDispatcher dispatcher(
+          &tokenizer,
+          /*enable_service_routing=*/batch_response,
+          /*disable_log_stats=*/false,
+          [](std::shared_ptr<Request> /*request*/) {});
+      auto request = generate_request_with_prompt_tokens(
+          {10, 11}, /*max_tokens=*/1, /*max_context_len=*/32);
+      make_request_decode_ready(request);
+      ASSERT_TRUE(request->finished());
+      request->sequences()[0]->record_speculative_token_stats(stats);
+
+      int32_t response_count = 0;
+      request->state().output_func =
+          [&response_count](const RequestOutput& output) {
+            EXPECT_TRUE(output.finished);
+            ++response_count;
+            return true;
+          };
+      request->state().outputs_func =
+          [&response_count](const std::vector<RequestOutput>& outputs) {
+            EXPECT_EQ(outputs.size(), 1);
+            ++response_count;
+            return std::vector<bool>(outputs.size(), true);
+          };
+
+      SpeculativeStatsLogCapture logs;
+      std::vector<std::shared_ptr<Request>> requests{request};
+      dispatcher.process_completed_requests(requests);
+      const bool decode_started = gate->wait_for_decode();
+      // The response is already running but has not logged its statistics.
+      // Retire an unused overlapped tail exactly in this interval.
+      request->sequences()[0]->record_speculative_token_stats({11, 15, 1});
+      gate->release();
+      dispatcher.wait_completion();
+      ASSERT_TRUE(decode_started);
+      EXPECT_EQ(response_count, 1);
+
+      const SpeculativeTokenStats live_stats =
+          request->speculative_token_stats_snapshot();
+      EXPECT_EQ(live_stats.accepted_tokens, stats.accepted_tokens + 11);
+      EXPECT_EQ(live_stats.proposed_tokens, stats.proposed_tokens + 15);
+      EXPECT_EQ(live_stats.verified_rounds, stats.verified_rounds + 1);
+
+      const std::string messages = logs.messages();
+      if (stats.verified_rounds == 0) {
+        EXPECT_EQ(messages.find("speculative_accepted_tokens:"),
+                  std::string::npos);
+        EXPECT_EQ(messages.find("speculative_verified_rounds:"),
+                  std::string::npos);
+        continue;
+      }
+      const std::string expected = "speculative_accepted_tokens: " +
+                                   std::to_string(stats.accepted_tokens) +
+                                   ", speculative_proposed_tokens: " +
+                                   std::to_string(stats.proposed_tokens) +
+                                   ", speculative_verified_rounds: " +
+                                   std::to_string(stats.verified_rounds);
+      EXPECT_NE(messages.find(expected), std::string::npos) << messages;
+      EXPECT_EQ(messages.find("speculative_proposed_tokens: " +
+                              std::to_string(live_stats.proposed_tokens)),
+                std::string::npos);
+      if (stats.proposed_tokens == 0) {
+        EXPECT_EQ(messages.find("speculative_token_acceptance_rate:"),
+                  std::string::npos);
+      } else {
+        EXPECT_NE(messages.find("speculative_token_acceptance_rate: 0.4000"),
+                  std::string::npos);
+      }
+    }
+  }
+}
 
 TEST(ContinuousSchedulerTest,
      MixedSequenceCountsPreserveBatchesAcrossDecodeAndCancellation) {

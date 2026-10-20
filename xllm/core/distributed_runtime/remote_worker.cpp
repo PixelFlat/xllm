@@ -84,6 +84,11 @@ bool RemoteWorker::set_speculative_validate_time_predictor(
   return channel_->set_speculative_validate_time_predictor(predictor);
 }
 
+std::optional<std::string> RemoteWorker::dspark_calibration(
+    const DSparkCalibrationCommand& command) {
+  return channel_->dspark_calibration(command);
+}
+
 void RemoteWorker::get_cache_info(uint64_t& cluster_id,
                                   std::string& addr,
                                   uint16_t& port) {

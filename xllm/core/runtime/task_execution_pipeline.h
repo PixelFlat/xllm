@@ -35,6 +35,8 @@ limitations under the License.
 namespace xllm {
 
 class ProcessGroup;
+class DSparkAdaptiveCostCache;
+struct DSparkCalibrationCommand;
 
 // The owner establishes these model contracts before admission. Persistent
 // storage is allocated before KV budgeting; KV may be populated afterwards.
@@ -93,6 +95,13 @@ struct SpeculativeTaskCapacity {
   bool reuse_topk = false;
   DraftSamplingMode draft_sampling_mode = DraftSamplingMode::GREEDY;
   bool unified_graph = false;
+  bool adaptive_dspark = false;
+  bool sparse_dsa_target = false;
+  double adaptive_min_gain = 0.0;
+  // Startup calibration installs identical immutable costs on sampling ranks.
+  std::shared_ptr<const DSparkAdaptiveCostCache> adaptive_costs;
+  bool calibration_leader = false;
+  bool startup_calibration = false;
 };
 
 struct MtpContextStorage;
@@ -152,6 +161,8 @@ class TaskExecutionPipeline final {
   // -(previous sampling output row + 1) with scheduler overlap.
   // Backpressure and validation return before accepting a Task.
   TaskSubmission submit(const LlmForwardInput& input);
+  std::optional<std::string> dspark_calibration(
+      DSparkCalibrationCommand command);
   // Only the oldest accepted TaskId may be consumed. Other IDs are rejected
   // without removing a completion. Slot retirement precedes
   // Future completion; successful outputs own independent, ready CPU values.
@@ -303,8 +314,23 @@ class TaskExecutionPipeline final {
   void launch_decode(SpeculativeSlot& slot);
   bool launch_unified_block(SpeculativeSlot& slot);
   void launch_block_draft(SpeculativeSlot& slot);
+  void generate_adaptive_dspark_proposals(SpeculativeSlot& slot,
+                                          const torch::Tensor& anchors);
+  void launch_adaptive_dspark(SpeculativeSlot& slot);
+  Status plan_adaptive_dspark(SpeculativeSlot& slot,
+                              const LlmForwardInput& input);
+  Status warmup_adaptive_dspark_graphs(const LlmForwardInput& input);
+  void bind_adaptive_dspark_views(SpeculativeSlot& slot);
+  void bind_adaptive_dspark_graph_input(SpeculativeSlot& slot,
+                                        bool suppress_kv_writes);
+  std::optional<std::string> dspark_calibration_impl(
+      const DSparkCalibrationCommand& command);
+  void consume_adaptive_dspark(SpeculativeSlot& slot);
+  void trace_adaptive_dspark(const SpeculativeSlot& slot,
+                             const torch::Tensor& accepted_lengths) const;
   void write_block_context(SpeculativeSlot& slot, bool prefill);
-  void synchronize_samples(const TokenResultTensors& result);
+  void synchronize_samples(const TokenResultTensors& result,
+                           bool all_greedy = false);
   void synchronize_tokens(torch::Tensor& tokens, bool all_greedy);
   static Status plan_parallel(const ParallelInput& input,
                               uint32_t dp_size,
@@ -319,6 +345,8 @@ class TaskExecutionPipeline final {
   void release_outputs(SpeculativeSlot& slot);
 
   std::unique_ptr<SpeculativeTaskCapacity> speculative_capacity_;
+  struct DSparkAdaptiveState;
+  std::unique_ptr<DSparkAdaptiveState> dspark_adaptive_;
   WorkerImpl* worker_pipeline_ = nullptr;
   std::unique_ptr<TaskModel> draft_;
   torch::ScalarType hidden_dtype_ = torch::kFloat32;

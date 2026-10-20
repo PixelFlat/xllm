@@ -135,7 +135,10 @@ void RequestOutputDispatcher::process_completed_request(
     return;
   }
   // Keep terminal output behind earlier stream work on the response thread.
-  auto runnable = [this, request = request]() mutable {
+  // Snapshot before overlapped results can change the live request counters.
+  const SpeculativeTokenStats speculative_stats =
+      request->speculative_token_stats_snapshot();
+  auto runnable = [this, request = request, speculative_stats]() mutable {
     AUTO_COUNTER(responsing_latency_seconds_non_stream);
 
     double end_2_end_latency_seconds = request->end_to_end_latency_seconds();
@@ -148,7 +151,7 @@ void RequestOutputDispatcher::process_completed_request(
       if (req_output.status.has_value() && !req_output.status->ok()) {
         request->log_error_statistic(req_output.status.value());
       } else {
-        request->log_statistic(end_2_end_latency_seconds);
+        request->log_statistic(end_2_end_latency_seconds, speculative_stats);
       }
     }
     request->state().output_func(req_output);
@@ -167,9 +170,12 @@ void RequestOutputDispatcher::batch_process_completed_requests(
   request_outputs.resize(requests_size);
   for (size_t i = 0; i < requests_size; ++i) {
     auto& request = requests[i];
+    const SpeculativeTokenStats speculative_stats =
+        request->speculative_token_stats_snapshot();
     auto runnable = [counter,
                      this,
                      request = request,
+                     speculative_stats,
                      request_output = &request_outputs[i]]() mutable {
       AUTO_COUNTER(responsing_latency_seconds_non_stream);
       double end_2_end_latency_seconds = request->end_to_end_latency_seconds();
@@ -183,7 +189,7 @@ void RequestOutputDispatcher::batch_process_completed_requests(
             !request_output->status->ok()) {
           request->log_error_statistic(request_output->status.value());
         } else if (request->finished() || request->cancelled()) {
-          request->log_statistic(end_2_end_latency_seconds);
+          request->log_statistic(end_2_end_latency_seconds, speculative_stats);
         }
       }
       counter->decrement_count();
