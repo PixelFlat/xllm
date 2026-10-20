@@ -1054,6 +1054,9 @@ def _moe_expert_compute_impl(
         )
         gmm2_group_list = group_list
         gmm2_group_list_type = group_list_type
+    # GMM1 has consumed these routed inputs on the same stream. Release their
+    # large storage before allocating the expanded BF16 down-projection output.
+    del sorted_hidden_i8, pertoken_scale
     output = _grouped_matmul_gmm2(
         act_i8=act_i8,
         act_pertoken_scale=act_pt,

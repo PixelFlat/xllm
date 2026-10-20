@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -34,6 +35,65 @@ def test_unpermute_probs_keeps_fp32_without_a_dtype_copy() -> None:
     bf16_probs = fp32_probs.to(torch.bfloat16)
     converted = moe._unpermute_probs(bf16_probs, output)
     assert converted is bf16_probs
+
+
+@pytest.mark.parametrize("fused_gmm1", [False, True])
+@pytest.mark.parametrize("aliased_outputs", [False, True])
+def test_gmm1_routed_inputs_are_released_before_down_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    fused_gmm1: bool,
+    aliased_outputs: bool,
+) -> None:
+    routed_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+    groups = torch.tensor([[0, 1], [1, 1], [2, 1], [3, 1]] if fused_gmm1 else [1, 2, 3, 4], dtype=torch.int64)
+    indices = torch.arange(4, dtype=torch.int32)
+    expected = torch.ones(4, 4, dtype=torch.bfloat16)
+
+    def route(*args: object, **kwargs: object) -> tuple[torch.Tensor, ...]:
+        sorted_hidden = torch.ones(4, 4, dtype=torch.int8)
+        input_scale = torch.ones(4, dtype=torch.float32)
+        routed_refs.extend((weakref.ref(sorted_hidden), weakref.ref(input_scale)))
+        return sorted_hidden, indices, groups, input_scale
+
+    def gate_up(
+        sorted_hidden: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        group_list: torch.Tensor,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert routed_refs[0]() is sorted_hidden
+        assert routed_refs[1]() is input_scale
+        if aliased_outputs:
+            return sorted_hidden, input_scale
+        return torch.ones(4, 4, dtype=torch.int8), torch.ones(4, dtype=torch.float32)
+
+    def project_down(**kwargs: object) -> torch.Tensor:
+        # Only an intentional output alias may keep routed storage alive.
+        assert all((reference() is not None) == aliased_outputs for reference in routed_refs)
+        torch.testing.assert_close(kwargs["group_list"], groups)
+        assert kwargs["group_list_type"] == (2 if fused_gmm1 else 0)
+        return expected
+
+    monkeypatch.setattr(moe, "supports_fused_moe_gmm1", lambda device: fused_gmm1)
+    monkeypatch.setattr(moe, "_moe_init_routing_v3", route)
+    monkeypatch.setattr(moe.torch_npu, "npu_moe_init_routing_v2", route)
+    monkeypatch.setattr(moe.torch.ops.xllm_ops, "moe_grouped_matmul_swiglu_quant", gate_up)
+    monkeypatch.setattr(moe, "_grouped_matmul_swiglu_quant_v2", gate_up)
+    monkeypatch.setattr(moe, "_grouped_matmul_gmm2", project_down)
+
+    output, actual_indices = moe._moe_expert_compute_impl(
+        torch.ones(2, 4, dtype=torch.bfloat16),
+        torch.zeros(2, 2, dtype=torch.int32),
+        torch.ones(4, 4, 8, dtype=torch.int8),
+        torch.ones(4, 4, 4, dtype=torch.int8),
+        torch.ones(4, 8, dtype=torch.float32),
+        torch.ones(4, 4, dtype=torch.bfloat16),
+        2,
+    )
+    assert output is expected
+    torch.testing.assert_close(actual_indices, indices)
 
 
 @pytest.mark.parametrize("prob_dtype", [torch.float32, torch.bfloat16, torch.float16])
