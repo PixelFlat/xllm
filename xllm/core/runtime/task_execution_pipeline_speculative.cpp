@@ -184,10 +184,10 @@ bool neutral_host_values(const torch::Tensor& tensor, float neutral) {
 }
 
 bool adaptive_greedy_sampling(const SamplingParameters& sampling) {
-  if (sampling.sampling_mode != SamplingMode::GREEDY ||
-      sampling.logprobs || sampling.max_top_logprobs != 0 ||
-      sampling.use_beam_search || sampling.is_embeddings ||
-      sampling.num_return_sequences != 0 || sampling.acc_logprob.defined() ||
+  if (sampling.sampling_mode != SamplingMode::GREEDY || sampling.logprobs ||
+      sampling.max_top_logprobs != 0 || sampling.use_beam_search ||
+      sampling.is_embeddings || sampling.num_return_sequences != 0 ||
+      sampling.acc_logprob.defined() ||
       (sampling.filter_mask.defined() && sampling.filter_mask.numel() != 0) ||
       (sampling.filter_bitmask.defined() &&
        sampling.filter_bitmask.numel() != 0) ||

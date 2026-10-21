@@ -352,9 +352,9 @@ class RecordingProfileEngine final : public Engine {
         // the presence of a per-row sampling tensor implies greedy admission.
         SamplingParameters sampling;
         sampling.init({sequence->sampling_param()}, {0}, {0}, {}, {}, {});
-        observed_greedy_samples_.emplace_back(
-            sampling.sampling_mode == SamplingMode::GREEDY &&
-            !sampling.do_sample.defined());
+        observed_greedy_samples_.emplace_back(sampling.sampling_mode ==
+                                                  SamplingMode::GREEDY &&
+                                              !sampling.do_sample.defined());
       }
     }
     observed_batches_.emplace_back(sequence_count);
@@ -507,6 +507,128 @@ TEST(DecodeGraphWarmupPlanTest, CoversEveryPaddedMtpTokenBucket) {
       plan.batch_sizes,
       (std::vector<int32_t>{
           1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64}));
+}
+
+TEST(DecodeGraphWarmupPlanTest, ResolvesIndependentDraftInvocationShapes) {
+  ExecutionConfig execution;
+  auto config = execution.decode_graph_warmup_config(3, false, "mTp");
+  ASSERT_EQ(config.draft_shapes.size(), 1);
+  EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 1);
+  EXPECT_FALSE(config.draft_shapes.front().bucket_by_sequence);
+
+  execution.enable_task_pipeline(true);
+  config = execution.decode_graph_warmup_config(3, false, "MTP");
+  ASSERT_EQ(config.draft_shapes.size(), 2);
+  EXPECT_EQ(config.draft_shapes[0].tokens_per_sequence, 2);
+  EXPECT_EQ(config.draft_shapes[1].tokens_per_sequence, 1);
+  config = execution.decode_graph_warmup_config(1, false, "MTP");
+  ASSERT_EQ(config.draft_shapes.size(), 1);
+  EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 2);
+
+  for (const int32_t width : {5, 7}) {
+    config = execution.decode_graph_warmup_config(width, false, "dSpArK");
+    ASSERT_EQ(config.draft_shapes.size(), 1);
+    EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, width);
+    EXPECT_TRUE(config.draft_shapes.front().bucket_by_sequence);
+  }
+  for (const std::string algorithm : {"DFlash", "DFlash2", "Suffix"}) {
+    EXPECT_TRUE(execution.decode_graph_warmup_config(7, false, algorithm)
+                    .draft_shapes.empty());
+  }
+  EXPECT_TRUE(execution.decode_graph_warmup_config(0, false, "MTP")
+                  .draft_shapes.empty());
+  EXPECT_TRUE(execution.decode_graph_warmup_config(3, true, "MTP")
+                  .draft_shapes.empty());
+  execution.enable_unified_mtp_graph(true);
+  EXPECT_TRUE(execution.decode_graph_warmup_config(7, false, "DSpark")
+                  .draft_shapes.empty());
+}
+
+TEST(DecodeGraphWarmupPlanTest,
+     DsparkCoversDraftAndTargetWithoutRedundantBatch) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "Token-bucket graph warmup is not supported.";
+  }
+  ExecutionConfig execution;
+  execution.enable_task_pipeline(true).acl_graph_decode_batch_size_limit(8);
+  for (const int32_t width : {5, 7}) {
+    const auto config =
+        execution.decode_graph_warmup_config(width, false, "DSpark");
+    const auto plan = build_decode_graph_warmup_plan(config, 8, 1);
+    EXPECT_EQ(plan.batch_sizes,
+              width == 5 ? (std::vector<int32_t>{1, 2, 4, 8})
+                         : (std::vector<int32_t>{1, 2, 4, 6, 8}));
+  }
+}
+
+TEST(DecodeGraphWarmupPlanTest, JointCoverageUsesLocalDpGeometryAndGraphLimit) {
+  if (!Platform::supports_mtp_decode_graph_warmup()) {
+    GTEST_SKIP() << "Token-bucket graph warmup is not supported.";
+  }
+  for (const std::string algorithm : {"MTP", "DSpark"}) {
+    for (const int32_t width : {1, 3, 5, 7}) {
+      for (const int32_t dp_size : {1, 2, 4}) {
+        for (const int32_t local_capacity : {3, 5, 8, 17}) {
+          SCOPED_TRACE(algorithm);
+          SCOPED_TRACE(width);
+          SCOPED_TRACE(dp_size);
+          SCOPED_TRACE(local_capacity);
+          ExecutionConfig execution;
+          execution.enable_task_pipeline(true)
+              .acl_graph_decode_batch_size_limit(8);
+          const auto config =
+              execution.decode_graph_warmup_config(width, false, algorithm);
+          const int32_t global_capacity = local_capacity * dp_size;
+          const auto plan =
+              build_decode_graph_warmup_plan(config, global_capacity, dp_size);
+          const int32_t local_limit = std::min(local_capacity, 8);
+          const auto graph_rows =
+              [local_limit](int32_t count, int32_t rows, bool by_sequence) {
+                return by_sequence
+                           ? std::min(runtime::get_decode_graph_token_bucket(
+                                          count, false),
+                                      static_cast<int64_t>(local_limit)) *
+                                 rows
+                           : std::min(
+                                 runtime::get_decode_graph_token_bucket(
+                                     static_cast<int64_t>(count) * rows, false),
+                                 static_cast<int64_t>(local_limit) * rows);
+              };
+          for (int32_t local = 1; local <= local_limit; ++local) {
+            const int64_t target_bucket =
+                runtime::get_decode_graph_token_bucket(
+                    static_cast<int64_t>(local) * (width + 1), false);
+            EXPECT_TRUE(std::any_of(
+                plan.batch_sizes.begin(),
+                plan.batch_sizes.end(),
+                [=](int32_t global) {
+                  return global <= local_limit * dp_size &&
+                         runtime::get_decode_graph_token_bucket(
+                             static_cast<int64_t>(global / dp_size) *
+                                 (width + 1),
+                             false) == target_bucket;
+                }));
+            for (const auto& shape : config.draft_shapes) {
+              const int64_t expected = graph_rows(
+                  local, shape.tokens_per_sequence, shape.bucket_by_sequence);
+              EXPECT_TRUE(std::any_of(
+                  plan.batch_sizes.begin(),
+                  plan.batch_sizes.end(),
+                  [&](int32_t global) {
+                    return global <= local_limit * dp_size &&
+                           graph_rows(global / dp_size,
+                                      shape.tokens_per_sequence,
+                                      shape.bucket_by_sequence) == expected;
+                  }));
+            }
+          }
+          EXPECT_EQ(plan.batch_sizes.back(), global_capacity);
+          EXPECT_TRUE(
+              std::is_sorted(plan.batch_sizes.begin(), plan.batch_sizes.end()));
+        }
+      }
+    }
+  }
 }
 
 TEST(DecodeGraphBucketTest, UsesSharedWidthForActiveDpShards) {

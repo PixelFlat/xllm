@@ -105,7 +105,6 @@ void configure_profile_sampling(RequestSamplingParam& sampling,
     // Synthetic profiling requests use the same admission as serving. The
     // adaptive pipeline supports greedy execution only, including startup.
     sampling.temperature = 0.0F;
-    sampling.do_sample = false;
   }
 }
 

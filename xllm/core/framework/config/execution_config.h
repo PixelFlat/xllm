@@ -18,6 +18,8 @@ limitations under the License.
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
@@ -25,6 +27,13 @@ limitations under the License.
 namespace xllm {
 
 class JsonReader;
+
+// Describe one independently captured draft invocation. Block drafts round
+// whole requests before expanding rows; autoregressive drafts round token rows.
+struct DraftGraphWarmupShape {
+  int32_t tokens_per_sequence = 1;
+  bool bucket_by_sequence = false;
+};
 
 // Resolved decode geometry shared by scheduler profiling and graph warmup.
 // For MTP, num_decoding_tokens is the number of token rows produced per
@@ -34,6 +43,7 @@ struct DecodeGraphWarmupConfig {
   int32_t num_speculative_tokens = 0;
   bool enable_graph_mode_decode_no_padding = false;
   int32_t max_graph_batch_size = 0;
+  std::vector<DraftGraphWarmupShape> draft_shapes;
 };
 
 class ExecutionConfig final {
@@ -50,7 +60,8 @@ class ExecutionConfig final {
 
   DecodeGraphWarmupConfig decode_graph_warmup_config(
       int32_t num_speculative_tokens,
-      bool enable_no_padding) const;
+      bool enable_no_padding,
+      std::string_view speculative_algorithm = "MTP") const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {

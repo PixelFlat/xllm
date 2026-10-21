@@ -72,7 +72,9 @@ DecodeGraphWarmupPlan get_compatibility_decode_graph_warmup_plan(
   return plan;
 }
 
-DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
+namespace {
+
+DecodeGraphWarmupPlan build_target_decode_graph_warmup_plan(
     const DecodeGraphWarmupConfig& warmup_config,
     int32_t max_global_batch_size,
     int32_t dp_size) {
@@ -150,6 +152,100 @@ DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
   }
   plan.batch_sizes = std::move(batch_sizes);
 
+  return plan;
+}
+
+int64_t draft_graph_bucket(int32_t local_batch_size,
+                           int32_t max_local_batch_size,
+                           const DraftGraphWarmupShape& shape) {
+  if (shape.bucket_by_sequence) {
+    return std::min(runtime::get_decode_graph_token_bucket(
+                        local_batch_size, /*enable_no_padding=*/false),
+                    static_cast<int64_t>(max_local_batch_size)) *
+           shape.tokens_per_sequence;
+  }
+  return std::min(
+      runtime::get_decode_graph_token_bucket(
+          static_cast<int64_t>(local_batch_size) * shape.tokens_per_sequence,
+          /*enable_no_padding=*/false),
+      static_cast<int64_t>(max_local_batch_size) * shape.tokens_per_sequence);
+}
+
+}  // namespace
+
+DecodeGraphWarmupPlan build_decode_graph_warmup_plan(
+    const DecodeGraphWarmupConfig& warmup_config,
+    int32_t max_global_batch_size,
+    int32_t dp_size) {
+  DecodeGraphWarmupPlan plan = build_target_decode_graph_warmup_plan(
+      warmup_config, max_global_batch_size, dp_size);
+  if (!Platform::supports_mtp_decode_graph_warmup() ||
+      warmup_config.draft_shapes.empty() ||
+      warmup_config.enable_graph_mode_decode_no_padding || dp_size <= 0 ||
+      max_global_batch_size < dp_size) {
+    return plan;
+  }
+  const int32_t max_local_batch_size =
+      warmup_config.max_graph_batch_size > 0
+          ? std::min(max_global_batch_size / dp_size,
+                     warmup_config.max_graph_batch_size)
+          : max_global_batch_size / dp_size;
+  std::vector<int32_t> joint_batches;
+  joint_batches.reserve(plan.batch_sizes.size() +
+                        warmup_config.draft_shapes.size() *
+                            kCompatibilitySmallBatchSizes.size());
+  for (const auto& shape : warmup_config.draft_shapes) {
+    if (shape.tokens_per_sequence <= 0) {
+      continue;
+    }
+    int64_t previous_bucket = 0;
+    for (int32_t local = 1; local <= max_local_batch_size; ++local) {
+      const int64_t bucket =
+          draft_graph_bucket(local, max_local_batch_size, shape);
+      if (bucket != previous_bucket) {
+        joint_batches.emplace_back(local * dp_size);
+        previous_bucket = bucket;
+      } else {
+        joint_batches.back() = local * dp_size;
+      }
+    }
+  }
+  std::sort(joint_batches.begin(), joint_batches.end());
+  joint_batches.erase(std::unique(joint_batches.begin(), joint_batches.end()),
+                      joint_batches.end());
+
+  // Seed the schedule with every independently required draft bucket. Add a
+  // target representative only if its token bucket is still uncovered. In
+  // particular, target rows 24 and 30 both pad to 32, but Draft5 requests 4
+  // and 5 belong to different request buckets (4 and 8).
+  std::vector<int64_t> covered_target_buckets;
+  covered_target_buckets.reserve(joint_batches.size() +
+                                 plan.batch_sizes.size());
+  const auto target_bucket = [&warmup_config, dp_size](int32_t batch_size) {
+    return runtime::get_decode_graph_token_bucket(
+        static_cast<int64_t>(batch_size / dp_size) *
+            warmup_config.num_decoding_tokens,
+        /*enable_no_padding=*/false);
+  };
+  for (const int32_t batch_size : joint_batches) {
+    covered_target_buckets.emplace_back(target_bucket(batch_size));
+  }
+  for (const int32_t batch_size : plan.batch_sizes) {
+    const bool independent_batch = batch_size % dp_size != 0 ||
+                                   batch_size > max_local_batch_size * dp_size;
+    const int64_t bucket = target_bucket(batch_size);
+    if (independent_batch ||
+        std::find(covered_target_buckets.begin(),
+                  covered_target_buckets.end(),
+                  bucket) == covered_target_buckets.end()) {
+      joint_batches.emplace_back(batch_size);
+      covered_target_buckets.emplace_back(bucket);
+    }
+  }
+  std::sort(joint_batches.begin(), joint_batches.end());
+  joint_batches.erase(std::unique(joint_batches.begin(), joint_batches.end()),
+                      joint_batches.end());
+  plan.batch_sizes = std::move(joint_batches);
   return plan;
 }
 

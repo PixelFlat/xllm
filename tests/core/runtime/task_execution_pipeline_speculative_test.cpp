@@ -933,7 +933,7 @@ class SpeculativePipelineTest : public ::testing::Test {
     value.sampling_params.selected_token_idxes =
         torch::tensor(selected, torch::kInt32);
     value.sampling_params.sample_idxes = torch::tensor(sampled, torch::kInt32);
-    value.sampling_params.do_sample = torch::zeros({batch_size}, torch::kBool);
+    value.sampling_params.sampling_mode = SamplingMode::GREEDY;
     return value;
   }
 

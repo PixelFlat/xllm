@@ -325,7 +325,8 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       .decode_graph_warmup_config(
           ExecutionConfig::get_instance().decode_graph_warmup_config(
               options_.num_speculative_tokens(),
-              options_.enable_graph_mode_decode_no_padding()))
+              options_.enable_graph_mode_decode_no_padding(),
+              options_.speculative_algorithm()))
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())

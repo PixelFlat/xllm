@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/platform/platform.h"
 
 DEFINE_bool(enable_task_pipeline,
@@ -232,14 +233,37 @@ void ExecutionConfig::initialize() {
 
 DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
     int32_t num_speculative_tokens,
-    bool enable_no_padding) const {
+    bool enable_no_padding,
+    std::string_view speculative_algorithm) const {
   // num_decoding_tokens is owned by this config.
-  return {.num_decoding_tokens =
-              num_speculative_tokens > 0 ? num_speculative_tokens + 1 : 1,
-          .num_speculative_tokens = num_speculative_tokens,
-          .enable_graph_mode_decode_no_padding = enable_no_padding,
-          .max_graph_batch_size =
-              Platform::is_npu() ? acl_graph_decode_batch_size_limit() : 0};
+  DecodeGraphWarmupConfig config{
+      .num_decoding_tokens =
+          num_speculative_tokens > 0 ? num_speculative_tokens + 1 : 1,
+      .num_speculative_tokens = num_speculative_tokens,
+      .enable_graph_mode_decode_no_padding = enable_no_padding,
+      .max_graph_batch_size =
+          Platform::is_npu() ? acl_graph_decode_batch_size_limit() : 0};
+  // Unified capture owns a combined graph key rather than independent draft
+  // graphs. Keep exact/no-padding admission on its existing schedule as well.
+  if (num_speculative_tokens <= 0 || enable_unified_mtp_graph() ||
+      enable_no_padding) {
+    return config;
+  }
+  if (SpeculativeConfig::is_mtp_algorithm(speculative_algorithm)) {
+    if (enable_task_pipeline()) {
+      // The first invocation also repairs the previous accepted boundary.
+      config.draft_shapes.emplace_back(DraftGraphWarmupShape{2, false});
+    }
+    if (!enable_task_pipeline() || num_speculative_tokens > 1) {
+      config.draft_shapes.emplace_back(DraftGraphWarmupShape{1, false});
+    }
+  } else if (enable_task_pipeline() &&
+             SpeculativeConfig::is_dspark_algorithm(speculative_algorithm)) {
+    config.draft_shapes.emplace_back(
+        DraftGraphWarmupShape{num_speculative_tokens, true});
+  }
+  // Non-DSpark block drafts currently disable independent draft graphs.
+  return config;
 }
 
 }  // namespace xllm
