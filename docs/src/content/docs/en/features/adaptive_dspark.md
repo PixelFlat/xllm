@@ -26,7 +26,7 @@ select a verification budget. Parameter types and defaults are listed in the
 ## Supported configuration
 
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
-draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy sampling,
+draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy draft sampling,
 DP=1/CP=1, ACL graphs, schedule overlap and task pipeline. Graph warmup must be
 enabled. This path does not enable adaptive unified graphs. Fixed-width DSpark
 and other algorithms retain their own execution contracts.
@@ -55,7 +55,31 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --adaptive_dspark_cost_table_output=/results/dspark-costs.json
 ```
 
-Send greedy requests with explicit `temperature=0`.
+Send requests with an explicit temperature: `temperature=0` selects greedy
+target decoding; a positive value such as `temperature=0.5` selects random
+target sampling. Different temperatures can share a batch. Target top-k, top-p
+and min-p filtering use the ordinary sampler's semantics. The draft remains
+greedy (`--draft_sampling_mode=greedy`); probabilistic drafts are not admitted.
+
+For random targets, the rejection sampler maps request parameters through the
+device-side packed-row owners and draws one target token per verification row.
+With a deterministic draft this is exact point-mass rejection sampling: matching
+draws accept the draft prefix, and the first mismatch supplies the residual
+token; an all-matching prefix uses its terminal draw as the bonus. All TP ranks
+agree on the draws before acceptance and context-KV publication. Target/draft
+forward and adaptive packing retain ACL graph replay; random sampling and
+prefix commit execute on the task stream outside the model graph, without
+reading the packed boundaries back to Host. Per-request seeds, logprobs,
+structured constraints, minimum-length stop masks, token bias and non-neutral penalties remain unsupported
+and are rejected before execution rather than silently ignored.
+
+The budget is still selected ahead of the round from eligible lagged confidence;
+current target draws never feed back into the same round's clipping decision.
+Greedy-draft confidence need not predict stochastic acceptance accurately.
+Startup calibration currently uses greedy target requests, so its full-step
+costs do not include random-sampling overhead. Random-target correctness does
+not imply the same acceptance rate, optimal budgets or performance as greedy
+targets; measure them separately.
 
 For Draft5, change only `--num_speculative_tokens=5` and select a new output
 file such as `/results/dspark-costs-draft5.json`. The draft generates five

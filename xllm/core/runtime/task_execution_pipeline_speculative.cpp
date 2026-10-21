@@ -183,11 +183,13 @@ bool neutral_host_values(const torch::Tensor& tensor, float neutral) {
   });
 }
 
-bool adaptive_greedy_sampling(const SamplingParameters& sampling) {
-  if (sampling.sampling_mode != SamplingMode::GREEDY || sampling.logprobs ||
-      sampling.max_top_logprobs != 0 || sampling.use_beam_search ||
-      sampling.is_embeddings || sampling.num_return_sequences != 0 ||
-      sampling.acc_logprob.defined() ||
+bool adaptive_target_sampling(const SamplingParameters& sampling) {
+  if (sampling.logprobs || sampling.max_top_logprobs != 0 ||
+      sampling.use_beam_search || sampling.is_embeddings ||
+      sampling.num_return_sequences != 0 || sampling.acc_logprob.defined() ||
+      sampling.min_token_positions.defined() ||
+      sampling.min_tokens_remaining.defined() ||
+      sampling.min_token_ids.defined() ||
       (sampling.filter_mask.defined() && sampling.filter_mask.numel() != 0) ||
       (sampling.filter_bitmask.defined() &&
        sampling.filter_bitmask.numel() != 0) ||
@@ -196,17 +198,23 @@ bool adaptive_greedy_sampling(const SamplingParameters& sampling) {
       !neutral_host_values(sampling.repetition_penalties, /*neutral=*/1.0F)) {
     return false;
   }
-  if (!sampling.do_sample.defined() || sampling.do_sample.numel() == 0) {
-    return true;
+  if (sampling.sampling_mode == SamplingMode::GREEDY ||
+      sampling.sampling_mode == SamplingMode::RANDOM) {
+    return !sampling.do_sample.defined();
   }
-  if (!sampling.do_sample.device().is_cpu() ||
+  if (sampling.sampling_mode != SamplingMode::MIXED ||
+      !sampling.do_sample.defined() || sampling.do_sample.numel() == 0 ||
+      !sampling.do_sample.device().is_cpu() ||
       sampling.do_sample.scalar_type() != torch::kBool) {
     return false;
   }
   const torch::Tensor values = sampling.do_sample.contiguous();
   const bool* begin = values.const_data_ptr<bool>();
-  return std::none_of(
+  const bool any_random = std::any_of(
       begin, begin + values.numel(), [](bool value) { return value; });
+  const bool all_random = std::all_of(
+      begin, begin + values.numel(), [](bool value) { return value; });
+  return any_random && !all_random;
 }
 
 uint64_t dspark_graph_kv_capacity(const LlmTaskCapacity& capacity,
@@ -279,7 +287,7 @@ Status TaskExecutionPipeline::create(
        !draft.model.has_dspark_confidence_head())) {
     return invalid(
         "Adaptive task pipeline requires NPU DSpark Draft5/7, sparse DSA "
-        "Target graphs, a ConfidenceHead, greedy sampling and supported "
+        "Target graphs, a ConfidenceHead, greedy draft sampling and supported "
         "request/page capacity.");
   }
   if (capacity.adaptive_dspark &&
@@ -700,10 +708,11 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!status.ok()) {
     return status;
   }
-  if (slot.adaptive && !adaptive_greedy_sampling(input.sampling_params)) {
+  if (slot.adaptive && !adaptive_target_sampling(input.sampling_params)) {
     return invalid(
-        "Adaptive DSpark task pipeline requires greedy requests without "
-        "log probabilities, structured sampling or non-neutral penalties.");
+        "Adaptive DSpark task pipeline requires consistent sampling flags "
+        "without log probabilities, structured sampling or non-neutral "
+        "penalties.");
   }
 
   const auto& c = speculative_capacity_->common;
@@ -2374,7 +2383,7 @@ void TaskExecutionPipeline::generate_adaptive_dspark_proposals(
   auto& invocation = *slot.drafts.front();
   auto& adaptive = *slot.adaptive;
   const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
-  // Admission checked every penalty is neutral and sampling is greedy. Use
+  // Admission checked every penalty is neutral and the draft is greedy. Use
   // the same minimal sampler in serving and startup profiling; do not launch
   // no-op penalty kernels merely because the client supplied neutral tensors.
   SamplingParameters sampling;
@@ -2427,13 +2436,24 @@ void TaskExecutionPipeline::launch_adaptive_dspark(SpeculativeSlot& slot) {
   slot.target_logits =
       model_.logits(slot.target_output.hidden_states,
                     validate.sampling_params().selected_token_idxes);
-  torch::argmax_out(slot.target_tokens,
-                    slot.target_logits,
-                    /*dim=*/-1,
-                    /*keepdim=*/false);
-  // The admitted target is greedy too. Any required CP consensus must precede
-  // local acceptance/KV masking, not merely synchronize the final output.
-  synchronize_tokens(slot.target_tokens, /*all_greedy=*/true);
+  const auto& sampling = slot.target_prefill->sampling_params();
+  if (sampling.sampling_mode == SamplingMode::GREEDY) {
+    torch::argmax_out(slot.target_tokens,
+                      slot.target_logits,
+                      /*dim=*/-1,
+                      /*keepdim=*/false);
+  } else {
+    slot.target_tokens.copy_(
+        RejectionSampler::sample_ragged_greedy_draft_target(
+            slot.target_logits,
+            sampling,
+            adaptive.owners,
+            validate.sampling_params().selected_token_idxes));
+  }
+  // A sampled target must agree across TP ranks before prefix acceptance and
+  // context-KV writes, not merely synchronize the final returned tokens.
+  synchronize_tokens(slot.target_tokens,
+                     sampling.sampling_mode == SamplingMode::GREEDY);
   const auto& result = slot.target_prefill->device_result();
   auto result_tokens = result.tokens;
   auto result_lengths = result.lengths;

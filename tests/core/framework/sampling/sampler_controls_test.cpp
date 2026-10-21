@@ -16,6 +16,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/framework/sampling/rejection_sampler.h"
 #include "core/framework/sampling/sampler.h"
 
 namespace xllm {
@@ -113,6 +114,162 @@ TEST(SamplerControlsTest, MinPRemovesLowProbabilityCandidates) {
   const auto probs = torch::softmax(result.draft_logits, -1);
   EXPECT_EQ(probs[0][1].item<float>(), 0);
   EXPECT_EQ(probs[0][2].item<float>(), 0);
+}
+
+TEST(RaggedRejectionSamplerTest, MapsMixedRequestParametersOnPackedRows) {
+  auto requests = make_sampling_params(3, false);
+  requests.sampling_mode = SamplingMode::MIXED;
+  requests.do_sample = torch::tensor({false, true, true}, torch::kBool);
+  requests.temperatures = torch::tensor({0.0F, 0.5F, 2.0F});
+  const torch::Tensor owners = torch::tensor({2, 2, 0, 1, 1, -1}, torch::kInt);
+  const torch::Tensor indices = torch::arange(6, torch::kInt);
+  torch::Tensor logits = torch::tensor({{0.0F, 1.0F, 2.0F}}).repeat({6, 1});
+  torch::Tensor reference = logits.clone();
+  reference[5].zero_();
+  auto expanded = make_sampling_params(6, false);
+  expanded.sampling_mode = SamplingMode::MIXED;
+  expanded.do_sample =
+      torch::tensor({true, true, false, true, true, false}, torch::kBool);
+  expanded.temperatures = torch::tensor({2.0F, 2.0F, 0.0F, 0.5F, 0.5F, 0.0F});
+  torch::manual_seed(681);
+  const auto expected = Sampler().forward(reference, expanded).next_tokens;
+  torch::manual_seed(681);
+  const auto actual = RejectionSampler::sample_ragged_greedy_draft_target(
+      logits, requests, owners, indices);
+  EXPECT_TRUE(torch::equal(actual, expected));
+  EXPECT_TRUE(torch::equal(logits, reference));
+  EXPECT_EQ(actual[2].item<int64_t>(), 2);
+  EXPECT_EQ(actual[5].item<int64_t>(), 0);
+  EXPECT_TRUE(
+      torch::equal(requests.temperatures, torch::tensor({0.0F, 0.5F, 2.0F})));
+}
+
+TEST(RaggedRejectionSamplerTest, ReusesNormalTopKTopPAndMinPTransforms) {
+  auto requests = make_sampling_params(2, true);
+  requests.temperatures = torch::tensor({0.5F, 1.5F});
+  requests.top_k = torch::tensor({1, 3}, torch::kLong);
+  requests.top_p = torch::tensor({1.0F, 0.7F});
+  requests.min_p = torch::tensor({0.0F, 0.2F});
+  const torch::Tensor owners = torch::tensor({1, 0, 1, 0}, torch::kInt);
+  torch::Tensor logits = torch::tensor({{2.0F, 1.0F, 0.0F}}).repeat({4, 1});
+  torch::Tensor reference = logits.clone();
+  auto expanded = make_sampling_params(4, true);
+  expanded.temperatures = torch::tensor({1.5F, 0.5F, 1.5F, 0.5F});
+  expanded.top_k = torch::tensor({3, 1, 3, 1}, torch::kLong);
+  expanded.top_p = torch::tensor({0.7F, 1.0F, 0.7F, 1.0F});
+  expanded.min_p = torch::tensor({0.2F, 0.0F, 0.2F, 0.0F});
+  torch::manual_seed(91);
+  const auto expected = Sampler().forward(reference, expanded).next_tokens;
+  torch::manual_seed(91);
+  const auto actual = RejectionSampler::sample_ragged_greedy_draft_target(
+      logits, requests, owners, torch::arange(4, torch::kInt));
+  EXPECT_TRUE(torch::equal(actual, expected));
+  EXPECT_TRUE(torch::equal(logits, reference));
+}
+
+TEST(RaggedRejectionSamplerTest, PreservesTargetAndResidualDistributions) {
+  torch::manual_seed(403);
+  constexpr int64_t kTrials = 20000;
+  auto requests = make_sampling_params(1, true);
+  requests.temperatures = torch::tensor({0.5F});
+  // At temperature .5 these logits yield p=(.2,.3,.5), not raw softmax.
+  const torch::Tensor probabilities = torch::tensor({0.2F, 0.3F, 0.5F});
+  torch::Tensor logits = (probabilities.log() * 0.5F).repeat({kTrials, 1});
+  const auto sampled = RejectionSampler::sample_ragged_greedy_draft_target(
+      logits,
+      requests,
+      torch::zeros({kTrials}, torch::kInt),
+      torch::arange(kTrials, torch::kInt));
+  for (int64_t token = 0; token < 3; ++token) {
+    EXPECT_NEAR(sampled.eq(token).to(torch::kFloat32).mean().item<float>(),
+                probabilities[token].item<float>(),
+                0.015);
+  }
+  // For deterministic proposal d=1, matching accepts with probability p(d).
+  // A mismatch supplies the residual p(x)/(1-p(d)) without a second draw.
+  const auto rejected = sampled.masked_select(sampled.ne(1));
+  EXPECT_NEAR(
+      rejected.eq(0).to(torch::kFloat32).mean().item<float>(), 0.2 / 0.7, 0.02);
+  EXPECT_NEAR(
+      rejected.eq(2).to(torch::kFloat32).mean().item<float>(), 0.5 / 0.7, 0.02);
+}
+
+TEST(RaggedRejectionSamplerTest, DrawsFreshRandomValuesOnEveryInvocation) {
+  auto requests = make_sampling_params(1, true);
+  torch::Tensor first_logits = torch::zeros({256, 8});
+  torch::Tensor second_logits = first_logits.clone();
+  const auto owners = torch::zeros({256}, torch::kInt);
+  const auto indices = torch::arange(256, torch::kInt);
+  torch::manual_seed(593);
+  const auto first = RejectionSampler::sample_ragged_greedy_draft_target(
+      first_logits, requests, owners, indices);
+  const auto second = RejectionSampler::sample_ragged_greedy_draft_target(
+      second_logits, requests, owners, indices);
+  EXPECT_FALSE(torch::equal(first, second));
+}
+
+TEST(RaggedRejectionSamplerTest, IgnoresNonfiniteUncommittedPaddingLogits) {
+  auto requests = make_sampling_params(1, true);
+  requests.temperatures = torch::tensor({0.5F});
+  torch::Tensor logits =
+      torch::tensor({{0.0F, 20.0F, 0.0F}, {NAN, INFINITY, -INFINITY}});
+  const auto sampled = RejectionSampler::sample_ragged_greedy_draft_target(
+      logits,
+      requests,
+      torch::tensor({0, -1}, torch::kInt),
+      torch::arange(2, torch::kInt));
+  EXPECT_EQ(sampled[0].item<int64_t>(), 1);
+  EXPECT_TRUE(torch::isfinite(logits[1]).all().item<bool>());
+  EXPECT_TRUE(logits[1].eq(0).all().item<bool>());
+}
+
+TEST(RaggedRejectionSamplerTest, ClippingPreservesTwoTokenJointDistribution) {
+  torch::manual_seed(1059);
+  constexpr int64_t kTrials = 6000;
+  const torch::Tensor first_probs = torch::tensor({0.2F, 0.3F, 0.5F});
+  const torch::Tensor transitions = torch::tensor(
+      {{0.6F, 0.3F, 0.1F}, {0.1F, 0.2F, 0.7F}, {0.3F, 0.5F, 0.2F}});
+  const torch::Tensor expected = first_probs.unsqueeze(1) * transitions;
+  for (const int64_t width : {5, 7}) {
+    for (const int64_t budget : {int64_t{0}, int64_t{2}, width}) {
+      SCOPED_TRACE(width);
+      SCOPED_TRACE(budget);
+      auto request = make_sampling_params(1, true);
+      request.temperatures = torch::tensor({0.5F});
+      // The deterministic proposal is token 1 at every position. Each row
+      // after the anchor therefore conditions on a speculative token 1.
+      torch::Tensor logits =
+          transitions[1].log().repeat({kTrials, budget + 1, 1}) * 0.5F;
+      logits.select(1, 0).copy_(first_probs.log() * 0.5F);
+      logits = logits.view({-1, 3});
+      const auto sampled =
+          RejectionSampler::sample_ragged_greedy_draft_target(
+              logits,
+              request,
+              torch::zeros({kTrials * (budget + 1)}, torch::kInt),
+              torch::arange(kTrials * (budget + 1), torch::kInt))
+              .view({kTrials, budget + 1});
+      const auto first = sampled.select(1, 0);
+      // After a rejection (or zero-budget bonus), ordinary next-step target
+      // sampling must condition on the actually committed first token.
+      torch::Tensor continuation =
+          transitions.index_select(0, first).log() * 0.5F;
+      auto continuation_params = make_sampling_params(kTrials, true);
+      continuation_params.temperatures = torch::full({kTrials}, 0.5F);
+      torch::Tensor second =
+          Sampler().forward(continuation, continuation_params).next_tokens;
+      if (budget > 0) {
+        second = torch::where(first.eq(1), sampled.select(1, 1), second);
+      }
+      const torch::Tensor joint_ids = first * 3 + second;
+      for (int64_t token = 0; token < 9; ++token) {
+        EXPECT_NEAR(
+            joint_ids.eq(token).to(torch::kFloat32).mean().item<float>(),
+            expected.flatten()[token].item<float>(),
+            0.02);
+      }
+    }
+  }
 }
 
 }  // namespace

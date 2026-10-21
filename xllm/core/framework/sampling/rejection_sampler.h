@@ -39,6 +39,19 @@ class RejectionSampler final {
   SampleOutput forward(const DraftProposal& draft_proposal,
                        const torch::Tensor& target_logits) const;
 
+  // Packed verification for a deterministic (point-mass) draft. Sample each
+  // target row, then let the caller commit the prefix matching its proposals,
+  // including the first mismatch or the terminal bonus row. This is exact
+  // delta-q rejection sampling without materializing draft probabilities.
+  // owners maps packed rows to requests; -1 padding borrows request zero's
+  // parameters and must never be committed. No layout tensor is read on Host.
+  // Penalties, constraints, seeded sampling and logprobs are not supported.
+  static torch::Tensor sample_ragged_greedy_draft_target(
+      torch::Tensor& target_logits,
+      const SamplingParameters& request_sampling,
+      const torch::Tensor& owners,
+      const torch::Tensor& packed_indices);
+
   // `uniform_rand` is consumed in place (log'ed); `target_lse` is the
   // caller-computed row logsumexp of `target_logits`.
   static torch::Tensor random_sample(const DraftProposal& draft_proposal,

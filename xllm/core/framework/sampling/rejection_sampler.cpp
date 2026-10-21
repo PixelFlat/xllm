@@ -19,6 +19,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <array>
 #include <optional>
 #include <utility>
 
@@ -98,6 +99,65 @@ RejectionSampler::RejectionSampler(const SamplingParameters& sampling_params,
     // extend (Sampler::forward() mixed-mode shape assumptions).
     do_sample_ = sampling_params.require_do_sample().unsqueeze(/*dim=*/-1);
   }
+}
+
+torch::Tensor RejectionSampler::sample_ragged_greedy_draft_target(
+    torch::Tensor& target_logits,
+    const SamplingParameters& request_sampling,
+    const torch::Tensor& owners,
+    const torch::Tensor& packed_indices) {
+  CHECK_EQ(target_logits.dim(), 2);
+  CHECK_EQ(owners.dim(), 1);
+  CHECK_EQ(owners.numel(), target_logits.size(0));
+  CHECK_EQ(owners.device(), target_logits.device());
+  CHECK(owners.scalar_type() == torch::kInt32 ||
+        owners.scalar_type() == torch::kInt64);
+  CHECK_EQ(packed_indices.dim(), 1);
+  CHECK_EQ(packed_indices.numel(), owners.numel());
+  CHECK_EQ(packed_indices.device(), owners.device());
+  CHECK(request_sampling.selected_token_idxes.defined());
+  CHECK_GT(request_sampling.num_sample_seqs(), 0);
+  if (request_sampling.sampling_mode == SamplingMode::MIXED) {
+    CHECK(request_sampling.do_sample.defined());
+  }
+  CHECK(!request_sampling.logprobs);
+  CHECK(!request_sampling.seeds.defined());
+  CHECK(!request_sampling.seed_offsets.defined());
+  CHECK(!request_sampling.logits_bias.defined());
+  CHECK(!request_sampling.min_token_positions.defined());
+  CHECK(!request_sampling.min_tokens_remaining.defined());
+  CHECK(!request_sampling.min_token_ids.defined());
+  CHECK(!request_sampling.filter_mask.defined());
+  CHECK(!request_sampling.filter_bitmask.defined());
+
+  // Graph padding has no conditional distribution: its borrowed logits may
+  // be non-finite. Give only those uncommitted rows a valid dummy distribution
+  // before multinomial; do not sanitize any real request's logits.
+  target_logits.masked_fill_(owners.lt(0).unsqueeze(1), 0);
+  const torch::Tensor request_rows = owners.clamp_min(0).to(torch::kInt64);
+  SamplingParameters packed;
+  packed.selected_token_idxes = packed_indices;
+  packed.sampling_mode = request_sampling.sampling_mode;
+  constexpr std::array<torch::Tensor SamplingParameters::*, 5> kRequestFields =
+      {&SamplingParameters::temperatures,
+       &SamplingParameters::top_k,
+       &SamplingParameters::top_p,
+       &SamplingParameters::min_p,
+       &SamplingParameters::do_sample};
+  for (const auto member : kRequestFields) {
+    const auto& values = request_sampling.*member;
+    if (values.defined()) {
+      CHECK_EQ(values.device(), owners.device());
+      CHECK_EQ(values.dim(), 1);
+      CHECK_EQ(values.numel(), request_sampling.num_sample_seqs());
+      packed.*member = values.index_select(/*dim=*/0, request_rows);
+    }
+  }
+  // Only the shared Sampler owns temperature/filter transforms and RNG.
+  // Sampling every row also supplies the correct residual token: conditioned
+  // on not matching deterministic draft d, X~p has p(X)/(1-p(d)), X!=d.
+  // The caller must establish TP consensus before committing any KV state.
+  return Sampler().forward(target_logits, packed).next_tokens;
 }
 
 SampleOutput RejectionSampler::forward(

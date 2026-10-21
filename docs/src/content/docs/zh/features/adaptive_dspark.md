@@ -25,7 +25,7 @@ limitations under the License.
 ## 支持的配置
 
 当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
-head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy 采样、DP=1/CP=1、
+head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy draft、DP=1/CP=1、
 ACL graph、异步调度和 task pipeline。必须启用 graph warmup；这条路径暂不支持
 自适应 unified graph。固定步数 DSpark 和其他算法的执行限制保持各自原有约定。
 
@@ -52,7 +52,24 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --adaptive_dspark_cost_table_output=/results/dspark-costs.json
 ```
 
-客户端显式传入 `temperature=0`。
+客户端显式传入 temperature：`temperature=0` 使用 greedy target；
+`temperature=0.5` 等正值使用随机 target 采样。不同 temperature 可以混合成批，
+target 的 top-k、top-p 和 min-p 过滤复用普通采样器的语义。
+draft 仍须使用 `--draft_sampling_mode=greedy`，暂不支持 probabilistic draft。
+
+随机 target 路径由 rejection sampler 按 Device 上的 packed-row owners 映射
+每请求参数，对每个验证行采样。由于 draft 是确定性的，这与点质量提议分布的
+拒绝采样等价：连续匹配的结果接受 draft 前缀，首次不匹配的采样结果就是拒绝后
+的替代 token；全部匹配时使用末行采样结果作为 bonus。各 TP rank 在接受判断、
+context KV 更新前先统一采样结果。target/draft forward 和自适应打包继续走
+ACL graph；随机采样和前缀提交在模型图外、task stream 上执行，不将打包边界
+回读到 Host。每请求 seed、logprobs、结构化约束、最短输出长度 stop mask、token bias 及非中性 penalty
+仍不支持，会在执行前拒绝，不会静默忽略。
+
+预算仍提前使用符合轮次约束的历史 confidence 决定，本轮 target 采样结果不参与
+本轮裁剪。greedy draft 的 confidence 不一定能准确预测随机采样接受率。
+当前启动标定使用 greedy target 请求，完整步成本尚不包含随机采样开销；支持
+随机采样的正确性不代表接受率、预算最优性和性能与 greedy 相同，需要单独测量。
 
 使用 Draft5 时，将步数改为 `--num_speculative_tokens=5`，并选择新的输出文件，
 例如 `/results/dspark-costs-draft5.json`。draft 本身生成五个候选，自适应验证可

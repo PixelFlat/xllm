@@ -102,8 +102,8 @@ void configure_profile_sampling(RequestSamplingParam& sampling,
       speculative_config.enable_adaptive_speculative_decode() &&
       SpeculativeConfig::is_dspark_algorithm(
           speculative_config.speculative_algorithm())) {
-    // Synthetic profiling requests use the same admission as serving. The
-    // adaptive pipeline supports greedy execution only, including startup.
+    // Startup costs use a fixed greedy sampling policy. Serving may sample
+    // random target tokens, whose extra sampler cost is not calibrated here.
     sampling.temperature = 0.0F;
   }
 }
