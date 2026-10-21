@@ -69,12 +69,17 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
     uint32_t physical_requests,
     uint32_t requested_graph_rows,
     std::span<const DSparkGraphCost> prewarmed_graphs,
-    uint32_t draft_width) {
+    uint32_t draft_width,
+    std::span<const DSparkGraphCost> actual_batch_graphs,
+    std::optional<uint32_t> calibration_requests) {
   if ((draft_width != 5 && draft_width != 7) || logical_requests == 0 ||
       logical_requests > physical_requests ||
       physical_requests >
           std::numeric_limits<uint32_t>::max() / (draft_width + 1) ||
-      !valid_costs(prewarmed_graphs, /*fixed_time_ms=*/0.0)) {
+      !valid_costs(prewarmed_graphs, /*fixed_time_ms=*/0.0) ||
+      (!actual_batch_graphs.empty() &&
+       !valid_costs(actual_batch_graphs, /*fixed_time_ms=*/0.0)) ||
+      (calibration_requests && *calibration_requests == 0)) {
     return std::nullopt;
   }
   const auto find_rows = [&](uint32_t rows) {
@@ -93,13 +98,57 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
       full == prewarmed_graphs.end()) {
     return std::nullopt;
   }
+  if (std::any_of(actual_batch_graphs.begin(),
+                  actual_batch_graphs.end(),
+                  [&](const DSparkGraphCost& graph) {
+                    const auto known = find_rows(graph.graph_rows);
+                    return graph.graph_rows < logical_requests ||
+                           graph.graph_rows > full->graph_rows ||
+                           known == prewarmed_graphs.end() ||
+                           known->graph_rows != graph.graph_rows;
+                  })) {
+    return std::nullopt;
+  }
   // Request admission/retirement can temporarily select a smaller or larger
   // Bcap than the calibration workload. Decide the supported shape before
   // executing a Task; never capture a new binding or retry an execution.
-  const uint32_t graph_rows = requested_graph_rows >= physical_requests &&
-                                      requested_graph_rows <= full->graph_rows
-                                  ? requested_graph_rows
-                                  : full->graph_rows;
+  uint32_t graph_rows = requested_graph_rows >= physical_requests &&
+                                requested_graph_rows <= full->graph_rows
+                            ? requested_graph_rows
+                            : full->graph_rows;
+  if (!actual_batch_graphs.empty()) {
+    const auto actual =
+        std::lower_bound(actual_batch_graphs.begin(),
+                         actual_batch_graphs.end(),
+                         graph_rows,
+                         [](const DSparkGraphCost& graph, uint32_t rows) {
+                           return graph.graph_rows < rows;
+                         });
+    if (actual == actual_batch_graphs.end() ||
+        actual->graph_rows != graph_rows) {
+      // A partially admitted/retired batch can share Bcap without sharing the
+      // whole-round B/G binding. Use its warmed full width before execution;
+      // never substitute a different tier for a stable requested sample.
+      if (logical_requests == physical_requests &&
+          requested_graph_rows >= physical_requests &&
+          requested_graph_rows <= full->graph_rows &&
+          (!calibration_requests ||
+           *calibration_requests == logical_requests)) {
+        return std::nullopt;
+      }
+      const auto actual_full =
+          std::lower_bound(actual_batch_graphs.begin(),
+                           actual_batch_graphs.end(),
+                           logical_requests * (draft_width + 1),
+                           [](const DSparkGraphCost& graph, uint32_t rows) {
+                             return graph.graph_rows < rows;
+                           });
+      if (actual_full == actual_batch_graphs.end()) {
+        return std::nullopt;
+      }
+      graph_rows = actual_full->graph_rows;
+    }
+  }
   return DSparkBudgetPlan{
       std::min(logical_requests * draft_width, graph_rows - logical_requests),
       graph_rows};

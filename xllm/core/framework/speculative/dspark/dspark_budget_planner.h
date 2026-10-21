@@ -55,12 +55,19 @@ class DSparkBudgetPlanner final {
   // Transient buckets outside that range explicitly run prewarmed full width;
   // their completions must not be recorded as samples of the requested G.
   // Unknown G, invalid geometry or missing full-width capacity is rejected.
+  // Whole-round graphs may additionally restrict G for the current actual B.
+  // Transient partial batches use their captured full width when necessary;
+  // stable unsupported B/G pairs remain errors, not calibration samples.
+  // Internal startup sampling supplies its intended B to identify transitions
+  // even when the transient logical and physical request counts are equal.
   static std::optional<DSparkBudgetPlan> calibration_plan(
       uint32_t logical_requests,
       uint32_t physical_requests,
       uint32_t requested_graph_rows,
       std::span<const DSparkGraphCost> prewarmed_graphs,
-      uint32_t draft_width = 7);
+      uint32_t draft_width = 7,
+      std::span<const DSparkGraphCost> actual_batch_graphs = {},
+      std::optional<uint32_t> calibration_requests = std::nullopt);
 
   // Lagged confidence is retired Host feedback, flattened [batch, draft_width],
   // or empty. Costs must be ascending, unique, prewarmed physical graph

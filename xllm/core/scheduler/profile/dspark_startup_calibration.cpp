@@ -320,7 +320,16 @@ void ProfileManager::calibrate_dspark_startup() {
                               {"calibration", configuration},
                               {"captured_geometry", geometry}}
                    .dump();
-  const auto points = plan_dspark_calibration(config, requests, graphs);
+  const auto& coverage = geometry.at("graph_coverage");
+  std::vector<DSparkCalibrationGraphCoverage> graph_coverage;
+  graph_coverage.reserve(coverage.size());
+  for (const auto& entry : coverage) {
+    graph_coverage.emplace_back(DSparkCalibrationGraphCoverage{
+        entry.at("requests").get<uint32_t>(),
+        entry.at("target_graph_rows").get<std::vector<uint32_t>>()});
+  }
+  const auto points =
+      plan_dspark_calibration(config, requests, graphs, graph_coverage);
   CHECK(points)
       << "Calibration requires captured buckets and full-width coverage.";
   for (const auto& point : *points) {

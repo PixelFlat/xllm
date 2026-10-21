@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <array>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "core/framework/sampling/rejection_sampler.h"
 #include "core/framework/speculative/dspark/dspark_adaptive_cost_cache.h"
@@ -96,6 +97,9 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     std::vector<std::string> request_ids;
     std::vector<double> lagged_confidence;
     std::vector<int32_t> draft_counts;
+    // Complete raw-B/G bindings are captured at drained startup for this Slot.
+    // Admission checks this set before mutating persistent request context.
+    std::unordered_set<uint64_t> unified_graph_bindings;
     // Proposal IDs, confidence and widths share an owned arena. Proposal +
     // confidence consensus is one broadcast; confidence + width feedback is
     // one tiny D2H copy covered by the ordinary result-ready fence.

@@ -64,6 +64,13 @@ struct DSparkCalibrationPoint {
   DSparkCalibrationContext context;
 };
 
+// Whole-round graphs bind actual B as well as G. An empty coverage list keeps
+// the split-graph policy; otherwise each listed request bucket is explicit.
+struct DSparkCalibrationGraphCoverage {
+  uint32_t requests = 0;
+  std::vector<uint32_t> target_graph_rows;
+};
+
 std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
     std::string_view contents,
     uint32_t draft_width = 7);
@@ -93,7 +100,8 @@ std::optional<uint32_t> dspark_calibration_warmup_length(
 std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
     const DSparkStartupCalibrationConfig& config,
     std::span<const uint32_t> captured_requests,
-    std::span<const uint32_t> captured_target_rows);
+    std::span<const uint32_t> captured_target_rows,
+    std::span<const DSparkCalibrationGraphCoverage> graph_coverage = {});
 
 // Host-only startup fit using cell medians and an identifiable additive model.
 // No device/runtime or subprocess is involved. The serialized table includes

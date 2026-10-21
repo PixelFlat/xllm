@@ -12,16 +12,174 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 import torch
 
 from xllm.python.model_executor.runners.unified_block_acl_graph import (
+    TensorDesc,
     UnifiedBlockAclGraph,
     UnifiedBlockGraphRegistry,
+    _BlockGraphLifecycle,
     _greedy_dflash2_path,
+    _tensor_binding,
 )
+
+
+def test_tensor_binding_exposes_named_immutable_metadata() -> None:
+    tensor = torch.arange(20, dtype=torch.float32)[4:].view(4, 4).t()
+    descriptor = _tensor_binding(tensor)
+    assert isinstance(descriptor, TensorDesc)
+    assert descriptor.data_ptr == tensor.data_ptr()
+    assert descriptor.shape == tuple(tensor.shape)
+    assert descriptor.stride == tuple(tensor.stride())
+    assert descriptor.dtype == tensor.dtype
+    assert descriptor.device == tensor.device
+    with pytest.raises(AttributeError):
+        descriptor.data_ptr = 0
+
+
+def test_tensor_binding_preserves_tuple_cache_keys_after_content_updates() -> None:
+    tensor = torch.arange(16, dtype=torch.float32).view(4, 4)
+    legacy = tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, tensor.device
+    descriptor = _tensor_binding(tensor)
+    assert descriptor == legacy
+    assert hash(descriptor) == hash(legacy)
+    cache = {legacy: "captured"}
+    tensor.add_(7)
+    assert cache[_tensor_binding(tensor)] == "captured"
+    assert cache[_tensor_binding(tensor.view_as(tensor))] == "captured"
+
+
+def test_tensor_binding_distinguishes_storage_layout_dtype_and_device() -> None:
+    tensor = torch.zeros((4, 4), dtype=torch.float32)
+    descriptor = _tensor_binding(tensor)
+    cache = {descriptor: "captured"}
+    for changed in (tensor.clone(), tensor.view(2, 8), tensor.t(), tensor.view(torch.int32)):
+        assert _tensor_binding(changed) not in cache
+    assert descriptor._replace(device=torch.device("meta")) not in cache
+
+
+@pytest.fixture
+def graph_runtime(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Record lifecycle operations without replacing either production runner."""
+    calls = []
+
+    class Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_stream(self, other: "Stream") -> None:
+            calls.append(f"{self.name}:wait:{other.name}")
+
+        def synchronize(self) -> None:
+            calls.append(f"{self.name}:synchronize")
+
+    class Graph:
+        def replay(self) -> None:
+            calls.append("replay")
+
+        def reset(self) -> None:
+            calls.append("reset")
+
+    @contextmanager
+    def stream_context(stream: Stream) -> Iterator[None]:
+        calls.append(f"{stream.name}:enter")
+        yield
+        calls.append(f"{stream.name}:exit")
+
+    @contextmanager
+    def graph_context(graph: Graph, *, pool: tuple, stream: Stream, capture_error_mode: str) -> Iterator[None]:
+        assert graph is runtime.graph and pool is runtime.pool and stream is runtime.stream
+        assert capture_error_mode == "thread_local"
+        calls.append("capture:enter")
+        yield
+        calls.append("capture:exit")
+
+    runtime = SimpleNamespace(
+        calls=calls, current=Stream("producer"), stream=Stream("graph"), graph=Graph(), pool=(1, 2)
+    )
+    monkeypatch.setattr(torch.npu, "current_stream", lambda _: runtime.current)
+    monkeypatch.setattr(torch.npu, "stream", stream_context)
+    monkeypatch.setattr(torch.npu, "graph", graph_context)
+    monkeypatch.setattr(torch.npu, "NPUGraph", lambda: runtime.graph)
+    monkeypatch.setattr(torch.npu, "graph_task_update_begin", lambda stream, handle: calls.append(f"begin:{handle}"))
+    monkeypatch.setattr(torch.npu, "graph_task_update_end", lambda stream: calls.append("end"))
+    return runtime
+
+
+class _BodyRound(_BlockGraphLifecycle):
+    def __init__(self, runtime: SimpleNamespace) -> None:
+        super().__init__(torch.zeros(1), runtime.stream, runtime.pool)
+        self.calls = runtime.calls
+
+    def _run(self) -> torch.Tensor:
+        self.calls.append("body")
+        return self.tokens + 1
+
+
+def test_shared_lifecycle_orders_capture_task_updates_replay_and_retirement(graph_runtime: SimpleNamespace) -> None:
+    runtime = graph_runtime
+    runner = _BodyRound(runtime)
+    runner.capture()
+    assert runtime.calls == [
+        "graph:wait:producer",
+        "graph:enter",
+        "body",
+        "body",
+        "graph:exit",
+        "graph:synchronize",
+        "producer:wait:graph",
+        "graph:enter",
+        "capture:enter",
+        "body",
+        "capture:exit",
+        "graph:exit",
+    ]
+    assert runner.context.stream is runtime.stream
+    saved = runner.hidden
+    runner.context.tasks.append(
+        SimpleNamespace(
+            handle=17,
+            update=lambda: runtime.calls.append("update"),
+            event=SimpleNamespace(record=lambda stream: runtime.calls.append("record")),
+        )
+    )
+    runtime.calls.clear()
+    assert runner.execute() is saved
+    assert runtime.calls == [
+        "graph:wait:producer",
+        "graph:enter",
+        "begin:17",
+        "update",
+        "end",
+        "record",
+        "replay",
+        "graph:exit",
+        "producer:wait:graph",
+    ]
+    runtime.calls.clear()
+    runner.close()
+    assert runtime.calls == ["graph:synchronize", "producer:synchronize", "reset"]
+
+
+def test_shared_lifecycle_propagates_replay_failure_without_recapture(
+    graph_runtime: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _BodyRound(graph_runtime)
+    runner.capture()
+    graph_runtime.calls.clear()
+
+    def fail_replay() -> None:
+        raise RuntimeError("replay failed")
+
+    monkeypatch.setattr(graph_runtime.graph, "replay", fail_replay)
+    with pytest.raises(RuntimeError, match="replay failed"):
+        runner.execute()
+    assert "body" not in graph_runtime.calls and "capture:enter" not in graph_runtime.calls
 
 
 def test_unified_dflash2_path_tracks_predecessors_per_sequence() -> None:
@@ -72,7 +230,8 @@ class _ToyExecutor:
         self.eager_runner = SimpleNamespace(device=torch.device(device), layer_caches=[])
         self.cache = torch.full((128, 2), -50.0, device=device)
         self.last_slots = torch.zeros(6, dtype=torch.int32, device=device)
-        self._target_mismatch = torch.tensor([[0, 1, 0], [0, 0, 0]], device=device)
+        # Capture must not copy a Python constant to the device.
+        self._target_mismatch = torch.tensor([[0, 1, 0], [0, 0, 0]], dtype=torch.int64, device=device)
         if algorithm == "dflash2" and not target:
             self.dflash2_candidates = self._candidates
 

@@ -38,6 +38,13 @@ class Executor final {
   virtual ~Executor() = default;
 
   bool supports_prepared_attention_metadata() const;
+  bool supports_adaptive_unified_graph() const;
+  void warmup_adaptive_unified_graph(Executor& draft_executor,
+                                     const AdaptiveDSparkGraphTask& task,
+                                     ProcessGroup* sampling_group);
+  torch::Tensor run_adaptive_unified_graph(Executor& draft_executor,
+                                           const AdaptiveDSparkGraphTask& task,
+                                           ProcessGroup* sampling_group);
   // Called on Prepare after binding Slot-owned tensor and native metadata.
   // No model computation; the supported backend must not mutate active state.
   void prepare_attention_metadata(std::vector<KVCache>& kv_caches,

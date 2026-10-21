@@ -46,6 +46,15 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
 
   ~PyExecutorImpl() override;
 
+  bool supports_adaptive_unified_graph() const override;
+  void warmup_adaptive_unified_graph(ExecutorImpl& draft_executor,
+                                     const AdaptiveDSparkGraphTask& task,
+                                     ProcessGroup* sampling_group) override;
+  torch::Tensor run_adaptive_unified_graph(
+      ExecutorImpl& draft_executor,
+      const AdaptiveDSparkGraphTask& task,
+      ProcessGroup* sampling_group) override;
+
   bool supports_prepared_attention_metadata() const override {
     return supports_prepared_metadata_;
   }
@@ -80,6 +89,9 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                                   ProcessGroup* sampling_group);
 
  private:
+  // Startup only; serving must find an already captured exact Slot binding.
+  void create_adaptive_unified_registry(PyExecutorImpl& draft_executor,
+                                        ProcessGroup* sampling_group);
   // Caller holds the GIL. First binding occurs on Prepare for pipeline input.
   void bind_kv_caches(std::vector<KVCache>& kv_caches);
 
@@ -91,6 +103,9 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
 
   pybind11::object py_executor_;
   pybind11::object block_graph_registry_;
+  pybind11::object adaptive_unified_registry_;
+  PyExecutorImpl* adaptive_unified_draft_ = nullptr;
+  ProcessGroup* adaptive_unified_sampling_group_ = nullptr;
   bool supports_prepared_metadata_ = false;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;

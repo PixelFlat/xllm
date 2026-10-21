@@ -235,6 +235,32 @@ uint64_t dspark_graph_kv_capacity(const LlmTaskCapacity& capacity,
   return pages * page_size;
 }
 
+uint64_t adaptive_unified_graph_key(uint32_t batch_size, uint32_t graph_rows) {
+  return (static_cast<uint64_t>(batch_size) << 32) | graph_rows;
+}
+
+std::vector<int64_t> adaptive_unified_graph_rows(
+    uint32_t batch_size,
+    std::span<const int64_t> captured_graph_rows,
+    uint32_t draft_width) {
+  std::vector<int64_t> result;
+  result.reserve(4);
+  // Whole-round graphs duplicate model nodes, unlike prepared Target graphs.
+  // Four physical tiers bound startup variants without restricting raw B.
+  for (const uint32_t width : {1U, 2U, 4U, draft_width + 1}) {
+    const int64_t required = static_cast<int64_t>(batch_size) * width;
+    const auto bucket = std::lower_bound(
+        captured_graph_rows.begin(), captured_graph_rows.end(), required);
+    if (bucket == captured_graph_rows.end()) {
+      return {};
+    }
+    if (result.empty() || result.back() != *bucket) {
+      result.emplace_back(*bucket);
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 bool supports_unified_block_graph(const SpeculativeTaskCapacity& capacity,
@@ -297,6 +323,14 @@ Status TaskExecutionPipeline::create(
                common.model.max_blocks_per_sequence >
            std::numeric_limits<int32_t>::max())) {
     return invalid("Adaptive DSpark block tables exceed INT32 indexing.");
+  }
+  if (capacity.adaptive_dspark && capacity.unified_graph &&
+      (common.cp_sampling_group != nullptr ||
+       !target.executor.supports_adaptive_unified_graph() ||
+       !draft.executor.supports_adaptive_unified_graph())) {
+    return invalid(
+        "Adaptive DSpark unified graphs require supported Target/Draft "
+        "executors and CP=1.");
   }
   if (common.enable_kv_push && (capacity.kind != SpeculativeTaskKind::MTP ||
                                 !target.push_kv || !draft.push_kv)) {
@@ -469,6 +503,7 @@ Status TaskExecutionPipeline::initialize_speculative() {
       adaptive.request_ids.reserve(count);
       adaptive.lagged_confidence.reserve(count * (width - 1));
       adaptive.draft_counts.reserve(count);
+      adaptive.unified_graph_bindings.reserve(static_cast<size_t>(count) * 4);
     } else {
       slot->proposal_storage =
           torch::empty({count * (width - 1)}, options.dtype(torch::kInt64));
@@ -713,6 +748,12 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
         "Adaptive DSpark task pipeline requires consistent sampling flags "
         "without log probabilities, structured sampling or non-neutral "
         "penalties.");
+  }
+  if (slot.adaptive && speculative_capacity_->unified_graph &&
+      input.sampling_params.sampling_mode != SamplingMode::GREEDY) {
+    return invalid(
+        "Adaptive DSpark unified graphs require greedy target sampling; "
+        "disable unified graphs for positive or mixed temperatures.");
   }
 
   const auto& c = speculative_capacity_->common;
@@ -1013,9 +1054,18 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
       static_cast<uint32_t>(*std::max_element(slot.upper_kv_lengths.begin(),
                                               slot.upper_kv_lengths.end())) +
       draft_width;
+  const auto unified_rows =
+      speculative_capacity_->unified_graph
+          ? adaptive_unified_graph_rows(
+                slot.rows, captured_graph_batch_sizes_, draft_width)
+          : std::vector<int64_t>();
+  const std::span<const int64_t> candidate_rows =
+      speculative_capacity_->unified_graph
+          ? std::span<const int64_t>(unified_rows)
+          : std::span<const int64_t>(captured_graph_batch_sizes_);
   std::vector<DSparkGraphCost> costs;
-  costs.reserve(captured_graph_batch_sizes_.size());
-  for (const int64_t graph_rows : captured_graph_batch_sizes_) {
+  costs.reserve(candidate_rows.size());
+  for (const int64_t graph_rows : candidate_rows) {
     costs.emplace_back(DSparkGraphCost{static_cast<uint32_t>(graph_rows), 0.0});
   }
   DSparkBudgetOptions options;
@@ -1060,8 +1110,27 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
         dspark_adaptive_->calibration_point->target_graph_rows;
     const uint32_t physical_requests =
         slot.drafts.front()->padded_batch_size / draft_width;
-    plan = DSparkBudgetPlanner::calibration_plan(
-        slot.rows, physical_requests, graph_rows, costs, draft_width);
+    if (speculative_capacity_->unified_graph) {
+      std::vector<DSparkGraphCost> target_graphs;
+      target_graphs.reserve(captured_graph_batch_sizes_.size());
+      for (const int64_t rows : captured_graph_batch_sizes_) {
+        target_graphs.emplace_back(
+            DSparkGraphCost{static_cast<uint32_t>(rows), 0.0});
+      }
+      plan = DSparkBudgetPlanner::calibration_plan(
+          slot.rows,
+          physical_requests,
+          graph_rows,
+          target_graphs,
+          draft_width,
+          costs,
+          dspark_adaptive_->calibration_point
+              ? std::optional(dspark_adaptive_->calibration_point->requests)
+              : std::nullopt);
+    } else {
+      plan = DSparkBudgetPlanner::calibration_plan(
+          slot.rows, physical_requests, graph_rows, costs, draft_width);
+    }
     if (!plan) {
       return invalid(
           "DSpark calibration requires a known G and prewarmed full-width "
@@ -1077,6 +1146,13 @@ Status TaskExecutionPipeline::plan_adaptive_dspark(
   }
   if (!plan) {
     return invalid("Adaptive DSpark requires a prewarmed full-width graph.");
+  }
+  if (speculative_capacity_->unified_graph &&
+      !adaptive.unified_graph_bindings.contains(
+          adaptive_unified_graph_key(slot.rows, plan->graph_rows))) {
+    return invalid(
+        "Adaptive DSpark unified graph requires a prewarmed batch/verify "
+        "binding.");
   }
   adaptive.plan = *plan;
   adaptive.generation = generation;
@@ -1552,6 +1628,218 @@ Status TaskExecutionPipeline::warmup_adaptive_dspark_graphs(
   }
   std::sort(captured_graph_batch_sizes_.begin(),
             captured_graph_batch_sizes_.end());
+  if (speculative_capacity_->unified_graph) {
+    return warmup_adaptive_unified_graphs(input);
+  }
+  return Status();
+}
+
+std::vector<DSparkCalibrationGraphCoverage>
+TaskExecutionPipeline::adaptive_dspark_graph_coverage() const {
+  if (!speculative_capacity_->unified_graph) {
+    return {};
+  }
+  const auto& captured_requests =
+      slots_.front()->speculative->drafts.front()->captured_graph_batch_sizes;
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
+  std::vector<DSparkCalibrationGraphCoverage> coverage;
+  coverage.reserve(captured_requests.size());
+  for (const int64_t draft_rows : captured_requests) {
+    const bool common_draft =
+        std::all_of(slots_.begin(), slots_.end(), [&](const auto& task_slot) {
+          const auto& captured = task_slot->speculative->drafts.front()
+                                     ->captured_graph_batch_sizes;
+          return std::binary_search(
+              captured.begin(), captured.end(), draft_rows);
+        });
+    if (!common_draft) {
+      continue;
+    }
+    CHECK_EQ(draft_rows % draft_width, 0);
+    const uint32_t requests = static_cast<uint32_t>(draft_rows / draft_width);
+    DSparkCalibrationGraphCoverage entry;
+    entry.requests = requests;
+    entry.target_graph_rows.reserve(4);
+    for (const int64_t rows : captured_graph_batch_sizes_) {
+      const bool common =
+          std::all_of(slots_.begin(), slots_.end(), [&](const auto& task_slot) {
+            return task_slot->speculative->adaptive->unified_graph_bindings
+                .contains(adaptive_unified_graph_key(
+                    requests, static_cast<uint32_t>(rows)));
+          });
+      if (common) {
+        entry.target_graph_rows.emplace_back(static_cast<uint32_t>(rows));
+      }
+    }
+    coverage.emplace_back(std::move(entry));
+  }
+  return coverage;
+}
+
+Status TaskExecutionPipeline::warmup_adaptive_unified_graphs(
+    const LlmForwardInput& input) {
+  const auto host = SlotBuffer::model_input_view(input);
+  const auto batch = model_batch(input);
+  const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
+  CHECK(input.input_params.meta.is_graph_warmup);
+  CHECK(batch.forward_type.is_decode());
+  c10::DeviceGuard device_guard(device_.unwrap());
+  auto guard = task_stream_.set_stream_guard();
+  uint64_t new_variants = 0;
+  for (auto& task_slot : slots_) {
+    auto& slot = *task_slot->speculative;
+    auto& adaptive = *slot.adaptive;
+    auto& invocation = *slot.drafts.front();
+    auto& draft = *invocation.input;
+    const uint32_t original_rows = slot.rows;
+    const DSparkBudgetPlan original_plan = adaptive.plan;
+    const uint32_t original_draft_rows = invocation.padded_batch_size;
+    // ProfileManager sweeps the largest batch first. Enumerate every raw B,
+    // including non-buckets such as three, before accepting serving Tasks.
+    // The graph keeps actual-B head/result shapes and a fixed physical G.
+    for (uint32_t rows = 1; rows <= original_rows; ++rows) {
+      slot.rows = rows;
+      const ModelInputHostView prefix_host{
+          host.token_ids.first(rows),
+          std::span<const int32_t>(slot.upper_positions).first(rows),
+          host.new_cache_slots.first(rows),
+          host.q_seq_lens.first(rows),
+          std::span<const int32_t>(slot.upper_kv_lengths).first(rows),
+          host.q_cu_seq_lens.first(rows),
+          host.block_tables.first(static_cast<size_t>(rows) *
+                                  host.block_table_width),
+          host.block_table_width};
+      const ModelInputBatch prefix_batch{
+          BatchForwardType::DECODE, rows, batch.batch_id, false};
+      Status status =
+          SlotBuffer::plan_mtp_decode(draft, prefix_host, prefix_batch);
+      CHECK(status.ok()) << status.message();
+      auto& draft_parallel = draft.model_params().parallel;
+      draft_parallel.raw_dp_global_token_nums = {
+          static_cast<int32_t>(rows * draft_width)};
+      draft_parallel.dp_global_token_nums =
+          draft_parallel.raw_dp_global_token_nums;
+      draft_parallel.dp_is_decode = {1};
+      const uint32_t draft_rows =
+          task_graph_batch_size(draft_parallel, invocation.graph_batch_sizes);
+      CHECK_GT(draft_rows, 0U);
+      status = SlotBuffer::prepare_planned_mtp_decode(
+          draft, prefix_host, prefix_batch, prepare_stream_, draft_rows);
+      CHECK(status.ok()) << status.message();
+      pad_task_parallel(draft_parallel, draft_rows);
+      CHECK_EQ(prepare_stream_.synchronize(), 0);
+      // Cold prepared capture precedes the composite graph's write mask.
+      // Borrow reserved page zero for reads and suppress every cache write.
+      draft.model_params().attention.device.new_cache_slots.fill_(-1);
+      draft.model_params().attention.device.block_tables.zero_();
+      draft_->executor.prepare_attention_metadata(draft_->kv_caches,
+                                                  draft.model_params());
+      // Smaller physical Draft buckets may not yet have appeared in the
+      // scheduler's descending warmup. Keep their prepared path available too.
+      draft_->executor.warmup_prepared_graph(draft.tokens(),
+                                             draft.positions(),
+                                             draft_->kv_caches,
+                                             draft.model_params());
+      const int32_t maximum_kv_length = *std::max_element(
+          draft.model_params().attention.host.kv_seq_lens.begin(),
+          draft.model_params().attention.host.kv_seq_lens.end());
+      invocation.captured_graph_kv_capacities.try_emplace(
+          draft_rows,
+          dspark_graph_kv_capacity(capacity_,
+                                   draft.input_scratch_->rows_per_sequence_,
+                                   maximum_kv_length));
+      auto& captured = invocation.captured_graph_batch_sizes;
+      const auto bucket =
+          std::lower_bound(captured.begin(), captured.end(), draft_rows);
+      if (bucket == captured.end() || *bucket != draft_rows) {
+        captured.insert(bucket, draft_rows);
+      }
+      invocation.padded_batch_size = draft_rows;
+      const uint32_t kv_bound = static_cast<uint32_t>(std::min(
+          {invocation.captured_graph_kv_capacities.at(draft_rows) + 1,
+           static_cast<uint64_t>(capacity_.max_kv_seq_len),
+           static_cast<uint64_t>(capacity_.max_positions),
+           static_cast<uint64_t>(
+               draft.model_params().attention.device.block_tables.size(1)) *
+               capacity_.logical_block_size}));
+      status = slot.target_prefill->bind_result(rows,
+                                                draft_width + 1,
+                                                /*top_logprobs=*/0,
+                                                /*logprobs=*/false);
+      CHECK(status.ok()) << status.message();
+      MtpContextView dummy_state{};
+      dummy_state.prepared_ = true;
+      dummy_state.tokens_ = prefix(slot.state->token_storage_, rows);
+      dummy_state.state_.positions =
+          prefix(slot.state->storage_.positions, rows);
+      dummy_state.state_.kv_seq_lens =
+          prefix(slot.state->storage_.kv_seq_lens, rows);
+      // Cold sources borrow Slot storage, not central published request state.
+      // Suppression is a Device value shared with serving's final binding.
+      adaptive.arena_storage.zero_();
+      dummy_state.tokens_.fill_(1);
+      dummy_state.state_.positions.zero_();
+      dummy_state.state_.kv_seq_lens.fill_(1);
+      const auto graph_tiers = adaptive_unified_graph_rows(
+          rows, captured_graph_batch_sizes_, draft_width);
+      CHECK(!graph_tiers.empty());
+      for (const int64_t captured_rows : graph_tiers) {
+        const uint32_t graph_rows = static_cast<uint32_t>(captured_rows);
+        const uint64_t key = adaptive_unified_graph_key(rows, graph_rows);
+        if (adaptive.unified_graph_bindings.contains(key)) {
+          continue;
+        }
+        adaptive.plan = {std::min(rows * draft_width, graph_rows - rows),
+                         graph_rows};
+        bind_adaptive_dspark_views(slot);
+        auto& target = *slot.validate_input;
+        status = SlotBuffer::prepare_dspark_validate(
+            target,
+            rows + adaptive.plan.draft_budget,
+            graph_rows,
+            static_cast<uint32_t>(target.model_device_.block_tables.size(1)),
+            static_cast<int32_t>(kv_bound),
+            batch.batch_id,
+            prepare_stream_);
+        CHECK(status.ok()) << status.message();
+        auto& parallel = target.model_params().parallel;
+        parallel.raw_dp_global_token_nums = {
+            static_cast<int32_t>(rows + adaptive.plan.draft_budget)};
+        parallel.dp_global_token_nums = {static_cast<int32_t>(graph_rows)};
+        parallel.dp_is_decode = {1};
+        bind_adaptive_dspark_graph_input(slot, /*suppress_kv_writes=*/true);
+        executor_.prepare_attention_metadata(kv_caches_, target.model_params());
+        CHECK_EQ(prepare_stream_.synchronize(), 0);
+        SlotBuffer::patch_mtp_decode(draft, dummy_state);
+        slot.context_slots.fill_(-1);
+        const AdaptiveDSparkGraphTask task{target,
+                                           draft,
+                                           slot.target_prefill->device_result(),
+                                           slot.context_slots};
+        executor_.warmup_adaptive_unified_graph(
+            draft_->executor, task, capacity_.sampling_group);
+        // Replay returns the composite stream's dependency to task_stream_.
+        // Finish its borrowed inputs before rewriting the next control/Slot.
+        executor_.run_adaptive_unified_graph(
+            draft_->executor, task, capacity_.sampling_group);
+        CHECK_EQ(task_stream_.synchronize(), 0);
+        adaptive.unified_graph_bindings.insert(key);
+        ++new_variants;
+      }
+      // Repeated scheduler warmup may find every G already captured. Its
+      // dummy writes still precede the next raw-B Prepare stream uploads.
+      CHECK_EQ(task_stream_.synchronize(), 0);
+    }
+    slot.rows = original_rows;
+    adaptive.plan = original_plan;
+    invocation.padded_batch_size = original_draft_rows;
+    bind_adaptive_dspark_views(slot);
+  }
+  LOG(INFO) << "Adaptive DSpark unified graph startup: new_variants="
+            << new_variants << ", slots=" << slots_.size()
+            << ", max_batch=" << host.q_seq_lens.size() << ", maximum_variants="
+            << static_cast<uint64_t>(slots_.size()) * host.q_seq_lens.size() *
+                   4;
   return Status();
 }
 
@@ -1768,8 +2056,10 @@ Status TaskExecutionPipeline::prepare_speculative(
                                    input.sampling_params.logprobs);
   CHECK(status.ok()) << status.message();
   slot.is_warmup = input.input_params.meta.is_graph_warmup;
-  slot.unified_graph =
-      supports_unified_block_graph(*speculative_capacity_, slot.rows, input);
+  slot.unified_graph = slot.adaptive
+                           ? speculative_capacity_->unified_graph
+                           : supports_unified_block_graph(
+                                 *speculative_capacity_, slot.rows, input);
   if (speculative_capacity_->common.dp_size > 1) {
     VLOG(1)
         << "MTP DP task batch=" << batch.batch_id
@@ -2423,6 +2713,29 @@ void TaskExecutionPipeline::generate_adaptive_dspark_proposals(
 
 void TaskExecutionPipeline::launch_adaptive_dspark(SpeculativeSlot& slot) {
 #if defined(USE_NPU)
+  if (slot.unified_graph) {
+    auto& draft = *slot.drafts.front()->input;
+    SlotBuffer::patch_mtp_decode(draft, *slot.state);
+    const AdaptiveDSparkGraphTask task{*slot.validate_input,
+                                       draft,
+                                       slot.target_prefill->device_result(),
+                                       slot.context_slots};
+    slot.target_output.aux_hidden_states = executor_.run_adaptive_unified_graph(
+        draft_->executor, task, capacity_.sampling_group);
+    CHECK(slot.target_output.aux_hidden_states.defined());
+    CHECK_EQ(slot.target_output.aux_hidden_states.size(0),
+             slot.adaptive->plan.graph_rows);
+    CHECK_EQ(slot.target_output.aux_hidden_states.size(1),
+             context_hidden_size());
+    const auto& result = slot.target_prefill->device_result();
+    // The composite graph has already committed ragged results and written
+    // accepted context in physical G order. Only request state remains here.
+    context_advance(
+        *slot.state, result.tokens, result.lengths, torch::Tensor());
+    context_publish(*slot.state);
+    COUNTER_INC(speculative_unified_graph_executions_total);
+    return;
+  }
   launch_block_draft(slot);
   auto& adaptive = *slot.adaptive;
   auto& validate = *slot.validate_input;

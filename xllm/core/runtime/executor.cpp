@@ -47,6 +47,26 @@ bool Executor::supports_prepared_attention_metadata() const {
   return impl_->supports_prepared_attention_metadata();
 }
 
+bool Executor::supports_adaptive_unified_graph() const {
+  return impl_->supports_adaptive_unified_graph();
+}
+
+void Executor::warmup_adaptive_unified_graph(
+    Executor& draft_executor,
+    const AdaptiveDSparkGraphTask& task,
+    ProcessGroup* sampling_group) {
+  impl_->warmup_adaptive_unified_graph(
+      *draft_executor.impl_, task, sampling_group);
+}
+
+torch::Tensor Executor::run_adaptive_unified_graph(
+    Executor& draft_executor,
+    const AdaptiveDSparkGraphTask& task,
+    ProcessGroup* sampling_group) {
+  return impl_->run_adaptive_unified_graph(
+      *draft_executor.impl_, task, sampling_group);
+}
+
 void Executor::prepare_attention_metadata(std::vector<KVCache>& kv_caches,
                                           ModelParamsView& params) {
   impl_->prepare_attention_metadata(kv_caches, params);

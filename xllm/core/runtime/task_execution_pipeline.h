@@ -21,6 +21,7 @@ limitations under the License.
 #include <functional>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
@@ -37,6 +38,7 @@ namespace xllm {
 class ProcessGroup;
 class DSparkAdaptiveCostCache;
 struct DSparkCalibrationCommand;
+struct DSparkCalibrationGraphCoverage;
 
 // The owner establishes these model contracts before admission. Persistent
 // storage is allocated before KV budgeting; KV may be populated afterwards.
@@ -324,6 +326,9 @@ class TaskExecutionPipeline final {
   Status plan_adaptive_dspark(SpeculativeSlot& slot,
                               const LlmForwardInput& input);
   Status warmup_adaptive_dspark_graphs(const LlmForwardInput& input);
+  Status warmup_adaptive_unified_graphs(const LlmForwardInput& input);
+  std::vector<DSparkCalibrationGraphCoverage> adaptive_dspark_graph_coverage()
+      const;
   void bind_adaptive_dspark_views(SpeculativeSlot& slot);
   void bind_adaptive_dspark_graph_input(SpeculativeSlot& slot,
                                         bool suppress_kv_writes);

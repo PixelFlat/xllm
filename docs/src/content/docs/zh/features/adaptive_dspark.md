@@ -26,8 +26,12 @@ limitations under the License.
 
 当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
 head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy draft、DP=1/CP=1、
-ACL graph、异步调度和 task pipeline。必须启用 graph warmup；这条路径暂不支持
-自适应 unified graph。固定步数 DSpark 和其他算法的执行限制保持各自原有约定。
+ACL graph、异步调度和 task pipeline。必须启用 graph warmup；添加
+`--enable_unified_mtp_graph=true` 可捕获完整自适应轮次，包括 greedy heads、
+confidence 共识、打包、验证及已接受 context 更新。unified graph 当前仅支持
+`temperature=0`；正温度或混合温度请求必须使用普通 graph，若开启 unified graph
+则会在执行前拒绝，不会静默改成 greedy。固定步数 DSpark 和其他算法的执行限制
+保持各自原有约定。
 
 ## 启动示例
 
@@ -135,6 +139,13 @@ Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回�
 二维网格必须通过共同的 G 值连通；request 桶和可选的 `target_graph_rows` 必须
 已经捕获，并保留完整宽度覆盖。上下文区间不能重叠，且必须满足模型、KV 容量和
 最坏采样进度的限制。
+
+Unified 启动为每个实际请求数 `B` 捕获最多四个 target 桶：分别取覆盖 `B`、
+`2B`、`4B` 和 `B * (draft_width + 1)` 的首个 prepared 桶。例如 Draft5 的
+`B=8` 对应 `G=8,16,32,48`。标定仅使用两个流水 Slot 都已捕获的完整 `B/G`
+绑定；显式指定未支持的桶会在采样前失败。过渡请求集合使用其已预热的完整宽度
+绑定推进，不计为稳定样本。服务阶段不会补捕获缺失绑定。Split 和 unified 的
+成本分别标定，加载已保存的 bundle 时会校验 unified 设置。
 
 不管使用默认值还是传入文件，启动日志都会输出
 `DSpark adaptive effective configuration`，包含来源、补齐默认项后的生效配置

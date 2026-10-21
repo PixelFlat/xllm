@@ -230,6 +230,71 @@ TEST(DSparkStartupCalibrationTest, PlansKvCoverageBeforeFirstCapture) {
   EXPECT_FALSE(dspark_calibration_warmup_length(4096, 32768, 128, 0));
 }
 
+TEST(DSparkStartupCalibrationTest, PlansOnlyCapturedWholeRoundBindings) {
+  auto config = *parse_dspark_startup_calibration(configuration().dump());
+  config.request_buckets = {1, 8};
+  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+  const std::array<uint32_t, 2> requests{1, 8};
+  const std::array<uint32_t, 8> graphs{1, 2, 4, 8, 16, 32, 48, 64};
+  const std::vector<DSparkCalibrationGraphCoverage> coverage{
+      {1, {1, 2, 4, 8}}, {8, {8, 16, 32, 64}}};
+  const auto split = plan_dspark_calibration(config, requests, graphs);
+  const auto unified =
+      plan_dspark_calibration(config, requests, graphs, coverage);
+  ASSERT_TRUE(split);
+  ASSERT_TRUE(unified);
+  EXPECT_EQ(split->size(), 9U);
+  EXPECT_EQ(unified->size(), 8U);
+  EXPECT_TRUE(
+      std::none_of(unified->begin(), unified->end(), [](const auto& point) {
+        return point.target_graph_rows == 48;
+      }));
+  EXPECT_EQ(unified->back().target_graph_rows, 64U);
+}
+
+TEST(DSparkStartupCalibrationTest, RejectsExplicitUncapturedWholeRoundPoint) {
+  auto config = *parse_dspark_startup_calibration(configuration().dump());
+  config.request_buckets = {8};
+  config.target_graph_rows = {8, 16, 32, 48, 64};
+  const std::array<uint32_t, 1> requests{8};
+  const std::array<uint32_t, 5> graphs{8, 16, 32, 48, 64};
+  const std::vector<DSparkCalibrationGraphCoverage> coverage{
+      {8, {8, 16, 32, 64}}};
+  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
+  config.target_graph_rows = {8, 32, 64};
+  EXPECT_TRUE(plan_dspark_calibration(config, requests, graphs, coverage));
+}
+
+TEST(DSparkStartupCalibrationTest, RejectsIncompleteWholeRoundCoverage) {
+  auto config = *parse_dspark_startup_calibration(configuration().dump());
+  config.request_buckets = {1, 8};
+  const std::array<uint32_t, 2> requests{1, 8};
+  const std::array<uint32_t, 8> graphs{1, 2, 4, 8, 16, 32, 48, 64};
+  const std::vector<std::vector<DSparkCalibrationGraphCoverage>> invalid{
+      {{1, {1, 2, 4, 8}}},
+      {{1, {1, 2, 4, 8}}, {8, {8, 16, 32, 48}}},
+      {{1, {1, 2, 4, 8}}, {8, {8, 16, 16, 64}}},
+      {{1, {1, 2, 4, 8}}, {8, {8, 16, 40, 64}}},
+      {{8, {8, 16, 32, 64}}, {1, {1, 2, 4, 8}}},
+      {{1, {1, 2, 4, 8}}, {2, {2, 4, 8, 16}}, {8, {8, 16, 32, 64}}}};
+  for (const auto& coverage : invalid) {
+    EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
+  }
+}
+
+TEST(DSparkStartupCalibrationTest, ChecksConnectivityAfterWholeRoundFiltering) {
+  auto config = *parse_dspark_startup_calibration(configuration().dump());
+  config.request_buckets = {1, 8};
+  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+  const std::array<uint32_t, 2> requests{1, 8};
+  const std::array<uint32_t, 7> graphs{1, 2, 4, 8, 16, 32, 64};
+  const std::vector<DSparkCalibrationGraphCoverage> coverage{{1, {1, 2, 4, 8}},
+                                                             {8, {16, 32, 64}}};
+  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
+  config.model = DSparkSpsCostModel::Kind::SPS;
+  EXPECT_TRUE(plan_dspark_calibration(config, requests, graphs, coverage));
+}
+
 TEST(DSparkStartupCalibrationTest, RejectsUncapturedAndMissingFullWidthPoints) {
   auto config = *parse_dspark_startup_calibration(configuration().dump());
   const std::array<uint32_t, 2> requests{1, 4};

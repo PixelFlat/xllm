@@ -473,7 +473,7 @@ def test_block_invalid_inputs_raise_before_capacity_check(
         metadata.is_spec_verify = True
     else:
         positions = positions[:2]
-    message = "fixed-width request" if invalid == "layout" else "non-causal chunked-prefill"
+    message = "equal positive query widths" if invalid == "layout" else "non-causal chunked-prefill"
     with pytest.raises(ValueError, match=message):
         runner.execute_block(tokens, positions, metadata)
     runner.attention_backend.prepare_graph_replay.assert_not_called()

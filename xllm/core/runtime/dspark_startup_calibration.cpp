@@ -67,6 +67,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
   for (const int64_t rows : captured_graph_batch_sizes_) {
     graphs.emplace_back(static_cast<uint32_t>(rows));
   }
+  const auto graph_coverage = adaptive_dspark_graph_coverage();
   const auto kv_bound = [&](uint32_t batch) {
     uint64_t bound =
         std::min(capacity_.max_kv_seq_len, capacity_.max_positions);
@@ -93,9 +94,16 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
         bounds.emplace_back(nlohmann::json{{"requests", batch},
                                            {"max_kv_length", kv_bound(batch)}});
       }
+      nlohmann::json coverage = nlohmann::json::array();
+      for (const auto& entry : graph_coverage) {
+        coverage.emplace_back(
+            nlohmann::json{{"requests", entry.requests},
+                           {"target_graph_rows", entry.target_graph_rows}});
+      }
       return nlohmann::json{{"request_buckets", requests},
                             {"draft_width", draft_width},
                             {"target_graph_rows", graphs},
+                            {"graph_coverage", std::move(coverage)},
                             {"kv_bounds", std::move(bounds)},
                             {"slot_count", capacity_.slot_count}}
           .dump();
@@ -114,7 +122,8 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
       if (!config) {
         return std::nullopt;
       }
-      const auto points = plan_dspark_calibration(*config, requests, graphs);
+      const auto points =
+          plan_dspark_calibration(*config, requests, graphs, graph_coverage);
       const uint64_t index = data["point"].get<uint64_t>();
       if (!points || index >= points->size()) {
         return std::nullopt;

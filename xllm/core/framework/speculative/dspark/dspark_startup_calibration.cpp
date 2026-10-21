@@ -283,13 +283,32 @@ std::optional<uint32_t> dspark_calibration_warmup_length(
 std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
     const DSparkStartupCalibrationConfig& config,
     std::span<const uint32_t> captured_requests,
-    std::span<const uint32_t> captured_target_rows) {
+    std::span<const uint32_t> captured_target_rows,
+    std::span<const DSparkCalibrationGraphCoverage> graph_coverage) {
   if ((config.draft_width != 5 && config.draft_width != 7) ||
       !sorted_axis(captured_requests) || !sorted_axis(captured_target_rows) ||
       !sorted_axis(config.request_buckets) || config.contexts.empty() ||
       (!config.target_graph_rows.empty() &&
        !sorted_axis(config.target_graph_rows))) {
     return std::nullopt;
+  }
+  uint32_t previous_request = 0;
+  for (const auto& coverage : graph_coverage) {
+    if (coverage.requests <= previous_request ||
+        !std::binary_search(captured_requests.begin(),
+                            captured_requests.end(),
+                            coverage.requests) ||
+        !sorted_axis(coverage.target_graph_rows)) {
+      return std::nullopt;
+    }
+    previous_request = coverage.requests;
+    for (const uint32_t rows : coverage.target_graph_rows) {
+      if (rows < coverage.requests ||
+          !std::binary_search(
+              captured_target_rows.begin(), captured_target_rows.end(), rows)) {
+        return std::nullopt;
+      }
+    }
   }
   std::vector<DSparkCalibrationPoint> points;
   for (const auto& context : config.contexts) {
@@ -303,17 +322,26 @@ std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
           full == captured_target_rows.end()) {
         return std::nullopt;
       }
+      std::span<const uint32_t> available = captured_target_rows;
+      if (!graph_coverage.empty()) {
+        const auto found = std::find_if(
+            graph_coverage.begin(),
+            graph_coverage.end(),
+            [&](const auto& entry) { return entry.requests == requests; });
+        if (found == graph_coverage.end()) {
+          return std::nullopt;
+        }
+        available = found->target_graph_rows;
+      }
       const auto& selected = config.target_graph_rows;
       const std::span<const uint32_t> candidates =
-          selected.empty() ? captured_target_rows : std::span(selected);
+          selected.empty() ? available : std::span(selected);
       bool has_full = false;
       for (const uint32_t rows : candidates) {
         if (rows < requests || rows > *full) {
           continue;
         }
-        if (!std::binary_search(captured_target_rows.begin(),
-                                captured_target_rows.end(),
-                                rows)) {
+        if (!std::binary_search(available.begin(), available.end(), rows)) {
           return std::nullopt;
         }
         points.emplace_back(DSparkCalibrationPoint{requests, rows, context});

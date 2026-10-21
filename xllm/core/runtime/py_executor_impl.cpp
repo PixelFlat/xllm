@@ -235,6 +235,11 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
+  if (adaptive_unified_registry_ && Py_IsInitialized()) {
+    py::gil_scoped_acquire gil;
+    adaptive_unified_registry_.attr("close")();
+  }
+  clear_python_object(adaptive_unified_registry_);
   if (block_graph_registry_ && Py_IsInitialized()) {
     py::gil_scoped_acquire gil;
     block_graph_registry_.attr("close")();
@@ -244,6 +249,109 @@ PyExecutorImpl::~PyExecutorImpl() {
     PyCausalLM::set_active_instance(nullptr);
   }
   clear_python_object(py_executor_);
+}
+
+bool PyExecutorImpl::supports_adaptive_unified_graph() const {
+#if defined(USE_NPU)
+  return supports_prepared_metadata_ && options_.enable_graph() &&
+         options_.enable_task_pipeline();
+#else
+  return false;
+#endif
+}
+
+void PyExecutorImpl::create_adaptive_unified_registry(
+    PyExecutorImpl& draft_executor,
+    ProcessGroup* sampling_group) {
+#if defined(USE_NPU)
+  CHECK(supports_adaptive_unified_graph());
+  CHECK(draft_executor.supports_adaptive_unified_graph());
+  if (adaptive_unified_registry_) {
+    CHECK_EQ(adaptive_unified_draft_, &draft_executor);
+    CHECK_EQ(adaptive_unified_sampling_group_, sampling_group);
+    return;
+  }
+  auto module = py::module_::import(
+      "xllm.python.model_executor.runners.unified_block_acl_graph");
+  adaptive_unified_registry_ = module.attr("AdaptiveUnifiedBlockGraphRegistry")(
+      py_executor_,
+      draft_executor.py_executor_,
+      py::cpp_function(
+          [this]() { PyCausalLM::set_active_instance(py_causal_lm_); }),
+      py::cpp_function([model = draft_executor.py_causal_lm_]() {
+        PyCausalLM::set_active_instance(model);
+      }),
+      py::cpp_function([sampling_group](torch::Tensor arena) {
+        // Confidence is local to each TP rank even when the token sampler is
+        // greedy. Publish one authoritative compact proposal/confidence arena
+        // inside the graph before allocating any verification prefixes.
+        if (sampling_group != nullptr && sampling_group->world_size() > 1) {
+          sampling_group->broadcast(arena, /*root_rank=*/0);
+        }
+      }),
+      py::cpp_function(
+          [device_index = device_.index()](const py::object& runner) {
+            // Prepare can take the GIL while holding this device lock.
+            py::gil_scoped_release release;
+            auto& capture_lock =
+                npu::DeviceCaptureLock::get_instance().get_lock(device_index);
+            std::lock_guard<std::mutex> lock(capture_lock);
+            py::gil_scoped_acquire acquire;
+            runner.attr("capture")();
+          }));
+  adaptive_unified_draft_ = &draft_executor;
+  adaptive_unified_sampling_group_ = sampling_group;
+#else
+  LOG(FATAL) << "Adaptive unified DSpark graphs require NPU.";
+#endif
+}
+
+void PyExecutorImpl::warmup_adaptive_unified_graph(
+    ExecutorImpl& draft_executor,
+    const AdaptiveDSparkGraphTask& task,
+    ProcessGroup* sampling_group) {
+  auto* draft = dynamic_cast<PyExecutorImpl*>(&draft_executor);
+  CHECK(draft != nullptr);
+  py::gil_scoped_acquire gil;
+  create_adaptive_unified_registry(*draft, sampling_group);
+  const auto binding = [](SlotBuffer& input) {
+    return py::make_tuple(
+        input.tokens(),
+        input.positions(),
+        input.model_params().python_attention_metadata->value());
+  };
+  adaptive_unified_registry_.attr("warmup")(
+      binding(task.target),
+      binding(task.draft),
+      task.result.tokens,
+      task.result.lengths,
+      dspark_adaptive_graph_input(task.target.model_params()),
+      task.context_slots);
+}
+
+torch::Tensor PyExecutorImpl::run_adaptive_unified_graph(
+    ExecutorImpl& draft_executor,
+    const AdaptiveDSparkGraphTask& task,
+    ProcessGroup* sampling_group) {
+  CHECK(adaptive_unified_registry_)
+      << "Adaptive unified graphs must be captured during startup warmup.";
+  CHECK_EQ(adaptive_unified_draft_, &draft_executor);
+  CHECK_EQ(adaptive_unified_sampling_group_, sampling_group);
+  py::gil_scoped_acquire gil;
+  const auto binding = [](SlotBuffer& input) {
+    return py::make_tuple(
+        input.tokens(),
+        input.positions(),
+        input.model_params().python_attention_metadata->value());
+  };
+  return adaptive_unified_registry_
+      .attr("execute")(binding(task.target),
+                       binding(task.draft),
+                       task.result.tokens,
+                       task.result.lengths,
+                       dspark_adaptive_graph_input(task.target.model_params()),
+                       task.context_slots)
+      .cast<torch::Tensor>();
 }
 
 py::object PyExecutorImpl::mtp_sparse_attention_metadata_view(

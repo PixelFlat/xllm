@@ -28,8 +28,13 @@ select a verification budget. Parameter types and defaults are listed in the
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
 draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy draft sampling,
 DP=1/CP=1, ACL graphs, schedule overlap and task pipeline. Graph warmup must be
-enabled. This path does not enable adaptive unified graphs. Fixed-width DSpark
-and other algorithms retain their own execution contracts.
+enabled. Add `--enable_unified_mtp_graph=true` to capture each complete adaptive
+round, including the greedy heads, confidence consensus, packing, verification
+and accepted-context update. Unified graphs currently require `temperature=0`;
+positive or mixed temperatures must use ordinary graphs. Such requests are
+rejected before execution when unified graphs are enabled, never silently
+decoded greedily. Fixed-width DSpark and other algorithms retain their own
+execution contracts.
 
 ## Launch example
 
@@ -154,6 +159,15 @@ or commit time again. The additive probe grid must be connected through shared
 G values. Request buckets and any optional `target_graph_rows` must be captured;
 the grid must retain full-width coverage. Context intervals must not overlap and
 must fit the model, cache and worst-case sampling progress.
+
+Unified startup captures at most four target tiers per actual request count
+`B`: the first prepared buckets covering `B`, `2B`, `4B` and
+`B * (draft_width + 1)`. For example, Draft5 at `B=8` uses `G=8,16,32,48`.
+Calibration uses only complete `B/G` bindings captured for both pipeline slots;
+an explicit unsupported tier fails before sampling. Transient request sets use
+their prewarmed full-width binding and do not count as stable samples. Serving
+never captures a missing binding. Split and unified costs are distinct, and
+saved bundles validate the unified setting before installation.
 
 Both default and file-based startup log `DSpark adaptive effective configuration`
 with the source, all effective settings (including omitted defaults) and actual

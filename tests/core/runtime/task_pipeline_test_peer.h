@@ -45,6 +45,17 @@ struct TaskPipelineTestPeer {
       [](const TaskExecutionPipeline& pipeline) -> const auto& {
     return *pipeline.speculative_capacity_->adaptive_costs;
   };
+  static constexpr auto erase_adaptive_unified_binding =
+      [](TaskExecutionPipeline& pipeline, uint32_t rows, uint32_t graph_rows) {
+        const uint64_t key = (static_cast<uint64_t>(rows) << 32) | graph_rows;
+        uint32_t erased = 0;
+        for (auto& task_slot : pipeline.slots_) {
+          erased += static_cast<uint32_t>(
+              task_slot->speculative->adaptive->unified_graph_bindings.erase(
+                  key));
+        }
+        return erased;
+      };
   static constexpr auto plan_mtp_decode = SlotBuffer::plan_mtp_decode;
   static constexpr auto prepare_mtp_decode = SlotBuffer::prepare_mtp_decode;
   static constexpr auto prepare_planned_mtp_decode =

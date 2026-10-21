@@ -156,6 +156,112 @@ TEST(DSparkBudgetPlannerTest, CalibrationSupportsAnchorOnlyVerification) {
   EXPECT_EQ(plan->draft_budget, 0U);
 }
 
+TEST(DSparkBudgetPlannerTest, CalibrationUsesWholeRoundBindingForPartialBatch) {
+  const std::array<DSparkGraphCost, 4> actual = {
+      DSparkGraphCost{8, 0.0}, {16, 0.0}, {32, 0.0}, {48, 0.0}};
+  const auto transient = DSparkBudgetPlanner::calibration_plan(
+      /*logical_requests=*/5,
+      /*physical_requests=*/8,
+      /*requested_graph_rows=*/64,
+      kCalibrationGraphs,
+      /*draft_width=*/7,
+      actual);
+  ASSERT_TRUE(transient);
+  EXPECT_EQ(transient->graph_rows, 48U);
+  EXPECT_EQ(transient->draft_budget, 35U);
+  const auto available = DSparkBudgetPlanner::calibration_plan(
+      /*logical_requests=*/5,
+      /*physical_requests=*/8,
+      /*requested_graph_rows=*/16,
+      kCalibrationGraphs,
+      /*draft_width=*/7,
+      actual);
+  ASSERT_TRUE(available);
+  EXPECT_EQ(available->graph_rows, 16U);
+  EXPECT_EQ(available->draft_budget, 11U);
+}
+
+TEST(DSparkBudgetPlannerTest, CalibrationRejectsStableMissingWholeRoundTier) {
+  const std::array<DSparkGraphCost, 4> actual = {
+      DSparkGraphCost{8, 0.0}, {16, 0.0}, {32, 0.0}, {64, 0.0}};
+  EXPECT_FALSE(
+      DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/8,
+                                            /*physical_requests=*/8,
+                                            /*requested_graph_rows=*/48,
+                                            kCalibrationGraphs,
+                                            /*draft_width=*/7,
+                                            actual));
+  EXPECT_FALSE(
+      DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/5,
+                                            /*physical_requests=*/8,
+                                            /*requested_graph_rows=*/64,
+                                            kCalibrationGraphs,
+                                            /*draft_width=*/7,
+                                            std::span(actual).first(3)));
+  const std::array<DSparkGraphCost, 2> unknown = {DSparkGraphCost{8, 0.0},
+                                                  {40, 0.0}};
+  EXPECT_FALSE(
+      DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/5,
+                                            /*physical_requests=*/8,
+                                            /*requested_graph_rows=*/64,
+                                            kCalibrationGraphs,
+                                            /*draft_width=*/7,
+                                            unknown));
+}
+
+TEST(DSparkBudgetPlannerTest, CalibrationUsesDraftFiveWholeRoundCoverage) {
+  const std::array<DSparkGraphCost, 4> actual = {
+      DSparkGraphCost{8, 0.0}, {16, 0.0}, {32, 0.0}, {48, 0.0}};
+  const auto plan = DSparkBudgetPlanner::calibration_plan(
+      /*logical_requests=*/8,
+      /*physical_requests=*/8,
+      /*requested_graph_rows=*/48,
+      kCalibrationGraphs,
+      /*draft_width=*/5,
+      actual);
+  ASSERT_TRUE(plan);
+  EXPECT_EQ(plan->graph_rows, 48U);
+  EXPECT_EQ(plan->draft_budget, 40U);
+  const auto transient = DSparkBudgetPlanner::calibration_plan(
+      /*logical_requests=*/5,
+      /*physical_requests=*/8,
+      /*requested_graph_rows=*/48,
+      kCalibrationGraphs,
+      /*draft_width=*/5,
+      std::span(actual).first(3),
+      /*calibration_requests=*/8);
+  ASSERT_TRUE(transient);
+  EXPECT_EQ(transient->graph_rows, 32U);
+  EXPECT_EQ(transient->draft_budget, 25U);
+}
+
+TEST(DSparkBudgetPlannerTest,
+     CalibrationRecognizesDifferentWholeRoundRequestSet) {
+  const std::array<DSparkGraphCost, 4> actual = {
+      DSparkGraphCost{8, 0.0}, {16, 0.0}, {32, 0.0}, {64, 0.0}};
+  // A sample for B=10 can use G=48. An interim B=Bcap=8 cannot replay
+  // that whole graph, but can advance at its prewarmed full-width G=64.
+  const auto transient = DSparkBudgetPlanner::calibration_plan(
+      /*logical_requests=*/8,
+      /*physical_requests=*/8,
+      /*requested_graph_rows=*/48,
+      kCalibrationGraphs,
+      /*draft_width=*/7,
+      actual,
+      /*calibration_requests=*/10);
+  ASSERT_TRUE(transient);
+  EXPECT_EQ(transient->graph_rows, 64U);
+  EXPECT_EQ(transient->draft_budget, 56U);
+  EXPECT_FALSE(
+      DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/8,
+                                            /*physical_requests=*/8,
+                                            /*requested_graph_rows=*/48,
+                                            kCalibrationGraphs,
+                                            /*draft_width=*/7,
+                                            actual,
+                                            /*calibration_requests=*/8));
+}
+
 TEST(DSparkBudgetPlannerTest,
      CalibrationRejectsUnknownTierOrInsufficientCapacity) {
   EXPECT_FALSE(DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/1,
