@@ -48,6 +48,7 @@ from xllm.python.model_executor.executor import (  # noqa: E402
 )
 from xllm.python.model_executor.forward_context import (  # noqa: E402
     ForwardContext,
+    KVLoadContext,
     forward_context,
     get_forward_context,
     record_layer_event,
@@ -2182,6 +2183,60 @@ def test_kv_transfer_uses_eager_and_preserves_step_inputs(prepared: bool, is_mtp
     executor.decode_graph_runner.can_execute.assert_not_called()
     for runner in (executor.decode_graph_runner, executor.prepared_graph_runner, executor.inductor_runner):
         runner.execute.assert_not_called()
+
+
+def test_layerwise_load_prefill_keeps_following_prepared_decode_on_graph() -> None:
+    model = _FakeModel()
+    model.model.supports_layerwise_kv_load = True
+    model.model.layers = nn.ModuleList([nn.Identity(), nn.Identity()])
+    backend = _PreparedStubAttentionBackend()
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(model, {"model_type": "glm_moe_dsa"}, max_seqs_per_batch=2)
+    cache = torch.empty(2, 4, 1, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = SimpleNamespace(
+        q_cu_seq_lens_host_values=[1, 2], is_prefill=True, is_chunked_prefill=False, is_spec_verify=False
+    )
+    executor.prepare_metadata(metadata)
+    executor.eager_runner = MagicMock()
+    executor.prepared_graph_runner = MagicMock()
+    tokens = torch.tensor([1, 2], dtype=torch.int32)
+    positions = torch.tensor([9, 11], dtype=torch.int32)
+    load = MagicMock()
+    load.size.return_value = 2
+    executor.execute(tokens, positions, metadata, kv_load_synchronizer=load, kv_load_layers_per_event=1)
+    context = executor.eager_runner.execute.call_args.kwargs["kv_load"]
+    assert isinstance(context, KVLoadContext)
+    assert context.synchronizer is load
+    executor.prepared_graph_runner.execute.assert_not_called()
+    metadata.is_prefill = False
+    output = executor.execute(tokens, positions, metadata, enable_graph=True)
+    assert output is executor.prepared_graph_runner.execute.return_value
+    executor.prepared_graph_runner.execute.assert_called_once()
+    assert executor.eager_runner.execute.call_count == 1
+
+
+@pytest.mark.parametrize("invalid", ["decode", "graph", "verify", "unsupported"])
+def test_layerwise_load_rejects_incompatible_execution_before_running(invalid: str) -> None:
+    model = _FakeModel()
+    model.model.supports_layerwise_kv_load = invalid != "unsupported"
+    model.model.layers = nn.ModuleList([nn.Identity(), nn.Identity()])
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()):
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=2)
+    executor._kv_bound = True
+    executor.eager_runner = MagicMock()
+    metadata = SimpleNamespace(
+        is_prefill=invalid != "decode", is_chunked_prefill=False, is_spec_verify=invalid == "verify"
+    )
+    with pytest.raises(ValueError, match="supported eager prefill"):
+        executor.execute(
+            torch.tensor([1]),
+            torch.tensor([3]),
+            metadata,
+            enable_graph=invalid == "graph",
+            kv_load_synchronizer=MagicMock(),
+        )
+    executor.eager_runner.execute.assert_not_called()
 
 
 @pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])

@@ -122,6 +122,11 @@ UnifiedMtpExecutionResult UnifiedMtpExecutor::execute(
   CHECK(compute_stream_.wait_event(
       current_draft_input.runtime.metadata_ready_event))
       << "failed to wait Unified MTP input producer";
+  if (input.input_params.parallel.layer_wise_load_synchronizer != nullptr) {
+    CHECK(input.input_params.parallel.layer_wise_load_synchronizer
+              ->wait_all_on_current_stream())
+        << "Unified MTP Host KV reload failed.";
+  }
 
   torch::Tensor draft_rows =
       current_draft_input.token_ids.view({batch_size, 2});

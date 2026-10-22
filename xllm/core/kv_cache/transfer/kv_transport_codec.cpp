@@ -29,6 +29,11 @@ bool valid_block_type(int32_t value) { return proto::BlockType_IsValid(value); }
 
 bool valid_block_id(int32_t value) { return value >= 0; }
 
+bool valid_prefetch_source_id(int32_t value) {
+  // Store GET addresses its source by hash; -1 denotes no local source block.
+  return value == -1 || valid_block_id(value);
+}
+
 }  // namespace
 
 bool proto_to_block_transfer_info(
@@ -124,7 +129,7 @@ bool StoragePrefetchRequest::to_proto(
   encoded_request.mutable_transfer_infos()->Reserve(transfer_infos.size());
   for (const BlockTransferInfo& info : transfer_infos) {
     if (!valid_transfer_type(static_cast<int32_t>(info.transfer_type)) ||
-        !valid_block_id(info.src_block_id) ||
+        !valid_prefetch_source_id(info.src_block_id) ||
         !valid_block_id(info.dst_block_id) ||
         !valid_block_type(static_cast<int32_t>(info.block_type))) {
       return false;
@@ -150,7 +155,7 @@ bool StoragePrefetchRequest::from_proto(
   decoded_request.transfer_infos.reserve(proto_request.transfer_infos_size());
   for (const proto::BlockTransferInfo& proto_info :
        proto_request.transfer_infos()) {
-    if (!valid_block_id(proto_info.src_block_id()) ||
+    if (!valid_prefetch_source_id(proto_info.src_block_id()) ||
         !valid_block_id(proto_info.dst_block_id()) ||
         proto_info.hash_key().size() != XXH3_128BITS_HASH_VALUE_LEN ||
         !valid_block_type(proto_info.block_type())) {

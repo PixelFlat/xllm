@@ -54,6 +54,49 @@ class LayerSynchronizer(Protocol):
         ...
 
 
+class KVLoadSynchronizer(Protocol):
+    """Orders the current compute stream after a Host KV copy group."""
+
+    def wait_group(self, group_id: int) -> bool: ...
+
+    def size(self) -> int: ...
+
+
+@dataclass(slots=True)
+class KVLoadContext:
+    """Per-forward load dependencies; never retained by a captured graph."""
+
+    synchronizer: KVLoadSynchronizer
+    layers_per_event: int
+    num_layers: int
+    _next_group: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        if self.layers_per_event <= 0 or self.num_layers <= 0:
+            raise ValueError("Host KV load requires positive layer and group sizes")
+        groups = (self.num_layers + self.layers_per_event - 1) // self.layers_per_event
+        # The composite native handle may include one final draft-cache event.
+        if self.synchronizer.size() not in (groups, groups + 1):
+            raise ValueError("Host KV load event count does not match the model layers")
+
+    def wait_layer(self, layer_id: int) -> None:
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError(f"Host KV load layer index is out of range: {layer_id}")
+        if layer_id % self.layers_per_event:
+            return
+        group_id = layer_id // self.layers_per_event
+        if group_id != self._next_group:
+            raise RuntimeError("Host KV load groups must be consumed once in layer order")
+        if not self.synchronizer.wait_group(group_id):
+            raise RuntimeError(f"Host KV reload failed for layer group {group_id}")
+        self._next_group += 1
+
+    def check_consumed(self) -> None:
+        groups = (self.num_layers + self.layers_per_event - 1) // self.layers_per_event
+        if self._next_group != groups:
+            raise RuntimeError("Python model did not consume every Host KV load group")
+
+
 @dataclass(frozen=True, slots=True)
 class AclGraphTask:
     event: object
@@ -107,6 +150,7 @@ class ForwardContext:
     # layers. A new ForwardContext gets a new cache, so entries never leak
     # across requests or graph executions.
     layer_shared_cache: dict[object, object] = field(default_factory=dict)
+    kv_load: KVLoadContext | None = None
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)
@@ -153,6 +197,14 @@ def record_layer_event(layer_id: int) -> None:
     if ctx is not None and ctx.layer_synchronizer is not None:
         if not ctx.layer_synchronizer.record_event(layer_id):
             raise RuntimeError(f"failed to record layer completion event for layer {layer_id}")
+
+
+def wait_for_kv_layer(layer_id: int) -> None:
+    ctx = _current_context.get()
+    if ctx is not None and ctx.kv_load is not None:
+        if ctx.acl_graph is not None or ctx.execution_state is not None:
+            raise RuntimeError("Per-batch Host KV load dependencies cannot be captured in a graph")
+        ctx.kv_load.wait_layer(layer_id)
 
 
 def get_execution_buffer(

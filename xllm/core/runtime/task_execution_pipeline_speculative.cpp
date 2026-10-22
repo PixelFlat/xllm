@@ -377,7 +377,9 @@ Status TaskExecutionPipeline::create(
                                 target.executor,
                                 target.kv_caches,
                                 common,
-                                std::move(target.push_kv)));
+                                std::move(target.push_kv),
+                                std::move(target.load_kv),
+                                std::move(target.fence_kv)));
   program->speculative_capacity_ =
       std::make_unique<SpeculativeTaskCapacity>(capacity);
   program->draft_ = std::make_unique<TaskModel>(std::move(draft));

@@ -19,10 +19,14 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <gtest/gtest.h>
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -375,6 +379,84 @@ TEST(ForwardInputBuilderTest, FirstChunkUsesRemotePrefix) {
 
   expect_mapping(info, BlockType::KV, block_ids(blocks), {100, 101});
   EXPECT_EQ(sequence.kv_state().next_transfer_block_idx(), 2u);
+}
+
+TEST(BatchHostRestoreTest, CancelledSequenceKeepsCopyBlocksUntilBatchRetires) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(16).enable_prefix_cache(false);
+  BlockManagerImpl device_manager(options);
+  BlockManagerImpl host_manager(options);
+  const size_t initial_free = device_manager.num_free_blocks();
+  Sequence sequence = make_basic_sequence(std::vector<int32_t>(17, 1));
+  sequence.kv_state().replace_composite_blocks(BlockType::KV,
+                                               device_manager.allocate(2),
+                                               /*num_shared_blocks=*/0,
+                                               /*cache_publish_cursor=*/0);
+  sequence.host_kv_state().replace_composite_blocks(BlockType::KV,
+                                                    host_manager.allocate(2),
+                                                    /*num_shared_blocks=*/1,
+                                                    /*cache_publish_cursor=*/1);
+  sequence.set_host_cache_match(/*restore_tokens=*/16, /*copy_units=*/1);
+  sequence.retain_host_restore_blocks(
+      {sequence.host_kv_state().blocks(BlockType::KV)[0],
+       sequence.kv_state().blocks(BlockType::KV)[0]});
+  {
+    Batch batch(&sequence);
+    const Slice<Block> device = sequence.kv_state().blocks(BlockType::KV);
+    const Slice<Block> host = sequence.host_kv_state().blocks(BlockType::KV);
+    EXPECT_EQ(device[0].ref_count(), 2U);
+    EXPECT_EQ(host[0].ref_count(), 2U);
+    // New partial blocks and unfilled offload destinations keep their normal
+    // ownership counts, so the hierarchy's offload eligibility is unchanged.
+    EXPECT_EQ(device[1].ref_count(), 1U);
+    EXPECT_EQ(host[1].ref_count(), 1U);
+    device_manager.deallocate(device);
+    host_manager.deallocate(host);
+    sequence.reset();
+    EXPECT_EQ(device_manager.num_free_blocks(), initial_free - 1);
+    EXPECT_EQ(host_manager.num_free_blocks(), initial_free - 1);
+  }
+  EXPECT_EQ(device_manager.num_free_blocks(), initial_free);
+  EXPECT_EQ(host_manager.num_free_blocks(), initial_free);
+}
+
+TEST(KVCacheBlockLeaseTest, BatchRetirementDuringOwnerReleaseClearsUsage) {
+  BlockManager::Options options;
+  options.num_blocks(4).block_size(16).enable_prefix_cache(true);
+  BlockManagerImpl manager(options);
+  const size_t initial_used = manager.num_used_blocks();
+  std::vector<Block> blocks = manager.allocate(1);
+  std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> hash;
+  hash.fill(1);
+  blocks[0].set_hash_value(hash.data());
+  manager.cache(blocks);
+  Sequence sequence = make_basic_sequence(std::vector<int32_t>(17, 1));
+  sequence.kv_state().replace_composite_blocks(BlockType::KV,
+                                               std::move(blocks),
+                                               /*num_shared_blocks=*/1,
+                                               /*cache_publish_cursor=*/1);
+  sequence.retain_host_restore_blocks(
+      {sequence.kv_state().blocks(BlockType::KV)[0]});
+  auto batch = std::make_unique<Batch>(&sequence);
+  const auto owners = sequence.host_restore_owners();
+  std::vector<std::unique_lock<std::mutex>> release_locks;
+  release_locks.reserve(owners.size());
+  for (const auto& owner : owners) {
+    release_locks.emplace_back(owner->lock());
+  }
+  manager.deallocate(sequence.kv_state().blocks(BlockType::KV));
+  // Reproduce the scheduler retiring a batch between the PD thread's manager
+  // deallocation and its Sequence::reset.
+  auto retired =
+      std::async(std::launch::async,
+                 [batch = std::move(batch)]() mutable { batch.reset(); });
+  EXPECT_EQ(retired.wait_for(std::chrono::milliseconds(20)),
+            std::future_status::timeout);
+  sequence.reset();
+  EXPECT_EQ(manager.num_used_blocks(), initial_used + 1);
+  release_locks.clear();
+  retired.get();
+  EXPECT_EQ(manager.num_used_blocks(), initial_used);
 }
 
 TEST(ForwardInputBuilderTest, LaterChunkUsesLogicalOffset) {

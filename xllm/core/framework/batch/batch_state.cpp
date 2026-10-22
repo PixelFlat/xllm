@@ -37,12 +37,21 @@ void BatchState::add(Sequence* sequence, uint32_t allowed_max_token) {
 
   set_batch_id();
   sequence_plan_.add(sequence, allowed_max_token);
+  retain_host_restore_blocks(*sequence);
 
   if (sequence->has_input_embedding()) {
     input_embeddings_vec_.emplace_back(sequence->get_input_embedding());
   }
 
   update_forward_type(sequence);
+}
+
+void BatchState::retain_host_restore_blocks(Sequence& sequence) {
+  auto retained = sequence.take_host_restore_blocks();
+  if (retained != nullptr) {
+    host_restore_leases_.reserve(host_restore_leases_.size() + 1);
+    host_restore_leases_.emplace_back(std::move(retained));
+  }
 }
 
 void BatchState::update_forward_type(Sequence* sequence) {
@@ -84,6 +93,7 @@ void BatchState::reserve(size_t sequence_count,
                          size_t group_count,
                          size_t input_embedding_count) {
   sequence_plan_.reserve(sequence_count);
+  host_restore_leases_.reserve(sequence_count);
   input_embeddings_vec_.reserve(input_embedding_count);
   sequence_groups_.reserve(group_count);
 }

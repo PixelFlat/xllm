@@ -2394,6 +2394,23 @@ TaskModel WorkerImpl::task_model() {
   CHECK(status_ == Status::LOADED || status_ == Status::READY);
   CHECK(model_ != nullptr && model_executor_ != nullptr);
   TaskModel task{*model_, *model_executor_, kv_caches_};
+  if (options_.host_blocks_factor() > 1.0) {
+    // KV allocation follows pipeline creation. Resolve the shared target/draft
+    // hierarchy only after a Task has passed admission and Prepare.
+    task.load_kv = [this](uint64_t batch_id) {
+      CHECK(hierarchy_kv_cache_transfer_ != nullptr);
+      return hierarchy_kv_cache_transfer_->take_load_handle(batch_id);
+    };
+    task.fence_kv = [this](const Stream& task_stream) {
+      // Composite MTP registers the shared hierarchy against its own producer
+      // stream, which need not be this leaf worker's default stream.
+      const Stream* producer = hierarchy_kv_cache_producer_stream_ != nullptr
+                                   ? hierarchy_kv_cache_producer_stream_
+                                   : compute_stream_.get();
+      Stream producer_stream(*producer->get_stream());
+      producer_stream.wait_stream(task_stream);
+    };
+  }
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   if (options_.enable_disagg_pd() &&
       options_.instance_role() == InstanceRole::PREFILL &&
@@ -2841,7 +2858,8 @@ uint32_t WorkerImpl::transfer_kv_blocks(
 }
 
 std::shared_ptr<HierarchyKVCacheTransfer>
-WorkerImpl::create_hierarchy_kv_cache_transfer() {
+WorkerImpl::create_hierarchy_kv_cache_transfer(
+    std::optional<bool> enable_task_pipeline) {
   CHECK_GT(options_.host_blocks_factor(), 1.0)
       << "Hierarchy KV cache transfer requires Host cache blocks.";
   CHECK_GT(options_.dp_size(), 0u);
@@ -2867,6 +2885,8 @@ WorkerImpl::create_hierarchy_kv_cache_transfer() {
       .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
       .enable_mla(options_.enable_mla())
       .enable_kvcache_store(options_.enable_kvcache_store())
+      .enable_task_pipeline(
+          enable_task_pipeline.value_or(options_.enable_task_pipeline()))
       .store_protocol(options_.store_protocol())
       .store_rdma_devices(options_.store_rdma_devices())
       .store_master_server_address(options_.store_master_server_address())

@@ -88,6 +88,17 @@ target_link_options(task_execution_pipeline_input_test PRIVATE
 
 if(USE_NPU)
   cc_test(
+    NAME py_executor_kv_load_test
+    SRCS py_executor_kv_load_test.cpp
+    DEPS :runtime GTest::gtest_main
+  )
+  target_link_libraries(py_executor_kv_load_test PRIVATE nnopbase)
+  target_link_options(py_executor_kv_load_test PRIVATE
+    "-Wl,--whole-archive"
+    "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
+    "-Wl,--no-whole-archive")
+
+  cc_test(
     NAME
       worker_memory_resources_test
     SRCS

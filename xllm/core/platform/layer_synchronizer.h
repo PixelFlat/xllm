@@ -27,6 +27,12 @@ class LayerSynchronizer {
   virtual ~LayerSynchronizer() = default;
 
   virtual bool synchronize_layer(int64_t layer_index) = 0;
+  // Order a consumer stream after a load without waiting for device completion
+  // on the CPU. Backends without stream waits retain their blocking semantics.
+  virtual bool wait_layer_on_current_stream(int64_t layer_index) {
+    return synchronize_layer(layer_index);
+  }
+  bool wait_all_on_current_stream();
   // Reports record failure without aborting pending waits. The stream owner
   // must first make any submitted work safe, then call abort().
   virtual bool record_stream(int64_t layer_index, Stream* stream) = 0;

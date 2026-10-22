@@ -118,8 +118,6 @@ Worker::Worker(const ParallelArgs& parallel_args,
                   options.speculative_algorithm()) &&
               options.enable_graph() && parallel_args.dp_size() == 1)))) &&
           !options.enable_prefill_piecewise_graph() &&
-          options.host_blocks_factor() <= 1.0 &&
-          !options.enable_kvcache_store() &&
           !options.enable_offline_inference() &&
           !EPLBConfig::get_instance().enable_eplb() &&
           !KVCacheConfig::get_instance().enable_virtual_memory() &&
@@ -127,7 +125,15 @@ Worker::Worker(const ParallelArgs& parallel_args,
           parallel_args.layerwise_split_size() == 1)
         << "Task pipeline requires Python LLM, fixed "
            "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs with DP=1 and "
-           "a layerwise split of one, without offload.";
+           "a layerwise split of one.";
+    CHECK(options.host_blocks_factor() <= 1.0 ||
+          (Platform::is_npu() &&
+           (!options.enable_speculative_decode() ||
+            (SpeculativeConfig::is_mtp_algorithm(
+                 options.speculative_algorithm()) &&
+             !options.enable_adaptive_speculative_decode()))))
+        << "Task pipeline Host KV cache requires NPU ordinary or fixed MTP "
+           "decoding.";
   }
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
@@ -412,6 +418,16 @@ folly::SemiFuture<bool> Worker::pull_kv_blocks_async(
 uint32_t Worker::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
+  if (enable_task_pipeline_ &&
+      impl_->get_hierarchy_kv_cache_transfer() != nullptr &&
+      !block_transfer_info.empty() &&
+      (block_transfer_info.front().transfer_type == TransferType::D2H2G ||
+       block_transfer_info.front().transfer_type == TransferType::H2D)) {
+    CHECK(task_pipeline_ != nullptr);
+    // PrepareAck can precede Launch. Publish the actual task-stream producer
+    // before the hierarchy records either copy direction's dependency.
+    task_pipeline_->fence_kv_cache();
+  }
   return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
 }
 

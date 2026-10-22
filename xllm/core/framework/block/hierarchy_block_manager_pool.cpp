@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <mutex>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -607,6 +608,17 @@ void HierarchyBlockManagerPool::release_host_match(Sequence* sequence,
 
 void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
   DCHECK(sequence != nullptr);
+  // PD handoff can release the owner while the scheduler retires its batch.
+  // A lease must observe both manager deallocation and Sequence::reset before
+  // it performs the final cached-usage check.
+  // Destroy an unsubmitted lease only after releasing the owner locks below.
+  const auto pending_restore = sequence->take_host_restore_blocks();
+  const auto restore_owners = sequence->host_restore_owners();
+  std::vector<std::unique_lock<std::mutex>> restore_locks;
+  restore_locks.reserve(restore_owners.size());
+  for (const auto& owner : restore_owners) {
+    restore_locks.emplace_back(owner->lock());
+  }
   int32_t dp_rank = BlockManagerPool::get_dp_rank(sequence);
   auto* composite =
       static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get());
@@ -826,6 +838,7 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
 
   std::vector<BlockTransferInfo>& load_infos =
       load_block_transfer_infos_[dp_rank];
+  std::vector<Block> restore_blocks;
   for (const auto& [type, entry] : host_block_managers_[dp_rank]) {
     std::vector<Block>* host_blocks = host_state.mutable_blocks(type);
     std::vector<Block>* hbm_blocks = hbm_state.mutable_blocks(type);
@@ -837,11 +850,15 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
     const size_t host_matched_blocks = host_state.num_cached_blocks(type);
     const size_t comparable_blocks =
         std::min(host_blocks->size(), hbm_blocks->size());
-    for (size_t i = 0; i < comparable_blocks; ++i) {
+    const size_t restore_end = std::min(comparable_blocks, host_matched_blocks);
+    const size_t restore_count =
+        restore_end - std::min(restore_end, hbm_matched_blocks);
+    restore_blocks.reserve(restore_blocks.size() + 2 * restore_count);
+    load_infos.reserve(load_infos.size() + restore_count);
+    for (size_t i = hbm_matched_blocks; i < restore_end; ++i) {
       Block& host_block = (*host_blocks)[i];
       Block& hbm_block = (*hbm_blocks)[i];
-      if (i < hbm_matched_blocks || i >= host_matched_blocks ||
-          !hbm_block.is_valid() || !host_block.is_valid()) {
+      if (!hbm_block.is_valid() || !host_block.is_valid()) {
         continue;
       }
       // Shared Host sources can restore multiple private HBM destinations.
@@ -852,9 +869,18 @@ bool HierarchyBlockManagerPool::allocate(Sequence* sequence,
                               host_block.get_immutable_hash_value(),
                               TransferType::H2D,
                               type);
+      restore_blocks.emplace_back(host_block);
+      restore_blocks.emplace_back(hbm_block);
     }
   }
 
+  auto lease = sequence->retain_host_restore_blocks(std::move(restore_blocks));
+  if (lease != nullptr) {
+    std::erase_if(host_restore_leases_,
+                  [](const auto& prior) { return prior.expired(); });
+    host_restore_leases_.reserve(host_restore_leases_.size() + 1);
+    host_restore_leases_.emplace_back(lease);
+  }
   collect_offload_pairs(sequence, dp_rank, restore_tokens);
   CHECK_GE(hbm_state.current_max_tokens_capacity(), restore_tokens);
   hbm_state.set_kv_cache_tokens_num(restore_tokens);
@@ -1239,7 +1265,10 @@ void HierarchyBlockManagerPool::transfer_blocks(RecBatchGroup& batches) {
 void HierarchyBlockManagerPool::transfer_blocks() { transfer_offload_blocks(); }
 
 bool HierarchyBlockManagerPool::has_pending_async_block_release() const {
-  if (offload_transfers_.has_pending()) {
+  if (offload_transfers_.has_pending() ||
+      std::any_of(host_restore_leases_.begin(),
+                  host_restore_leases_.end(),
+                  [](const auto& lease) { return !lease.expired(); })) {
     return true;
   }
   for (const OffloadBlockPairQueue& queue : offload_block_pair_queues_) {

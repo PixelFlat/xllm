@@ -31,6 +31,7 @@ class NPULayerSynchronizerImpl {
   aclrtEvent* get_event(const int64_t layer_index);
   std::atomic<bool>* get_event_flag(const int64_t layer_index);
   bool synchronize_layer(const int64_t layer_index);
+  bool wait_layer_on_current_stream(int64_t layer_index);
   bool record_event(const int64_t layer_index, const int32_t device_index);
   // Unblock all pending synchronize_layer spins and make them report failure.
   void abort();

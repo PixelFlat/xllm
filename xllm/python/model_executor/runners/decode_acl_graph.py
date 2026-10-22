@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import accumulate
 
 import torch
 import torch.distributed as dist
@@ -456,25 +455,6 @@ class DecodeAclGraphRunner(AclGraphRunner):
         if query_width is None or query_width <= 0 or padded_batch_size % query_width != 0:
             return query_lens
         return (query_width,) * (padded_batch_size // query_width)
-
-    @staticmethod
-    def _host_cumulative_query_lengths(metadata: AttentionMetadata, batch_size: int) -> list[int]:
-        """Return graph query ends from scheduler-owned host metadata."""
-        host_values = getattr(metadata, "q_cu_seq_lens_host_values", None)
-        if host_values is not None:
-            values = [int(value) for value in host_values]
-            if len(values) == batch_size + 1:
-                return values
-            if len(values) == batch_size:
-                return [0, *values]
-            raise RuntimeError("host query cumulative lengths must match graph rows")
-
-        query_lengths = getattr(metadata, "q_seq_lens_host", None)
-        if query_lengths is not None:
-            if query_lengths.device.type != "cpu" or query_lengths.numel() != batch_size:
-                raise RuntimeError("host query lengths must match graph rows")
-            return list(accumulate(int(length) for length in query_lengths.tolist()), initial=0)
-        raise RuntimeError("expanded decode graph requires scheduler-provided host query lengths")
 
     @staticmethod
     def _validate_decode_metadata_shapes(
@@ -1125,6 +1105,9 @@ class DecodeAclGraphRunner(AclGraphRunner):
             ),
         )
         entry.kv_seq_lens_delta = torch.empty(padded_batch_size, dtype=torch.int32, device=device)
+        entry.expanded_query_cu_seq_lens = (
+            torch.arange(padded_batch_size + 1, dtype=torch.int32, device=device) if is_expanded else None
+        )
         # The graph metadata update writes per-sequence KV lengths into this
         # buffer.  MLA/SFA consumes the same stable buffer as its key lengths.
         entry.static_metadata.kv_seq_lens = entry.kv_seq_lens_delta
@@ -1249,11 +1232,13 @@ class DecodeAclGraphRunner(AclGraphRunner):
             padded_batch_size,
         )
         if expanded is not None and static_metadata.q_cu_seq_lens is not None:
-            query_cu_seq_lens = self._cumulative_lengths(
-                kv_seq_lens,
-                getattr(metadata, "q_cu_seq_lens", None),
-            )
-            query_cu_seq_lens_host_values = self._host_cumulative_query_lengths(metadata, batch_size)
+            # Expanded attention has one query token per physical row. The
+            # caller can still provide cumulative ends per logical request;
+            # preserve that grouping in q_seq_lens, not in this row buffer.
+            if entry.expanded_query_cu_seq_lens is None:
+                raise RuntimeError("expanded decode graph is missing row query offsets")
+            query_cu_seq_lens = entry.expanded_query_cu_seq_lens[: batch_size + 1]
+            query_cu_seq_lens_host_values = list(range(batch_size + 1))
             static_metadata.q_cu_seq_lens[: batch_size + 1].copy_(query_cu_seq_lens)
             static_metadata.q_cu_seq_lens_host_values = query_cu_seq_lens_host_values
             if padded_batch_size > batch_size:

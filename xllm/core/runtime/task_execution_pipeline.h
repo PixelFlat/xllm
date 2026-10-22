@@ -16,9 +16,11 @@ limitations under the License.
 #pragma once
 #include <folly/futures/Future.h>
 
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -26,6 +28,7 @@ limitations under the License.
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/kv_cache/transfer/host_transfer/transfer.h"
 #include "core/platform/device.h"
 #include "core/runtime/executor.h"
 #include "core/runtime/forward_params.h"
@@ -72,6 +75,8 @@ struct LlmTaskCapacity {
 using TaskKVPush =
     std::function<folly::SemiFuture<bool>(const std::vector<TransferKVInfo>&,
                                           ModelParamsView&)>;
+using TaskKVLoad = std::function<std::optional<HostKVLoadHandle>(uint64_t)>;
+using TaskKVFence = std::function<void(const Stream&)>;
 
 // Borrowed resources outlive the pipeline. PUSH binds a fresh layer
 // synchronizer to the invocation and resolves KV resources at Launch time.
@@ -80,6 +85,8 @@ struct TaskModel {
   Executor& executor;
   std::vector<KVCache>& kv_caches;
   TaskKVPush push_kv = {};
+  TaskKVLoad load_kv = {};
+  TaskKVFence fence_kv = {};
 };
 
 class ProcessGroup;
@@ -165,6 +172,9 @@ class TaskExecutionPipeline final {
   // -(previous sampling output row + 1) with scheduler overlap.
   // Backpressure and validation return before accepting a Task.
   TaskSubmission submit(const LlmForwardInput& input);
+  // Publish all previously accepted model work to the hierarchy producer
+  // stream. Waits only for Launch submission, without consuming any results.
+  void fence_kv_cache();
   std::optional<std::string> dspark_calibration(
       DSparkCalibrationCommand command);
   // Only the oldest accepted TaskId may be consumed. Other IDs are rejected
@@ -251,6 +261,7 @@ class TaskExecutionPipeline final {
     Step expected_producer;
     bool is_warmup = false;
     std::vector<TransferKVInfo> transfer_kv_infos;
+    std::optional<HostKVLoadHandle> kv_load;
     StreamEventPtr input_ready;
     StreamEventPtr output_ready;
     std::unique_ptr<SlotBuffer> buffer;
@@ -280,6 +291,8 @@ class TaskExecutionPipeline final {
                         std::vector<KVCache>& kv_caches,
                         LlmTaskCapacity capacity,
                         TaskKVPush push_kv,
+                        TaskKVLoad load_kv,
+                        TaskKVFence fence_kv,
                         WorkerImpl* worker_pipeline = nullptr);
   Status validate(const Slot& slot, const LlmForwardInput& input) const;
   Status prepare(uint32_t slot_id, const LlmForwardInput& input);
@@ -364,6 +377,8 @@ class TaskExecutionPipeline final {
   Executor& executor_;
   std::vector<KVCache>& kv_caches_;
   TaskKVPush push_kv_;
+  TaskKVLoad load_kv_;
+  TaskKVFence fence_kv_;
   LlmTaskCapacity capacity_;
   Device device_;
   Stream prepare_stream_;
@@ -386,6 +401,9 @@ class TaskExecutionPipeline final {
   ConcurrentQueue<SlotTicket> execution_;
   ConcurrentQueue<SlotTicket> completed_;
   std::thread launch_thread_;
+  std::mutex launch_mutex_;
+  std::condition_variable launch_cv_;
+  uint64_t launched_task_id_ = 0;
   std::thread::id state_thread_id_;
   // Accessed exclusively on the state executor until the destructor barrier.
   uint64_t next_task_id_ = 1;

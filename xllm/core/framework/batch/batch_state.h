@@ -105,6 +105,7 @@ class BatchState final {
       std::vector<uint32_t>& kv_cache_tokens_num);
 
  private:
+  void retain_host_restore_blocks(Sequence& sequence);
   void dp_balance_shuffle_seqs();
   bool has_partial_finished_beam_group() const;
   BatchSequencePlan sequence_plan_;
@@ -114,6 +115,9 @@ class BatchState final {
   std::vector<MMData> mm_data_vec_;
   // Keep serialized restore sources alive through worker-result processing.
   std::vector<Block> linear_restore_src_blocks_;
+  // A cancelled sequence may release its own aliases before its pending
+  // worker result. Pin H2D sources and destinations until this batch retires.
+  std::vector<std::shared_ptr<KVCacheBlockLease>> host_restore_leases_;
   BatchForwardType batch_forward_type_;
   uint64_t batch_id_ = UNINITIALIZED_BATCH_ID;
 };

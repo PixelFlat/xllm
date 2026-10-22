@@ -87,7 +87,8 @@ uint32_t CompactHostKVTransfer::layers_per_event() const {
 
 bool CompactHostKVTransfer::load_impl(const HostKVRequest& request,
                                       const HostKVLoadHandle& handle) {
-  return load_executor_->execute(request, handle.synchronizer);
+  return load_executor_->execute(
+      request, handle.synchronizer, handle.producer_ready);
 }
 
 bool CompactHostKVTransfer::offload_impl(const HostKVRequest& request) {

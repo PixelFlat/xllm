@@ -105,6 +105,7 @@ class AclGraphEntry:
         "static_mtp_topk_indices",
         "static_metadata",
         "kv_seq_lens_delta",
+        "expanded_query_cu_seq_lens",
         "graph_tasks",
         "execution_state",
         "eplb",

@@ -22,6 +22,8 @@ limitations under the License.
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -183,6 +185,32 @@ class Block final {
   BlockManager* manager_ = nullptr;
 
   uint8_t hash_value_[XXH3_128BITS_HASH_VALUE_LEN];
+};
+
+// Serialize transfer retirement with the sequence's logical deallocation.
+class KVCacheBlockLeaseOwner final {
+ public:
+  std::unique_lock<std::mutex> lock() { return std::unique_lock(mutex_); }
+  void release() { released_.store(true, std::memory_order_release); }
+  bool released() const { return released_.load(std::memory_order_acquire); }
+
+ private:
+  std::mutex mutex_;
+  std::atomic<bool> released_{false};
+};
+
+// Pin transfer aliases beyond their sequence owner's lifetime. Managers must
+// outlive the lease, as they do for ordinary Block aliases.
+class KVCacheBlockLease final {
+ public:
+  explicit KVCacheBlockLease(std::vector<Block> blocks);
+  ~KVCacheBlockLease();
+  void release_owner();
+  std::shared_ptr<KVCacheBlockLeaseOwner> owner() const { return owner_; }
+
+ private:
+  std::vector<Block> blocks_;
+  std::shared_ptr<KVCacheBlockLeaseOwner> owner_;
 };
 
 // equal operator, mainly used for testing

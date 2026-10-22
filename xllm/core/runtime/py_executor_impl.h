@@ -107,6 +107,7 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   PyExecutorImpl* adaptive_unified_draft_ = nullptr;
   ProcessGroup* adaptive_unified_sampling_group_ = nullptr;
   bool supports_prepared_metadata_ = false;
+  bool supports_layerwise_kv_load_ = false;
   bool kv_bound_ = false;
   int64_t kv_layer_count_ = 0;
   std::vector<torch::Tensor> prepared_kv_bindings_;

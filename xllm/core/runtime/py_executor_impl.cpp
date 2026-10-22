@@ -44,6 +44,7 @@ limitations under the License.
 #include "models/llm/py_causal_lm.h"
 #include "models/py_model_helper.h"
 #include "models/vlm/utils/multimodal_utils.h"
+#include "platform/layer_synchronizer.h"
 
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -89,6 +90,13 @@ py::object dspark_adaptive_graph_input(const ModelParamsView& params) {
 
 void register_xllm_runtime_module(py::module_& m) {
   register_attention_metadata_views(m);
+
+  py::class_<LayerSynchronizer, std::shared_ptr<LayerSynchronizer>>(
+      m, "HostKVLoadSynchronizer")
+      .def("wait_group",
+           &LayerSynchronizer::wait_layer_on_current_stream,
+           py::call_guard<py::gil_scoped_release>())
+      .def("size", &LayerSynchronizer::size);
 
   m.def("tp_all_reduce", [](torch::Tensor tensor) {
     PyCausalLM* py_causal_lm = PyCausalLM::active_instance();
@@ -232,6 +240,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       py_executor_.attr("context_kv_graph_runner"));
   supports_prepared_metadata_ =
       py_executor_.attr("supports_prepared_metadata").cast<bool>();
+  supports_layerwise_kv_load_ =
+      py_executor_.attr("supports_layerwise_kv_load").cast<bool>();
 }
 
 PyExecutorImpl::~PyExecutorImpl() {
@@ -571,6 +581,26 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
         layer::AttentionMetadataBuilder::build(
             params, enable_mla_, std::nullopt, device_));
   }
+  const bool prepared_graph =
+      params.python_attention_metadata && params.enable_graph;
+  const bool layerwise_kv_load =
+      params.parallel.layer_wise_load_synchronizer != nullptr &&
+      supports_layerwise_kv_load_ && !prepared_graph &&
+      !params.is_spec_verify &&
+      (attn_metadata->is_prefill || attn_metadata->is_chunked_prefill);
+  if (params.parallel.layer_wise_load_synchronizer != nullptr) {
+    VLOG(1) << "[HostKV][PythonLoad] batch_id=" << params.meta.batch_id
+            << ", mode=" << (layerwise_kv_load ? "layerwise" : "wait_all")
+            << ", groups="
+            << params.parallel.layer_wise_load_synchronizer->size();
+    // Captured graphs and models without load hooks retain the per-batch
+    // fence. Eager prefill inserts waits at its actual layer consumers.
+    if (!layerwise_kv_load) {
+      CHECK(params.parallel.layer_wise_load_synchronizer
+                ->wait_all_on_current_stream())
+          << "Python model Host KV reload failed.";
+    }
+  }
   py::gil_scoped_acquire gil;
 
   // Prepared input already bound and checked KV caches during Prepare.
@@ -582,8 +612,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
       params.python_attention_metadata
           ? params.python_attention_metadata->value()
           : py::cast(PyAttentionMetadataView(attn_metadata, params));
-  const bool prepared_graph =
-      params.python_attention_metadata && params.enable_graph;
   if (params.python_attention_metadata) {
     VLOG(1) << "Task pipeline model path="
             << (prepared_graph ? "aclgraph" : "eager")
@@ -718,6 +746,11 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
   // mRoPE [3,N]->1-D decode collapse.
   py::kwargs graph_kwargs;
+  if (layerwise_kv_load) {
+    graph_kwargs["kv_load_synchronizer"] =
+        py::cast(params.parallel.layer_wise_load_synchronizer);
+    graph_kwargs["kv_load_layers_per_event"] = params.parallel.layers_per_event;
+  }
   if (params.graph.dspark_adaptive.arena.defined()) {
     graph_kwargs["dspark_adaptive"] = dspark_adaptive_graph_input(params);
   }
@@ -733,6 +766,15 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    eplb_decode_token_mask,
                                    params.meta.is_graph_warmup,
                                    **graph_kwargs);
+  if (layerwise_kv_load && params.parallel.draft_load_event_index.has_value()) {
+    // Target prefill can overlap its own reload, but a following draft body
+    // must still observe the composite handle's draft-cache completion.
+    py::gil_scoped_release release;
+    CHECK(params.parallel.layer_wise_load_synchronizer
+              ->wait_layer_on_current_stream(
+                  *params.parallel.draft_load_event_index))
+        << "Python model draft Host KV reload failed.";
+  }
   if (py::isinstance<py::tuple>(hidden_obj)) {
     py::tuple output = hidden_obj.cast<py::tuple>();
     CHECK(output.size() == 2 || output.size() == 3)

@@ -154,6 +154,9 @@ class BasicHostKVTransfer::Impl final {
 
   bool load(const HostKVRequest& request, const HostKVLoadHandle& handle) {
     CopyStreamLease stream(&streams_);
+    if (!stream.get()->wait_event(handle.producer_ready)) {
+      return false;
+    }
     bool stream_has_work = false;
     for (size_t index = 0; index < ranges_.size(); ++index) {
       CopyPlan plan = build_plan(

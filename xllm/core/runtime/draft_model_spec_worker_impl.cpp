@@ -299,7 +299,8 @@ void DraftModelSpecWorkerImpl<
   if (unified_transfer == nullptr) {
     unified_transfer = draft_transfer
                            ? draft_transfer
-                           : impl_->create_hierarchy_kv_cache_transfer();
+                           : impl_->create_hierarchy_kv_cache_transfer(
+                                 options_.enable_task_pipeline());
   }
 
   if (target_transfer == nullptr) {

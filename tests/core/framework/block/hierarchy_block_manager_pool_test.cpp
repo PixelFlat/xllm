@@ -23,6 +23,7 @@ limitations under the License.
 #include <limits>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/global_flags.h"
@@ -442,6 +443,56 @@ TEST(HierarchyBlockManagerPoolTest, FlatKvHasSingleHostKvLeaf) {
   ASSERT_TRUE(per_type.count(BlockType::KV) == 1);
   EXPECT_EQ(per_type.at(BlockType::KV).leaf->block_size(), 128);
   EXPECT_EQ(per_type.at(BlockType::KV).leaf->num_total_blocks(), 127u);
+}
+
+TEST(HierarchyBlockManagerPoolTest,
+     HostRestoreLeaseSurvivesCancellationAndReleasesCachedUsage) {
+  for (const auto [submitted, cancel_first] :
+       {std::pair{false, true}, {true, true}, {true, false}}) {
+    SCOPED_TRACE(submitted);
+    SCOPED_TRACE(cancel_first);
+    auto options = make_flat_kv_options();
+    options.block_size(16).hasher_type(BlockHasherType::MTP_TEXT);
+    HierarchyBlockManagerPool pool(
+        options, /*transfer_coordinator=*/nullptr, /*dp_size=*/1);
+    const std::vector<int32_t> tokens(33, 41);
+    auto& host =
+        HierarchyPoolTestPeer::mutable_host_block_managers(pool).front();
+    BlockManager* host_leaf = host.at(BlockType::KV).leaf.get();
+    BlockManager* device_leaf = HierarchyPoolTestPeer::device_composite(pool)
+                                    ->leaf_entries()
+                                    .at(BlockType::KV)
+                                    .leaf.get();
+    seed_host_prefix(host_leaf, tokens);
+    const size_t host_used = host_leaf->num_used_blocks();
+    const size_t device_used = device_leaf->num_used_blocks();
+    Sequence sequence = make_test_sequence(/*index=*/0, tokens);
+    pool.allocate_shared(&sequence);
+    ASSERT_TRUE(pool.allocate(&sequence, tokens.size()));
+    ASSERT_FALSE(sequence.has_host_cache_match());
+    std::shared_ptr<KVCacheBlockLease> lease;
+    if (submitted) {
+      lease = sequence.take_host_restore_blocks();
+      ASSERT_NE(lease, nullptr);
+    }
+    EXPECT_TRUE(pool.has_pending_async_block_release());
+    if (!cancel_first) {
+      lease.reset();
+      EXPECT_GT(host_leaf->num_used_blocks(), host_used);
+      EXPECT_GT(device_leaf->num_used_blocks(), device_used);
+      EXPECT_FALSE(pool.has_pending_async_block_release());
+    }
+    pool.deallocate(&sequence);
+    if (lease != nullptr) {
+      EXPECT_GT(host_leaf->num_used_blocks(), host_used);
+      EXPECT_GT(device_leaf->num_used_blocks(), device_used);
+      EXPECT_TRUE(pool.has_pending_async_block_release());
+    }
+    lease.reset();
+    EXPECT_EQ(host_leaf->num_used_blocks(), host_used);
+    EXPECT_EQ(device_leaf->num_used_blocks(), device_used);
+    EXPECT_FALSE(pool.has_pending_async_block_release());
+  }
 }
 
 TEST(HierarchyBlockManagerPoolTest,

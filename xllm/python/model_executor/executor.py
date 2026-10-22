@@ -33,6 +33,8 @@ from xllm.python.model_executor.forward_context import (
     AclGraphExecutionState,
     EplbRuntimeState,
     ForwardContext,
+    KVLoadContext,
+    KVLoadSynchronizer,
     LayerSynchronizer,
     forward_context,
 )
@@ -253,6 +255,9 @@ class ModelExecutor:
         # speculative graph needs the role-owned lm_head/compute_logits entry
         # after every unrolled body step.
         self.execution_model = model.model
+        self.supports_layerwise_kv_load = bool(
+            getattr(self.execution_model, "supports_layerwise_kv_load", False)
+        ) and not config.get("is_draft_engine", False)
         self._kv_bound = False
         cp_size = int(config.get("cp_size", 1))
         cp_rank = int(config.get("cp_rank", 0))
@@ -845,6 +850,8 @@ class ModelExecutor:
         is_graph_warmup: bool = False,
         *,
         dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
+        kv_load_synchronizer: KVLoadSynchronizer | None = None,
+        kv_load_layers_per_event: int = 1,
     ) -> ModelExecutionOutput:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
@@ -865,6 +872,27 @@ class ModelExecutor:
         eplb = None
         if expert_load_data is not None:
             eplb = EplbRuntimeState(expert_load_data, eplb_decode_token_mask, is_graph_warmup)
+        if kv_load_synchronizer is not None:
+            if (
+                not self.supports_layerwise_kv_load
+                or enable_graph
+                or metadata.is_spec_verify
+                or not (metadata.is_prefill or metadata.is_chunked_prefill)
+            ):
+                raise ValueError("Layerwise Host KV load requires a supported eager prefill model")
+            if getattr(metadata, "prepared_attention_state", None) is not None and mtp_topk_indices is not None:
+                raise ValueError("prepared prefill metadata does not support MTP top-k state")
+            kv_load = KVLoadContext(kv_load_synchronizer, kv_load_layers_per_event, len(self.execution_model.layers))
+            return self.eager_runner.execute(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                layer_synchronizer,
+                mtp_topk_indices,
+                eplb=eplb,
+                kv_load=kv_load,
+            )
         # Transfer completion events belong to this step. Graph replay cannot
         # record them through Python, and compilation must not retain a prior
         # step's synchronizer. Decode steps without a transfer can use graphs.

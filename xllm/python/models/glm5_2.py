@@ -57,6 +57,7 @@ from xllm.python.model_executor.cp_utils import (
 from xllm.python.model_executor.forward_context import (
     get_forward_context,
     record_layer_event,
+    wait_for_kv_layer,
 )
 from xllm.python.model_loader import W8A8WeightLoader, mla_head_split, moe_shard
 from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
@@ -1007,6 +1008,7 @@ class Glm52DecoderLayer(DeepseekV3DecoderLayer):
         slot_mapping_int64: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert query_cos_sin is not None
+        wait_for_kv_layer(self.layer_id)
         return self.self_attn(
             hidden,
             half_rope_cos,
@@ -1022,6 +1024,8 @@ class Glm52DecoderLayer(DeepseekV3DecoderLayer):
 
 
 class Glm52Model(DeepseekV3Model):
+    supports_layerwise_kv_load = True
+
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__(cfg, dtype, device)
         self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)

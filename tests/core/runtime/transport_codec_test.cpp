@@ -167,17 +167,39 @@ TEST(TransportCodecTest, InvalidBlockTransferEncodePreservesDestination) {
   }
 }
 
+TEST(TransportCodecTest, PrefetchRoundTripAcceptsUnusedSourceBlock) {
+  for (int32_t source_id : {-1, 7}) {
+    StoragePrefetchRequest request = make_prefetch_request();
+    request.transfer_infos[0].src_block_id = source_id;
+    proto::PrefetchRequest encoded;
+    ASSERT_TRUE(request.to_proto(&encoded));
+    StoragePrefetchRequest decoded;
+    ASSERT_TRUE(decoded.from_proto(encoded));
+    ASSERT_EQ(decoded.transfer_infos.size(), 1U);
+    EXPECT_EQ(decoded.transfer_infos[0].src_block_id, source_id);
+    EXPECT_EQ(decoded.transfer_infos[0].dst_block_id, 11);
+    EXPECT_EQ(decoded.transfer_infos[0].transfer_type, TransferType::G2H);
+    EXPECT_EQ(std::memcmp(decoded.transfer_infos[0].hash_key,
+                          request.transfer_infos[0].hash_key,
+                          XXH3_128BITS_HASH_VALUE_LEN),
+              0);
+    EXPECT_EQ(decoded.unit_end_offsets, request.unit_end_offsets);
+    EXPECT_EQ(decoded.batch_end_unit_offsets, request.batch_end_unit_offsets);
+  }
+}
+
 TEST(TransportCodecTest, InvalidPrefetchDecodePreservesDestination) {
   proto::PrefetchRequest valid;
   ASSERT_TRUE(make_prefetch_request().to_proto(&valid));
-  std::vector<proto::PrefetchRequest> invalid_inputs(6, valid);
+  std::vector<proto::PrefetchRequest> invalid_inputs(7, valid);
   invalid_inputs[0].clear_transfer_infos();
   invalid_inputs[1].mutable_transfer_infos(0)->set_hash_key("short");
   invalid_inputs[2].mutable_transfer_infos(0)->set_block_type(
       static_cast<proto::BlockType>(99));
   invalid_inputs[3].set_unit_end_offsets(0, 2);
   invalid_inputs[4].set_batch_end_unit_offsets(0, 0);
-  invalid_inputs[5].mutable_transfer_infos(0)->set_src_block_id(-1);
+  invalid_inputs[5].mutable_transfer_infos(0)->set_src_block_id(-2);
+  invalid_inputs[6].mutable_transfer_infos(0)->set_dst_block_id(-1);
 
   for (const proto::PrefetchRequest& invalid : invalid_inputs) {
     StoragePrefetchRequest destination = make_prefetch_request();
@@ -194,15 +216,16 @@ TEST(TransportCodecTest, InvalidPrefetchEncodePreservesDestination) {
   proto::PrefetchRequest destination;
   ASSERT_TRUE(make_prefetch_request().to_proto(&destination));
   const std::string original = destination.SerializeAsString();
-  StoragePrefetchRequest invalid = make_prefetch_request();
-  invalid.unit_end_offsets = {2};
-  EXPECT_FALSE(invalid.to_proto(&destination));
-  EXPECT_EQ(destination.SerializeAsString(), original);
-
-  invalid = make_prefetch_request();
-  invalid.transfer_infos[0].block_type = static_cast<BlockType>(99);
-  EXPECT_FALSE(invalid.to_proto(&destination));
-  EXPECT_EQ(destination.SerializeAsString(), original);
+  std::vector<StoragePrefetchRequest> invalid_inputs(4,
+                                                     make_prefetch_request());
+  invalid_inputs[0].unit_end_offsets = {2};
+  invalid_inputs[1].transfer_infos[0].block_type = static_cast<BlockType>(99);
+  invalid_inputs[2].transfer_infos[0].src_block_id = -2;
+  invalid_inputs[3].transfer_infos[0].dst_block_id = -1;
+  for (const auto& invalid : invalid_inputs) {
+    EXPECT_FALSE(invalid.to_proto(&destination));
+    EXPECT_EQ(destination.SerializeAsString(), original);
+  }
 }
 
 TEST(TransportCodecTest, PrefetchReuseReplacesTransfersAndOffsets) {

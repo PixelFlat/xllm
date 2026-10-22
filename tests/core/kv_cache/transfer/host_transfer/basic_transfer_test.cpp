@@ -115,6 +115,21 @@ TEST(HostKVTransferFactoryTest, SelectsConfiguredStrategy) {
   basic->drain();
 }
 
+TEST(BasicHostKVTransferTest, AbortedReloadCannotBeQueuedOnConsumerStream) {
+  if (Platform::device_count() < 1) {
+    GTEST_SKIP() << "An accelerator device is required for Host KV transfer.";
+  }
+  Device device(/*device_index=*/0);
+  device.set_device();
+  device.init_device_context();
+  auto synchronizer = create_layer_synchronizer(/*num_layers=*/2);
+  ASSERT_NE(synchronizer, nullptr);
+  synchronizer->abort();
+  auto consumer = device.get_stream_from_pool();
+  auto guard = consumer->set_stream_guard();
+  EXPECT_FALSE(synchronizer->wait_all_on_current_stream());
+}
+
 TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
   if (Platform::device_count() < 1) {
     GTEST_SKIP() << "An accelerator device is required for Host KV transfer.";
@@ -123,6 +138,8 @@ TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
   Device device(/*device_index=*/0);
   device.set_device();
   device.init_device_context();
+  std::unique_ptr<Stream> compute_stream = device.get_stream_from_pool();
+  auto compute_guard = compute_stream->set_stream_guard();
   const torch::TensorOptions host_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
   const torch::TensorOptions device_options =
@@ -145,7 +162,6 @@ TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
                           {{KVCacheTensorRole::KEY, std::move(blocks)}}});
   }
   HostKVLayout layout(/*num_layers=*/4, {std::move(group)}, device.unwrap());
-  std::unique_ptr<Stream> compute_stream = device.current_stream();
   BasicHostKVTransfer transfer(std::move(layout),
                                device,
                                *compute_stream,
@@ -153,17 +169,32 @@ TEST(BasicHostKVTransferTest, RoundTripUsesConfiguredLayerEventGroups) {
 
   const HostKVRequest offload_request{{HostKVMapping{5, 0, 0}}};
   ASSERT_TRUE(transfer.offload(offload_request));
+  for (int64_t layer_index = 0; layer_index < 4; ++layer_index) {
+    const torch::Tensor expected =
+        torch::full({2}, 10.0 + static_cast<double>(layer_index), host_options);
+    EXPECT_TRUE(torch::equal(host_key[0][layer_index], expected));
+  }
   const HostKVRequest load_request{{HostKVMapping{5, 0, 1}}};
   HostKVLoadHandle handle = transfer.prepare_load();
+  handle.producer_ready = compute_stream->record_event();
+  ASSERT_NE(handle.producer_ready, nullptr);
   ASSERT_NE(handle.synchronizer, nullptr);
   EXPECT_EQ(handle.synchronizer->size(), 2U);
   EXPECT_EQ(handle.layers_per_event, 2U);
   ASSERT_TRUE(transfer.load(load_request, handle));
-  ASSERT_TRUE(handle.synchronizer->synchronize_layer(/*layer_index=*/0));
-  ASSERT_TRUE(handle.synchronizer->synchronize_layer(/*layer_index=*/1));
-
-  for (const torch::Tensor& blocks : device_layers) {
-    EXPECT_TRUE(torch::equal(blocks[0], blocks[1]));
+  {
+    auto consumer = device.get_stream_from_pool();
+    auto consumer_guard = consumer->set_stream_guard();
+    for (int64_t layer_index = 0; layer_index < 4; ++layer_index) {
+      if (layer_index % handle.layers_per_event == 0) {
+        ASSERT_TRUE(handle.synchronizer->wait_layer_on_current_stream(
+            layer_index / handle.layers_per_event));
+      }
+      const torch::Tensor copied = device_layers[layer_index][1] * 2.0;
+      const torch::Tensor expected = torch::full(
+          {2}, 2.0 * (10.0 + static_cast<double>(layer_index)), host_options);
+      EXPECT_TRUE(torch::equal(copied.cpu(), expected));
+    }
   }
   transfer.drain();
   transfer.drain();

@@ -264,8 +264,8 @@ class WorkerImpl {
       const uint64_t batch_id,
       Slice<BlockTransferInfo>& block_transfer_info);
 
-  std::shared_ptr<HierarchyKVCacheTransfer>
-  create_hierarchy_kv_cache_transfer();
+  std::shared_ptr<HierarchyKVCacheTransfer> create_hierarchy_kv_cache_transfer(
+      std::optional<bool> enable_task_pipeline = std::nullopt);
 
   void bind_hierarchy_kv_cache_transfer(
       std::shared_ptr<HierarchyKVCacheTransfer> transfer,

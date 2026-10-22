@@ -858,10 +858,18 @@ class SpeculativePipelineTest : public ::testing::Test {
     ModelConfig::get_instance().model_impl(previous_model_impl_);
   }
 
-  void create(TaskKVPush target_push = {}, TaskKVPush draft_push = {}) {
+  void create(TaskKVPush target_push = {},
+              TaskKVPush draft_push = {},
+              TaskKVLoad load_kv = {},
+              TaskKVFence fence_kv = {}) {
     const Status status = TaskExecutionPipeline::create(
         state_thread_,
-        {*target_, *target_executor_, target_cache_, std::move(target_push)},
+        {*target_,
+         *target_executor_,
+         target_cache_,
+         std::move(target_push),
+         std::move(load_kv),
+         std::move(fence_kv)},
         {*draft_, *draft_executor_, draft_cache_, std::move(draft_push)},
         capacity_,
         pipeline_);
@@ -1085,6 +1093,165 @@ class SpeculativePipelineTest : public ::testing::Test {
   SpeculativeTaskCapacity capacity_;
   std::unique_ptr<TaskExecutionPipeline> pipeline_;
 };
+
+TEST_F(SpeculativePipelineTest, HostReloadWaitsForTargetAndDraftBeforeForward) {
+  auto load = create_layer_synchronizer(/*num_layers=*/2);
+  ASSERT_NE(load, nullptr);
+  std::atomic<uint32_t> forwarded{0};
+  target_->after_forward = [&] {
+    EXPECT_EQ(target_cache_.front().get_k_cache()[0].cpu().sum().item<float>(),
+              16.0F * 11.0F);
+    EXPECT_EQ(draft_cache_.front().get_k_cache()[0].cpu().sum().item<float>(),
+              16.0F * 23.0F);
+    ++forwarded;
+  };
+  create({}, {}, [load](uint64_t batch_id) {
+    EXPECT_EQ(batch_id, 101U);
+    return HostKVLoadHandle{load, /*layers_per_event=*/1};
+  });
+  auto source = input(false);
+  source.input_params.meta.batch_id = 101;
+  const TaskSubmission submitted = pipeline_->submit(source);
+  ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+
+  Stream copy_stream(target_->device());
+  const auto host_options =
+      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+  torch::Tensor target_host = torch::full({16, 1, 1}, 11.0, host_options);
+  torch::Tensor draft_host = torch::full({16, 1, 1}, 23.0, host_options);
+  {
+    auto guard = copy_stream.set_stream_guard();
+    target_cache_.front().get_k_cache()[0].copy_(target_host,
+                                                 /*non_blocking=*/true);
+  }
+  ASSERT_TRUE(load->record_stream(/*layer_index=*/0, &copy_stream));
+  EXPECT_EQ(forwarded.load(), 0U);
+  {
+    auto guard = copy_stream.set_stream_guard();
+    draft_cache_.front().get_k_cache()[0].copy_(draft_host,
+                                                /*non_blocking=*/true);
+  }
+  ASSERT_TRUE(load->record_stream(/*layer_index=*/1, &copy_stream));
+  const auto result = pipeline_->take_result_async(submitted.task_id).get();
+  EXPECT_TRUE(result.status.ok());
+  EXPECT_EQ(forwarded.load(), 1U);
+}
+
+TEST_F(SpeculativePipelineTest,
+       KvOffloadFenceWaitsForBothLaunchesWithoutRetiringSlots) {
+  capacity_.common.slot_count = 2;
+  Stream hierarchy_stream(target_->device());
+  std::promise<void> first_forward;
+  auto first_forward_ready = first_forward.get_future();
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::atomic<uint32_t> forwarded{0};
+  target_->after_forward = [&] {
+    const uint32_t index = ++forwarded;
+    target_cache_.front().get_k_cache().fill_(static_cast<double>(index));
+    if (index == 1) {
+      first_forward.set_value();
+      released.wait();
+    }
+  };
+  create({}, {}, {}, [&](const Stream& producer) {
+    hierarchy_stream.wait_stream(producer);
+  });
+  auto first = input(false);
+  const TaskSubmission first_task = pipeline_->submit(first);
+  ASSERT_TRUE(first_task.status.ok()) << first_task.status.message();
+  EXPECT_EQ(first_forward_ready.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  auto second = input(false);
+  second.input_params.embedding.embedding_ids = {2};
+  second.input_params.embedding.request_ids = {"second-request"};
+  const TaskSubmission second_task = pipeline_->submit(second);
+  EXPECT_TRUE(second_task.status.ok()) << second_task.status.message();
+  auto fence =
+      std::async(std::launch::async, [&] { pipeline_->fence_kv_cache(); });
+  EXPECT_EQ(fence.wait_for(std::chrono::milliseconds(20)),
+            std::future_status::timeout);
+  release.set_value();
+  fence.get();
+  {
+    // This is the hierarchy D2H consumer: it must see the second task's KV.
+    auto guard = hierarchy_stream.set_stream_guard();
+    EXPECT_EQ(target_cache_.front().get_k_cache().cpu().sum().item<float>(),
+              2.0F * 4.0F * 16.0F);
+  }
+  EXPECT_EQ(pipeline_->submit(input(false)).status.code(),
+            StatusCode::RESOURCE_EXHAUSTED);
+  EXPECT_TRUE(
+      pipeline_->take_result_async(first_task.task_id).get().status.ok());
+  EXPECT_TRUE(
+      pipeline_->take_result_async(second_task.task_id).get().status.ok());
+}
+
+TEST_F(SpeculativePipelineTest, OrdinaryTaskRetainsItsExternalHostReload) {
+  auto load = create_layer_synchronizer(/*num_layers=*/1);
+  ASSERT_NE(load, nullptr);
+  std::weak_ptr<LayerSynchronizer> retained = load;
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  {*target_, *target_executor_, target_cache_},
+                  capacity_.common,
+                  pipeline_)
+                  .ok());
+  std::atomic<uint32_t> forwarded{0};
+  target_->after_forward = [&] { ++forwarded; };
+  auto source = input(false);
+  source.input_params.embedding = {};
+  source.input_params.parallel.layer_wise_load_synchronizer = load;
+  const TaskSubmission submitted = pipeline_->submit(source);
+  ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+  source.input_params.parallel.layer_wise_load_synchronizer.reset();
+  EXPECT_FALSE(retained.expired());
+  EXPECT_EQ(forwarded.load(), 0U);
+  Stream copy_stream(target_->device());
+  ASSERT_TRUE(load->record_stream(/*layer_index=*/0, &copy_stream));
+  load.reset();
+  EXPECT_TRUE(
+      pipeline_->take_result_async(submitted.task_id).get().status.ok());
+  EXPECT_EQ(forwarded.load(), 1U);
+  EXPECT_TRUE(retained.expired());
+}
+
+TEST_F(SpeculativePipelineTest, HostReloadHandleFollowsAdmissionAndRetirement) {
+  auto load = create_layer_synchronizer(/*num_layers=*/1);
+  ASSERT_NE(load, nullptr);
+  Stream copy_stream(target_->device());
+  ASSERT_TRUE(load->record_stream(/*layer_index=*/0, &copy_stream));
+  std::weak_ptr<LayerSynchronizer> retained = load;
+  auto producer_ready = copy_stream.record_event();
+  std::weak_ptr<StreamEvent> retained_producer = producer_ready;
+  std::atomic<uint32_t> loads{0};
+  create({}, {}, [&](uint64_t) -> std::optional<HostKVLoadHandle> {
+    ++loads;
+    if (load == nullptr) {
+      return std::nullopt;
+    }
+    return HostKVLoadHandle{std::exchange(load, nullptr),
+                            /*layers_per_event=*/1,
+                            std::nullopt,
+                            std::exchange(producer_ready, nullptr)};
+  });
+  auto source = input(false);
+  source.input_params.prefill_without_cache = true;
+  EXPECT_FALSE(pipeline_->submit(source).status.ok());
+  EXPECT_EQ(loads.load(), 0U);
+  source.input_params.prefill_without_cache = false;
+  const TaskSubmission submitted = pipeline_->submit(source);
+  ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+  EXPECT_EQ(loads.load(), 1U);
+  EXPECT_FALSE(retained.expired());
+  EXPECT_FALSE(retained_producer.expired());
+  EXPECT_TRUE(
+      pipeline_->take_result_async(submitted.task_id).get().status.ok());
+  EXPECT_TRUE(retained.expired());
+  EXPECT_TRUE(retained_producer.expired());
+  EXPECT_TRUE(execute(input(false)).sample_output.next_tokens.defined());
+  EXPECT_EQ(loads.load(), 2U);
+}
 
 class PipelineExecutionMemoryTest : public SpeculativePipelineTest {
  protected:
@@ -3787,6 +3954,38 @@ TEST_F(SpeculativePipelineTest,
   EXPECT_TRUE(released->load());
   EXPECT_TRUE(torch::equal(result.output.sample_output.next_tokens.cpu(),
                            torch::tensor({2, 3}, torch::kInt32)));
+  pipeline_.reset();
+}
+
+TEST_F(SpeculativePipelineTest, WorkerReloadLookupUsesUnpackedBatchIdentity) {
+  PreparedTestWorker worker(device_);
+  worker.with_contiguous_input();
+  std::atomic<uint64_t> restored_batch{0};
+  TaskKVLoad load = [&](uint64_t batch_id) -> std::optional<HostKVLoadHandle> {
+    restored_batch.store(batch_id);
+    return std::nullopt;
+  };
+  ASSERT_TRUE(
+      TaskExecutionPipeline::create(
+          state_thread_,
+          {*target_, *target_executor_, target_cache_, {}, std::move(load)},
+          worker,
+          capacity_.common,
+          pipeline_)
+          .ok());
+  auto original = input(false);
+  original.input_params.meta.batch_id = 777;
+  proto::PackedForwardInput payload;
+  ASSERT_TRUE(original.to_packed_proto(&payload));
+  LlmForwardInput packed;
+  ASSERT_TRUE(packed.from_packed_proto(payload));
+  packed.input_params.meta.batch_id = 0;
+  const TaskSubmission submitted = pipeline_->submit(packed);
+  worker.release();
+  ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+  EXPECT_EQ(restored_batch.load(), 777U);
+  EXPECT_TRUE(
+      pipeline_->take_result_async(submitted.task_id).get().status.ok());
   pipeline_.reset();
 }
 

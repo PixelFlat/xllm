@@ -104,8 +104,9 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   std::vector<bool> storage_prefetch_disabled_;
 
   // Per-DP H2D descriptions waiting to be registered with workers. Blocks stay
-  // owned only by the Sequence's Host/device cache states.
+  // pinned by the sequence and then its batch's restore lease.
   std::vector<std::vector<BlockTransferInfo>> load_block_transfer_infos_;
+  std::vector<std::weak_ptr<KVCacheBlockLease>> host_restore_leases_;
   std::vector<OffloadBlockPairQueue> offload_block_pair_queues_;
 
   // Guards the destruction-time invariant for asynchronous prefetch callbacks.

@@ -72,8 +72,12 @@ CompactLoadExecutor::~CompactLoadExecutor() { drain(); }
 
 bool CompactLoadExecutor::execute(
     const HostKVRequest& request,
-    const std::shared_ptr<LayerSynchronizer>& synchronizer) {
+    const std::shared_ptr<LayerSynchronizer>& synchronizer,
+    const StreamEventPtr& producer_ready) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!copy_stream_->wait_event(producer_ready)) {
+    return false;
+  }
   const GroupedHostKVMappings mappings_by_group =
       group_mappings(request.target_mappings);
   for (size_t range_index = 0; range_index < ranges_.size(); ++range_index) {

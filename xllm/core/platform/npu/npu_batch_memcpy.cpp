@@ -72,13 +72,19 @@ bool NPUBatchMemcpy::copy(const std::vector<torch::Tensor>& src_tensors,
 
   c10::StreamGuard guard = stream->set_stream_guard();
 
+  // aclrtMemcpyBatch is synchronous and does not enqueue onto this stream.
+  // Finish its producer dependencies before reading or replacing device KV.
+  if (stream->synchronize() != 0) {
+    LOG(ERROR) << "BatchMemcpy producer stream synchronize timeout.";
+    return false;
+  }
+
   aclrtMemcpyBatchAttr attrs[1] = {attr};
   size_t attrs_indexes[1] = {0};
 
   // aclrtMemcpyBatch caps a single call at kMaxBatchCopyCount descriptors, so a
   // large transfer (e.g. a many-block prefix reload) is split into fixed-size
-  // chunks issued onto the same stream in order. The stream is synchronized
-  // once after all chunks are enqueued rather than per chunk.
+  // chunks after the stream dependencies have completed.
   std::vector<void*> srcs;
   std::vector<void*> dsts;
   std::vector<size_t> sizes;

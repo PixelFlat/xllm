@@ -26,11 +26,15 @@ namespace xllm {
 class Device;
 class LayerSynchronizer;
 class Stream;
+class StreamEvent;
 
 struct HostKVLoadHandle {
   std::shared_ptr<LayerSynchronizer> synchronizer;
   uint32_t layers_per_event = 1;
   std::optional<uint32_t> draft_event_index;
+  // Snapshot of preceding model work, before this load is registered. Keep it
+  // alive through the consumer task so reused HBM destinations are safe.
+  std::shared_ptr<StreamEvent> producer_ready;
 };
 
 enum class HostKVTransferMode : uint8_t {

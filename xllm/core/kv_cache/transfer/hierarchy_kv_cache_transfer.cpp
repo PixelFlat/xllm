@@ -467,6 +467,15 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
           host_kv_transfer_->prepare_load(!request.draft_mappings.empty());
       CHECK(handle.synchronizer != nullptr)
           << "Failed to create Host KV load synchronizer.";
+      if (options_.enable_task_pipeline()) {
+        // Worker fences the pipeline before registration. Snapshot that
+        // producer now; waiting on a later producer could include the very
+        // task that is waiting for this load and form a stream cycle.
+        handle.producer_ready =
+            cache_domains_.front().producer_stream->record_event();
+        CHECK(handle.producer_ready != nullptr)
+            << "Failed to snapshot Host KV reload producer.";
+      }
       {
         std::lock_guard<std::mutex> lock(mutex_);
         auto existing = load_handles_.find(batch_id);
@@ -478,8 +487,13 @@ uint32_t HierarchyKVCacheTransfer::transfer_kv_blocks(
         load_handles_[batch_id] = handle;
       }
       load_threadpool_->schedule(
-          [this, request = std::move(request), handle]() mutable {
-            load_from_host(request, handle);
+          [this, batch_id, request = std::move(request), handle]() mutable {
+            const bool submitted = load_from_host(request, handle);
+            VLOG(1) << "[HostKV][ReloadSubmit] batch_id=" << batch_id
+                    << ", target_mappings=" << request.target_mappings.size()
+                    << ", draft_mappings=" << request.draft_mappings.size()
+                    << ", events=" << handle.synchronizer->size()
+                    << ", success=" << submitted;
           });
       return static_cast<uint32_t>(block_transfer_info.size());
     }
@@ -560,6 +574,9 @@ uint32_t HierarchyKVCacheTransfer::offload(
     LOG(ERROR) << "Offload to Host cache failed.";
     return 0;
   }
+  VLOG(1) << "[HostKV][OffloadComplete] blocks=" << block_transfer_info.size()
+          << ", target_mappings=" << request.target_mappings.size()
+          << ", draft_mappings=" << request.draft_mappings.size();
   if (kv_cache_store_ != nullptr) {
     const uint32_t put_count = kv_cache_store_->batch_put(block_transfer_info);
     if (put_count != block_transfer_info.size()) {

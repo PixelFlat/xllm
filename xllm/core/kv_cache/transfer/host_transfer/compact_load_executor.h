@@ -50,7 +50,8 @@ class CompactLoadExecutor final {
   CompactLoadExecutor& operator=(const CompactLoadExecutor&) = delete;
 
   bool execute(const HostKVRequest& request,
-               const std::shared_ptr<LayerSynchronizer>& synchronizer);
+               const std::shared_ptr<LayerSynchronizer>& synchronizer,
+               const StreamEventPtr& producer_ready = nullptr);
   uint32_t event_count() const;
   uint32_t layers_per_event() const;
   void drain();

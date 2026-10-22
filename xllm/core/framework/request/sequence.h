@@ -445,6 +445,13 @@ class Sequence {
     return effective_restore_tokens_.has_value();
   }
   size_t host_cache_copy_units() const { return host_cache_copy_units_; }
+  // Scheduler-owned H2D aliases move to the batch before transfer submission.
+  std::shared_ptr<KVCacheBlockLease> retain_host_restore_blocks(
+      std::vector<Block> blocks);
+  std::shared_ptr<KVCacheBlockLease> take_host_restore_blocks();
+  // Keep transfer retirement outside the manager-deallocate/reset window.
+  std::vector<std::shared_ptr<KVCacheBlockLeaseOwner>> host_restore_owners()
+      const;
 
   // for generated tokens
   float get_acc_logprob();
@@ -581,6 +588,8 @@ class Sequence {
 
   std::optional<size_t> effective_restore_tokens_;
   size_t host_cache_copy_units_ = 0;
+  std::shared_ptr<KVCacheBlockLease> pending_host_restore_;
+  std::vector<std::shared_ptr<KVCacheBlockLeaseOwner>> host_restore_owners_;
 
   // Held by value: it is always present after construction, so a unique_ptr
   // only added a heap allocation per sequence and an indirection on the

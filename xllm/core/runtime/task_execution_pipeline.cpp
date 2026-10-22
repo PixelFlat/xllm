@@ -44,12 +44,16 @@ TaskExecutionPipeline::TaskExecutionPipeline(ThreadPool& state_executor,
                                              std::vector<KVCache>& kv_caches,
                                              LlmTaskCapacity capacity,
                                              TaskKVPush push_kv,
+                                             TaskKVLoad load_kv,
+                                             TaskKVFence fence_kv,
                                              WorkerImpl* worker_pipeline)
     : worker_pipeline_(worker_pipeline),
       model_(model),
       executor_(executor),
       kv_caches_(kv_caches),
       push_kv_(std::move(push_kv)),
+      load_kv_(std::move(load_kv)),
+      fence_kv_(std::move(fence_kv)),
       capacity_(std::move(capacity)),
       device_(model.device()),
       prepare_stream_(device_.unwrap()),
@@ -106,7 +110,9 @@ Status TaskExecutionPipeline::create(
                                 executor,
                                 resources.kv_caches,
                                 capacity,
-                                std::move(resources.push_kv)));
+                                std::move(resources.push_kv),
+                                std::move(resources.load_kv),
+                                std::move(resources.fence_kv)));
   pipeline->graph_batch_sizes_ = graph_batch_sizes(capacity);
   pipeline->captured_graph_batch_sizes_.reserve(
       pipeline->graph_batch_sizes_.size());
@@ -171,6 +177,8 @@ Status TaskExecutionPipeline::create(
                                 target.kv_caches,
                                 capacity,
                                 std::move(target.push_kv),
+                                std::move(target.load_kv),
+                                std::move(target.fence_kv),
                                 &worker));
   pipeline->slots_.reserve(capacity.slot_count);
   for (uint32_t slot_id = 0; slot_id < capacity.slot_count; ++slot_id) {
@@ -221,7 +229,6 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
       embedding.input_embedding.defined() || !copy.swap_blocks.empty() ||
       copy.src_block_indices.defined() || copy.dst_block_indices.defined() ||
       copy.cum_sum.defined() || params.parallel.cp_plan.enabled() ||
-      params.parallel.layer_wise_load_synchronizer != nullptr ||
       params.expert.expert_load_data.defined() ||
       params.expert.expert_array.defined() ||
       params.expert.eplb_decode_token_mask.defined() ||
@@ -472,6 +479,27 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
           promise.setValue(TaskSubmission{std::move(status), 0});
           return;
         }
+        auto& kv_load = slots_[slot_id]->kv_load;
+        const LlmModelParams& prepared_params =
+            worker_pipeline_ != nullptr
+                ? slots_[slot_id]->worker_input.input_params
+                : source->input_params;
+        kv_load.reset();
+        if (prepared_params.parallel.layer_wise_load_synchronizer != nullptr) {
+          kv_load = HostKVLoadHandle{
+              prepared_params.parallel.layer_wise_load_synchronizer,
+              prepared_params.parallel.layers_per_event,
+              prepared_params.parallel.draft_load_event_index};
+        }
+        if (load_kv_) {
+          auto registered_load = load_kv_(prepared_params.meta.batch_id);
+          CHECK(!kv_load.has_value() || !registered_load.has_value())
+              << "Task has two Host KV reload handles.";
+          if (registered_load.has_value()) {
+            CHECK(registered_load->synchronizer != nullptr);
+            kv_load = std::move(registered_load);
+          }
+        }
         slots_[slot_id]->is_warmup = source->input_params.meta.is_graph_warmup;
         const SlotTicket ticket{slot_id, next_task_id_++};
         accepted_.emplace_back(ticket);
@@ -479,6 +507,30 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
         promise.setValue(TaskSubmission{Status(), ticket.task_id});
       });
   return std::move(future).get();
+}
+
+void TaskExecutionPipeline::fence_kv_cache() {
+  check_external_thread();
+  CHECK(worker_pipeline_ != nullptr || fence_kv_);
+  folly::Promise<folly::Unit> promise;
+  auto future = promise.getFuture();
+  state_executor_.schedule([this, promise = std::move(promise)]() mutable {
+    const uint64_t previous_task_id = next_task_id_ - 1;
+    {
+      std::unique_lock<std::mutex> lock(launch_mutex_);
+      launch_cv_.wait(lock, [this, previous_task_id] {
+        return launched_task_id_ >= previous_task_id;
+      });
+    }
+    c10::DeviceGuard device_guard(device_.unwrap());
+    // Worker-owned execution already submits to the hierarchy compute stream.
+    // Prepared ordinary/MTP execution uses this pipeline's task stream.
+    if (worker_pipeline_ == nullptr) {
+      fence_kv_(task_stream_);
+    }
+    promise.setValue(folly::unit);
+  });
+  std::move(future).get();
 }
 
 folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
@@ -509,6 +561,7 @@ folly::Future<TaskResult> TaskExecutionPipeline::take_result_impl(
     }
     const SlotTicket ticket = wait_completed_front();
     auto output = consume(ticket.slot_id);
+    slots_[ticket.slot_id]->kv_load.reset();
     accepted_.pop_front();
     promise.setValue(TaskResult{Status(), std::move(output), ticket.task_id});
   });
@@ -533,6 +586,11 @@ void TaskExecutionPipeline::launch_loop() {
     }
     launch(ticket.slot_id);
     observe_execution_memory(ticket.slot_id);
+    {
+      std::lock_guard<std::mutex> lock(launch_mutex_);
+      launched_task_id_ = ticket.task_id;
+    }
+    launch_cv_.notify_all();
     // The completion queue covers every Slot, including unrequested results.
     completed_.push(ticket);
   }
@@ -572,6 +630,7 @@ TaskExecutionPipeline::~TaskExecutionPipeline() {
   while (!accepted_.empty()) {
     const SlotTicket ticket = wait_completed_front();
     discard(ticket.slot_id);
+    slots_[ticket.slot_id]->kv_load.reset();
     accepted_.pop_front();
   }
   CHECK(completed_.empty());
@@ -730,9 +789,19 @@ Status TaskExecutionPipeline::prepare_worker(uint32_t slot_id,
 }
 
 void TaskExecutionPipeline::launch(uint32_t slot_id) {
+  CHECK_LT(slot_id, slots_.size());
+  Slot& slot = *slots_[slot_id];
   if (worker_pipeline_ != nullptr) {
-    CHECK_LT(slot_id, slots_.size());
-    Slot& slot = *slots_[slot_id];
+    // This mode runs on the worker's compute stream. Its Python executor (or
+    // unified MTP executor) installs the load wait on that actual consumer.
+    slot.worker_input.input_params.parallel.layer_wise_load_synchronizer =
+        slot.kv_load.has_value() ? slot.kv_load->synchronizer : nullptr;
+    if (slot.kv_load.has_value()) {
+      slot.worker_input.input_params.parallel.layers_per_event =
+          slot.kv_load->layers_per_event;
+      slot.worker_input.input_params.parallel.draft_load_event_index =
+          slot.kv_load->draft_event_index;
+    }
     slot.worker_output =
         worker_pipeline_->execute_task_pipeline(slot.worker_input);
     if (slot.worker_output.has_value()) {
@@ -740,16 +809,32 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
     }
     return;
   }
+  if (slot.kv_load.has_value() &&
+      (speculative_capacity_ || executor_.python_impl() == nullptr ||
+       slot.buffer->tokens().numel() == 0)) {
+    c10::DeviceGuard device_guard(device_.unwrap());
+    auto guard = task_stream_.set_stream_guard();
+    // Empty ranks have no Python attention consumer to retain the dependency.
+    CHECK(slot.kv_load->synchronizer->wait_all_on_current_stream())
+        << "Task pipeline Host KV reload failed.";
+  }
   if (speculative_capacity_) {
     launch_speculative(slot_id);
     return;
   }
-  CHECK_LT(slot_id, slots_.size());
-  Slot& slot = *slots_[slot_id];
   c10::DeviceGuard device_guard(device_.unwrap());
   auto guard = task_stream_.set_stream_guard();
   CHECK(task_stream_.wait_event(slot.input_ready))
       << "Failed to wait for LLM task input.";
+  // The Python executor owns the consumer waits on this task stream. Bind a
+  // fresh handle on every Launch so a reused Slot never retains a prior batch.
+  auto& parallel = slot.buffer->model_params().parallel;
+  parallel.layer_wise_load_synchronizer =
+      slot.kv_load.has_value() ? slot.kv_load->synchronizer : nullptr;
+  parallel.layers_per_event =
+      slot.kv_load.has_value() ? slot.kv_load->layers_per_event : 1U;
+  parallel.draft_load_event_index =
+      slot.kv_load.has_value() ? slot.kv_load->draft_event_index : std::nullopt;
   CHECK_EQ(slot.step.id, published_tail_.id + 1);
   if (slot.buffer->has_previous_tokens()) {
     CHECK_EQ(slot.expected_producer.id, published_tail_.id);
@@ -864,6 +949,8 @@ void TaskExecutionPipeline::discard(uint32_t slot_id) {
 }
 
 void TaskExecutionPipeline::release_outputs(Slot& slot) {
+  slot.buffer->model_params().parallel.layer_wise_load_synchronizer.reset();
+  slot.buffer->model_params().parallel.draft_load_event_index.reset();
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   slot.buffer->model_params().parallel.layer_synchronizer.reset();
 #endif

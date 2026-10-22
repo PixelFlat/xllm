@@ -102,6 +102,37 @@ bool NPULayerSynchronizerImpl::record_event(const int64_t layer_index,
   return true;
 }
 
+bool NPULayerSynchronizerImpl::wait_layer_on_current_stream(
+    int64_t layer_index) {
+  while (!event_record_flags_[layer_index].load(std::memory_order_acquire)) {
+    if (aborted_.load(std::memory_order_acquire)) {
+      return false;
+    }
+  }
+  if (aborted_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+  const aclError query_ret =
+      aclrtQueryEventStatus(events_[layer_index], &status);
+  if (query_ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Host KV load event query failed: " << query_ret;
+    return false;
+  }
+  // Completed copies need no new dependency. Avoid draining Torch's pending
+  // operator submissions just to enqueue a redundant native stream wait.
+  if (status == ACL_EVENT_RECORDED_STATUS_COMPLETE) {
+    return true;
+  }
+  const aclError ret = aclrtStreamWaitEvent(
+      c10_npu::getCurrentNPUStream().stream(), events_[layer_index]);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "Host KV consumer stream wait failed: " << ret;
+    return false;
+  }
+  return true;
+}
+
 void NPULayerSynchronizerImpl::abort() {
   // Set aborted_ before raising the flags so any thread released from the spin
   // observes the abort and reports failure rather than syncing a stale event.

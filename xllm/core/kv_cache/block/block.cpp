@@ -20,10 +20,34 @@ limitations under the License.
 #include <string.h>
 
 #include <cstdint>
+#include <utility>
 
 #include "core/kv_cache/block/block_manager.h"
 
 namespace xllm {
+KVCacheBlockLease::KVCacheBlockLease(std::vector<Block> blocks)
+    : blocks_(std::move(blocks)),
+      owner_(std::make_shared<KVCacheBlockLeaseOwner>()) {}
+
+KVCacheBlockLease::~KVCacheBlockLease() {
+  auto lock = owner_->lock();
+  if (owner_->released()) {
+    for (Block& block : blocks_) {
+      Block retained = std::move(block);
+      if (retained.manager() != nullptr) {
+        // Sequence deallocation may have seen an extra transfer alias and kept
+        // a cached block logically in use. Recheck after the owner has gone.
+        retained.manager()->deallocate(Slice<Block>(&retained, /*size=*/1));
+      }
+    }
+  }
+  // Drop aliases before releasing the owner lock, including when the owner
+  // remains active. Its deallocator must observe the final reference count.
+  blocks_.clear();
+}
+
+void KVCacheBlockLease::release_owner() { owner_->release(); }
+
 Block::Block(int32_t id, BlockManager* manager)
     : id_(id), ref_count_(new std::atomic<uint32_t>(1)), manager_(manager) {
   // get the block size from the manager

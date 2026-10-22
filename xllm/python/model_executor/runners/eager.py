@@ -22,6 +22,7 @@ from xllm.python.model_executor.cp_utils import build_cp_context
 from xllm.python.model_executor.forward_context import (
     EplbRuntimeState,
     ForwardContext,
+    KVLoadContext,
     LayerSynchronizer,
     forward_context,
 )
@@ -66,6 +67,7 @@ class EagerRunner(BaseRunner):
         mtp_topk_indices: torch.Tensor | None = None,
         *,
         eplb: EplbRuntimeState | None = None,
+        kv_load: KVLoadContext | None = None,
     ) -> ModelExecutionOutput:
         cp_context = None
         is_mla = self.attention_backend.is_mla
@@ -126,13 +128,18 @@ class EagerRunner(BaseRunner):
                 layer_shared_cache=execution_contexts,
                 cp_context=cp_context,
                 eplb=eplb,
+                kv_load=kv_load,
             )
         ):
             if mtp_topk_indices is not None:
-                return self.model(input_ids, positions, input_embedding, mtp_topk_indices)
+                output = self.model(input_ids, positions, input_embedding, mtp_topk_indices)
             # Draft-MTP steps carry the target's (or previous draft step's)
             # hidden state as input_embedding; the MTP body fuses it with the
             # token embedding. Regular steps take the 2-arg path.
-            if input_embedding is None:
-                return self.model(input_ids, positions)
-            return self.model(input_ids, positions, input_embedding)
+            elif input_embedding is None:
+                output = self.model(input_ids, positions)
+            else:
+                output = self.model(input_ids, positions, input_embedding)
+            if kv_load is not None:
+                kv_load.check_consumed()
+            return output

@@ -284,7 +284,7 @@ def test_metadata_reuse_keeps_dp_admission_errors(runner: DecodeAclGraphRunner) 
 
     metadata.dp_execution_token_counts = (2, 2)
     metadata.kv_seq_lens_host_values = [2]
-    with pytest.raises(RuntimeError, match="one value per metadata row"):
+    with pytest.raises(RuntimeError, match="one value per metadata row|row count does not match KV lengths"):
         runner.prepare_execution(input_ids, metadata)
 
 
@@ -331,15 +331,18 @@ def test_metadata_reuse_preserves_kpool_span_graph_variants(runner: DecodeAclGra
     assert runner._capture.call_count == 2
 
 
-def test_metadata_reuse_preserves_expanded_verify_rows_and_query_groups(runner: DecodeAclGraphRunner) -> None:
+@pytest.mark.parametrize("query_ends", ([0, 1, 2, 3, 4], [1, 2, 3, 4], [0, 2, 4], [2, 4], None))
+def test_metadata_reuse_preserves_expanded_verify_rows_and_query_groups(
+    runner: DecodeAclGraphRunner, query_ends: list[int] | None
+) -> None:
     runner.attention_backend.supports_linear_spec_verify_graph = True
     input_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
     metadata = _metadata()
     metadata.is_chunked_prefill = True
     metadata.slot_mapping = torch.arange(4, dtype=torch.int32)
     metadata.q_seq_lens_host = torch.tensor([2, 2], dtype=torch.int32)
-    metadata.q_cu_seq_lens = torch.arange(5, dtype=torch.int32)
-    metadata.q_cu_seq_lens_host_values = list(range(5))
+    metadata.q_cu_seq_lens = torch.tensor(query_ends, dtype=torch.int32) if query_ends is not None else None
+    metadata.q_cu_seq_lens_host_values = query_ends
     metadata.expanded_decode_metadata = SimpleNamespace(
         enabled=True,
         block_table=torch.tensor([[11, 0], [11, 0], [21, 22], [21, 22]], dtype=torch.int32),
@@ -363,9 +366,47 @@ def test_metadata_reuse_preserves_expanded_verify_rows_and_query_groups(runner: 
             assert static_metadata.kv_seq_lens_host_values == [1, 2, 4, 5]
             assert static_metadata.q_seq_lens_host.tolist() == [2, 2]
             assert static_metadata.q_cu_seq_lens_host_values == list(range(5))
+            torch.testing.assert_close(static_metadata.q_cu_seq_lens, torch.arange(5, dtype=torch.int32))
             torch.testing.assert_close(
                 static_metadata.block_table[:, :2], metadata.expanded_decode_metadata.block_table
             )
 
     assert decode.call_count == 2
+    runner._capture.assert_called_once()
+
+
+def test_expanded_query_row_offsets_survive_padding_and_bucket_reuse(runner: DecodeAclGraphRunner) -> None:
+    runner.attention_backend.supports_linear_spec_verify_graph = True
+    for rows in (6, 8, 6):
+        groups = rows // 2
+        input_ids = torch.arange(rows, dtype=torch.int32)
+        metadata = _metadata()
+        metadata.is_chunked_prefill = True
+        metadata.slot_mapping = torch.arange(rows, dtype=torch.int32)
+        metadata.linear_state_indices = torch.arange(groups, dtype=torch.int32)
+        metadata.q_seq_lens_host = torch.full((groups,), 2, dtype=torch.int32)
+        metadata.q_cu_seq_lens = torch.arange(0, rows + 1, 2, dtype=torch.int32)
+        metadata.q_cu_seq_lens_host_values = list(range(0, rows + 1, 2))
+        metadata.expanded_decode_metadata = SimpleNamespace(
+            enabled=True,
+            block_table=torch.full((rows, 1), 11, dtype=torch.int32),
+            kv_seq_lens=torch.ones(rows, dtype=torch.int32),
+            kv_seq_lens_host=torch.ones(rows, dtype=torch.int32),
+            kv_seq_lens_host_values=[1] * rows,
+            paged_kv_indptr=torch.arange(rows + 1, dtype=torch.int32),
+            paged_kv_indices=torch.full((rows,), 11, dtype=torch.int32),
+            paged_kv_last_page_len=torch.ones(rows, dtype=torch.int32),
+            paged_attention_tiling_data=None,
+        )
+        decoded = runner.prepare_execution(input_ids, metadata)
+        assert decoded is not None
+        graph_key = runner.warmup(input_ids, input_ids, metadata, decode_metadata=decoded)
+        runner.execute(input_ids, input_ids, metadata, graph_key=graph_key, decode_metadata=decoded)
+        entry = runner._graphs[graph_key]
+        expected = list(range(rows + 1)) + [rows] * (entry.batch_size - rows)
+        assert entry.static_metadata.q_cu_seq_lens.tolist() == expected
+        assert entry.static_metadata.q_cu_seq_lens_host_values == expected
+        assert entry.expanded_query_cu_seq_lens.tolist() == list(range(entry.batch_size + 1))
+        assert entry.static_metadata.q_seq_lens_host.tolist() == [2] * 4
+
     runner._capture.assert_called_once()

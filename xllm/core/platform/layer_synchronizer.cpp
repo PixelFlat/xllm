@@ -23,6 +23,15 @@ limitations under the License.
 
 namespace xllm {
 
+bool LayerSynchronizer::wait_all_on_current_stream() {
+  for (uint32_t index = 0; index < size(); ++index) {
+    if (!wait_layer_on_current_stream(index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 #if defined(USE_NPU) || defined(USE_MLU)
 
 #if defined(USE_NPU)
@@ -33,6 +42,10 @@ class NPULayerSynchronizerAdapter final : public LayerSynchronizer {
 
   bool synchronize_layer(int64_t layer_index) override {
     return impl_.synchronize_layer(layer_index);
+  }
+
+  bool wait_layer_on_current_stream(int64_t layer_index) override {
+    return impl_.wait_layer_on_current_stream(layer_index);
   }
 
   bool record_stream(int64_t layer_index, Stream* stream) override {
