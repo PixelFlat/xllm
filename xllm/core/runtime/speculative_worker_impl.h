@@ -48,7 +48,6 @@ void scale_speculative_parallel_token_counts(VlmModelParams& params,
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
-    const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<JsonObjectGrammarState>& json_object_states);
 
 // Base class for all speculative decoding workers.
@@ -145,13 +144,6 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const TargetInput& inputs,
                                TargetInput& validate_inputs);
-  // Per-seq variant used by adaptive-speculative pruning: each sequence's
-  // validate row width equals per_seq_val_tokens[i] (must be in [1, N+1]).
-  // The dense meta/token/position/kv-slot buffers are rebuilt as varlen with
-  // total_tokens = Σ per_seq_val_tokens.
-  void prepare_validate_inputs(const TargetInput& inputs,
-                               TargetInput& validate_inputs,
-                               const std::vector<int32_t>& per_seq_val_tokens);
 
  protected:
   // Target model worker

@@ -64,19 +64,40 @@ TEST(MtpWorkerSelectionTest, UnifiedFlagSelectsPythonMtpWorker) {
   EXPECT_FALSE(ordinary_worker.task_pipeline_uses_worker_prepare());
 }
 
+TEST(MtpWorkerSelectionTest, RejectsLegacyAdaptiveExecutionBeforeModelSetup) {
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  const torch::Device device(torch::kCPU);
+  runtime::Options options;
+  options.enable_speculative_decode(true)
+      .enable_adaptive_spec_prune(true)
+      .speculative_algorithm("DSpark")
+      .num_speculative_tokens(7);
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires DSpark Draft5/7 with task pipeline");
+  options.enable_task_pipeline(true).speculative_algorithm("MTP");
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires DSpark Draft5/7 with task pipeline");
+  options.speculative_algorithm("DSpark").num_speculative_tokens(6);
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires DSpark Draft5/7 with task pipeline");
+  options.num_speculative_tokens(5).enable_speculative_decode(false);
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires DSpark Draft5/7 with task pipeline");
+}
+
 TEST(MtpWorkerSelectionTest, RequestRoutingDoesNotRejectUnsupportedSampling) {
   LlmForwardInput input;
   input.sampling_params.sampling_mode = SamplingMode::GREEDY;
-  EXPECT_TRUE(supports_unified_mtp_request(input, false));
+  EXPECT_TRUE(supports_unified_mtp_request(input));
   input.sampling_params.logprobs = true;
   input.sampling_params.max_top_logprobs = 5;
-  EXPECT_TRUE(supports_unified_mtp_request(input, false));
-  EXPECT_FALSE(supports_unified_mtp_request(input, true));
+  EXPECT_TRUE(supports_unified_mtp_request(input));
   input.sampling_params.sampling_mode = SamplingMode::MIXED;
-  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  EXPECT_FALSE(supports_unified_mtp_request(input));
   input.sampling_params.sampling_mode = SamplingMode::GREEDY;
   input.sampling_params.use_beam_search = true;
-  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  EXPECT_FALSE(supports_unified_mtp_request(input));
   input.sampling_params.use_beam_search = false;
   for (torch::Tensor* control : {&input.sampling_params.temperatures,
                                  &input.sampling_params.top_k,
@@ -87,15 +108,15 @@ TEST(MtpWorkerSelectionTest, RequestRoutingDoesNotRejectUnsupportedSampling) {
                                  &input.sampling_params.filter_mask,
                                  &input.sampling_params.filter_bitmask}) {
     *control = torch::ones({1});
-    EXPECT_FALSE(supports_unified_mtp_request(input, false));
+    EXPECT_FALSE(supports_unified_mtp_request(input));
     *control = torch::Tensor();
   }
   input.json_object_states.emplace_back();
-  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  EXPECT_FALSE(supports_unified_mtp_request(input));
   input.json_object_states.clear();
   input.input_params.multi_block_tables.emplace_back(
       torch::zeros({1, 1}, torch::kInt));
-  EXPECT_FALSE(supports_unified_mtp_request(input, false));
+  EXPECT_FALSE(supports_unified_mtp_request(input));
 }
 
 class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
@@ -169,21 +190,9 @@ class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
                              std::vector<EmbeddingCache::DecodeState>(1));
   }
 
-  LlmForwardInput build_verify(const LlmForwardInput& input, bool adaptive) {
+  LlmForwardInput build_verify(const LlmForwardInput& input) {
     LlmForwardInput verify_input;
-    if (adaptive) {
-      prepare_validate_inputs(input, verify_input, std::vector<int32_t>{2});
-    } else {
-      prepare_validate_inputs(input, verify_input);
-    }
-    CHECK_EQ(prepare_stream_->synchronize(), 0);
-    return verify_input;
-  }
-
-  LlmForwardInput build_verify(const LlmForwardInput& input,
-                               const std::vector<int32_t>& verify_widths) {
-    LlmForwardInput verify_input;
-    prepare_validate_inputs(input, verify_input, verify_widths);
+    prepare_validate_inputs(input, verify_input);
     CHECK_EQ(prepare_stream_->synchronize(), 0);
     return verify_input;
   }
@@ -308,7 +317,7 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
     return input;
   }
 
-  void check_verify_across_logical_page(bool adaptive) {
+  void check_verify_across_logical_page() {
     DecodeMetadataTestWorker worker(
         parallel_args(), torch::Device("npu:0"), options());
     const int32_t page_size = GetParam() == 1 ? 128 : 256;
@@ -316,7 +325,7 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
         make_input(page_size - 1, torch::tensor({{10, 11}}, torch::kInt));
     worker.resolve_decode_context(input);
     ASSERT_EQ(input.positions_host.item<int32_t>(), page_size - 1);
-    const LlmForwardInput verify_input = worker.build_verify(input, adaptive);
+    const LlmForwardInput verify_input = worker.build_verify(input);
     const auto& params = verify_input.input_params;
 
     EXPECT_TRUE(
@@ -335,7 +344,7 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
                              torch::tensor({page_size, 1}, torch::kInt)));
   }
 
-  void check_linear_state_rows(bool adaptive) {
+  void check_linear_state_rows() {
     DecodeMetadataTestWorker worker(
         parallel_args(), torch::Device("npu:0"), options());
     LlmForwardInput input;
@@ -354,12 +363,8 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
     input.input_params.embedding.linear_state_indices =
         torch::tensor({7, -1}, torch::kInt).to(torch::Device("npu:0"));
 
-    const LlmForwardInput verify_input =
-        adaptive ? worker.build_verify(input, std::vector<int32_t>{1, 2})
-                 : worker.build_verify(input, /*adaptive=*/false);
-    const torch::Tensor expected =
-        adaptive ? torch::tensor({7, -1, -1}, torch::kInt)
-                 : torch::tensor({7, 7, -1, -1}, torch::kInt);
+    const LlmForwardInput verify_input = worker.build_verify(input);
+    const torch::Tensor expected = torch::tensor({7, 7, -1, -1}, torch::kInt);
     const auto& embedding = verify_input.input_params.embedding;
     ASSERT_TRUE(embedding.linear_state_indices.defined());
     EXPECT_TRUE(torch::equal(embedding.linear_state_indices.cpu(), expected));
@@ -388,19 +393,11 @@ TEST_P(MtpDecodeMetadataTest, Keeps305TokenContextWithinAllocatedPages) {
 }
 
 TEST_P(MtpDecodeMetadataTest, BuildsFixedVerifyAcrossLogicalPage) {
-  check_verify_across_logical_page(/*adaptive=*/false);
-}
-
-TEST_P(MtpDecodeMetadataTest, BuildsAdaptiveVerifyAcrossLogicalPage) {
-  check_verify_across_logical_page(/*adaptive=*/true);
+  check_verify_across_logical_page();
 }
 
 TEST_P(MtpDecodeMetadataTest, ExpandsFixedVerifyLinearStateRows) {
-  check_linear_state_rows(/*adaptive=*/false);
-}
-
-TEST_P(MtpDecodeMetadataTest, ExpandsVariableVerifyLinearStateRows) {
-  check_linear_state_rows(/*adaptive=*/true);
+  check_linear_state_rows();
 }
 
 TEST_F(MtpDecodeMetadataTest,

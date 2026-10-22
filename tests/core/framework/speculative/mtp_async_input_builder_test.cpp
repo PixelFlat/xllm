@@ -398,17 +398,19 @@ TEST(MtpAsyncInputBuilderTest, PybindViewsPreserveGraphMetadataStorage) {
                 .cast<std::vector<int32_t>>(),
             (std::vector<int32_t>{6, 1}));
   py::object expanded_view = runner.attr("_expanded_verify_view")(py_metadata);
-  py::tuple selected =
+  py::object selected =
       runner.attr("_decode_metadata")(py_metadata, expanded_view);
 
-  EXPECT_TRUE(torch::equal(selected[0].cast<torch::Tensor>(),
+  EXPECT_TRUE(torch::equal(selected.attr("block_table").cast<torch::Tensor>(),
                            metadata->expanded_decode.block_table));
-  EXPECT_TRUE(torch::equal(selected[1].cast<torch::Tensor>(),
+  EXPECT_TRUE(torch::equal(selected.attr("kv_seq_lens").cast<torch::Tensor>(),
                            metadata->expanded_decode.kv_seq_lens));
-  EXPECT_EQ(selected[2].cast<std::vector<int32_t>>(),
-            metadata->expanded_decode.kv_seq_lens_host_vec);
-  EXPECT_TRUE(torch::equal(selected[3].cast<torch::Tensor>(),
-                           metadata->expanded_decode.paged_kv_indptr));
+  EXPECT_EQ(
+      selected.attr("kv_seq_lens_host_values").cast<std::vector<int32_t>>(),
+      metadata->expanded_decode.kv_seq_lens_host_vec);
+  EXPECT_TRUE(
+      torch::equal(selected.attr("paged_kv_indptr").cast<torch::Tensor>(),
+                   metadata->expanded_decode.paged_kv_indptr));
 
   // Sparse graph views borrow the final arena tensors without Host/CSR data.
   const torch::Tensor table = torch::tensor({{10, 11}}, torch::kInt);

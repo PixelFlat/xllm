@@ -258,10 +258,9 @@ SpeculativeWorkerImpl<TargetInput>::update_input_by_last_step_output(
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
-    const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<JsonObjectGrammarState>& json_object_states) {
-  target_output.spec_verify_layouts = make_verify_layouts(
-      val_output.next_tokens, pruned_prefix_lengths, json_object_states);
+  target_output.spec_verify_layouts =
+      make_verify_layouts(val_output.next_tokens, nullptr, json_object_states);
   // The verify output replaces sample_output wholesale, so only its own
   // embeddings need clearing.
   val_output.embeddings = torch::Tensor();
@@ -402,122 +401,6 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_work_before_execute(
                                         *prepare_stream_,
                                         /*record_ready_event=*/true,
                                         /*restore_linear_state=*/false);
-}
-
-// Per-seq adaptive validate builder: each sequence contributes
-// per_seq_val_tokens[i] rows instead of a uniform N+1. Only implements the
-// chunked-prefill (non-atb_spec_kernel) path since DFlash/DSpark require
-// --enable_chunked_prefill=true anyway.
-template <typename TargetInput>
-void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
-    const TargetInput& input,
-    TargetInput& validate_input,
-    const std::vector<int32_t>& per_seq_val_tokens) {
-  validate_input = input.to(device_, dtype_);
-  validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
-  validate_input.runtime.device_tensors_ready = false;
-  auto& input_params = validate_input.input_params;
-  torch::TensorOptions token_options = validate_input.token_ids.options();
-  torch::TensorOptions position_options = validate_input.positions.options();
-
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t num_sequences = input_params.meta.num_sequences;
-  CHECK_EQ(static_cast<int32_t>(per_seq_val_tokens.size()), num_sequences)
-      << "per_seq_val_tokens size must match num_sequences";
-  int32_t total_num_val_tokens = 0;
-  int32_t max_val_tokens = 0;
-  for (int32_t v : per_seq_val_tokens) {
-    CHECK_GE(v, 1) << "per_seq_val_tokens must be >= 1";
-    CHECK_LE(v, num_speculative_tokens + 1)
-        << "per_seq_val_tokens must be <= num_speculative_tokens + 1";
-    total_num_val_tokens += v;
-    if (v > max_val_tokens) {
-      max_val_tokens = v;
-    }
-  }
-  const int32_t block_size = options_.block_size();
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
-
-  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-  Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
-  specBuilder::DecodeBuildBuffers buf;
-  buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
-  buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  buf.out_kv_seq_lens.reserve(total_num_val_tokens);
-  buf.out_q_seq_lens.reserve(total_num_val_tokens);
-  buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
-  buf.reserve_row_buffers(static_cast<size_t>(total_num_val_tokens),
-                          row_ctx.block_table_stride);
-
-  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    int32_t kv_len =
-        specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    const int32_t seq_val_tokens =
-        per_seq_val_tokens[static_cast<size_t>(seq_id)];
-
-    for (int32_t val_idx = 0; val_idx < seq_val_tokens; ++val_idx) {
-      specBuilder::RowSpec row;
-      row.seq_id = seq_id;
-      if (val_idx == 0) {
-        row.token_id = token_ids[seq_id];
-      } else {
-        row.token_id = -val_idx;
-      }
-      row.position_offset = val_idx;
-      row.append_kv_len = true;
-      row.append_q_len_one = true;
-      row.append_block_table = true;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
-    }
-  }
-
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
-      << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
-      << "validate positions/tokens mismatch";
-
-  specBuilder::set_token_position_tensors(validate_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
-  // Match the dense (non-adaptive) validate path's DECODE-mode layout: each
-  // validate row is an independent q=1 decode step, and causal visibility
-  // across a seq's block comes from the per-row increasing kv_seq_lens (row j
-  // sees anchor_kv + j tokens), NOT from a chunked-prefill block mask. Using
-  // CHUNKED_PREFILL here (q_max_seq_len = max_val_tokens) gave the block a
-  // prefill-style mask under which col>=1 could not attend to the accepted
-  // draft tokens in col<j, so the target logits from col 1 onward diverged
-  // from the dense path and produced garbled adaptive output. Flatten to
-  // total_num_val_tokens q=1 rows exactly like the dense builder.
-  input_params.meta.num_sequences = total_num_val_tokens;
-  input_params.meta.q_max_seq_len = 1;
-  input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  specBuilder::update_input_params(input_params,
-                                   buf,
-                                   /*val_tokens_per_seq=*/1,
-                                   std::move(buf.out_q_seq_lens),
-                                   std::move(buf.out_q_cu_seq_lens),
-                                   buf.meta.kv_max_seq_len,
-                                   std::move(buf.out_kv_seq_lens),
-                                   /*update_block_tables=*/true);
-  input_params.attention.rebuild_device_buffer(device_);
-
-  expand_sampling_params_for_verify(validate_input.sampling_params,
-                                    per_seq_val_tokens,
-                                    total_num_val_tokens,
-                                    device_);
-
-  // Note: dp_global_token_nums is NOT scaled here. Under adaptive pruning each
-  // DP rank's validate token count is data-dependent, so a rank-local estimate
-  // (e.g. average width) would diverge across ranks and desync the MoE
-  // all-to-all pads. The authoritative per-rank counts are gathered over the DP
-  // group by the draft-model worker's sync_dp_global_token_nums_after_prune(),
-  // called on every DP rank right before the target validate forward.
-  validate_input.runtime.device_tensors_ready = true;
 }
 
 template <typename TargetInput>

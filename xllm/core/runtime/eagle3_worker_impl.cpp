@@ -61,8 +61,7 @@ Eagle3WorkerImpl<TargetInput>::Eagle3WorkerImpl(
                                  options,
                                  eagle3_main_options(options),
                                  eagle3_draft_options(options),
-                                 worker_type,
-                                 /*enable_adaptive_speculative_decode=*/false) {
+                                 worker_type) {
   // Context parallelism does not expose the auxiliary hidden states.
   CHECK_LE(parallel_args.cp_size(), 1)
       << "EAGLE-3 speculative decoding does not support context parallelism "

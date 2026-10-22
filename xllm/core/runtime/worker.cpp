@@ -63,6 +63,14 @@ Worker::Worker(const ParallelArgs& parallel_args,
                const runtime::Options& options,
                WorkerType worker_type)
     : enable_task_pipeline_(options.enable_task_pipeline()) {
+  CHECK(!options.enable_adaptive_spec_prune() ||
+        (options.enable_speculative_decode() && enable_task_pipeline_ &&
+         SpeculativeConfig::supports_adaptive_speculative_decode(
+             options.speculative_algorithm()) &&
+         (options.num_speculative_tokens() == 5 ||
+          options.num_speculative_tokens() == 7)))
+      << "Adaptive speculative decoding requires DSpark Draft5/7 with task "
+         "pipeline; the legacy synchronous adaptive path is not supported.";
   if (enable_task_pipeline_) {
     CHECK(ModelConfig::is_python_model_impl(
         ModelConfig::get_instance().model_impl()))
@@ -102,7 +110,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
             (!options.enable_speculative_decode() ||
              (SpeculativeConfig::is_mtp_algorithm(
                   options.speculative_algorithm()) &&
-              !options.enable_adaptive_speculative_decode())))
+              !options.enable_adaptive_spec_prune())))
           << "Task pipeline PD requires NPU PUSH, PREFILL or DECODE roles, "
              "replicated KV caches and ordinary or fixed MTP decoding.";
       CHECK(options.instance_role() != InstanceRole::PREFILL ||
@@ -113,7 +121,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           (!options.enable_speculative_decode() ||
            (SpeculativeConfig::supports_task_pipeline(
                 options.speculative_algorithm()) &&
-            (!options.enable_adaptive_speculative_decode() ||
+            (!options.enable_adaptive_spec_prune() ||
              (SpeculativeConfig::is_dspark_algorithm(
                   options.speculative_algorithm()) &&
               options.enable_graph() && parallel_args.dp_size() == 1)))) &&
@@ -243,13 +251,6 @@ bool Worker::init_model(const std::string& model_weights_path,
 
 bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache(kv_cache_shape);
-}
-
-bool Worker::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
-  SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
-      predictor);
-  return true;
 }
 
 std::optional<std::string> Worker::dspark_calibration(

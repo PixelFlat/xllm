@@ -43,11 +43,6 @@ bool WorkerClient::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache(kv_cache_shape);
 }
 
-bool WorkerClient::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
-  return worker_->set_speculative_validate_time_predictor(predictor);
-}
-
 std::optional<std::string> WorkerClient::dspark_calibration(
     const DSparkCalibrationCommand& command) {
   return worker_->dspark_calibration(command);

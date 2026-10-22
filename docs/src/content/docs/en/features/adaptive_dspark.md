@@ -23,6 +23,10 @@ Adaptive DSpark uses confidence feedback and calibrated full-step costs to
 select a verification budget. Parameter types and defaults are listed in the
 [CLI reference](/en/cli_reference/#speculativeconfig).
 
+The adaptive-pruning flag and JSON key are now `enable_adaptive_spec_prune`
+instead of `enable_adaptive_speculative_decode`. Update existing launch
+scripts and JSON configurations; the old name is not an alias.
+
 ## Supported configuration
 
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
@@ -51,7 +55,7 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --nnodes=16 --node_rank=0 --host=127.0.0.1 --port=8000 \
   --master_node_addr=127.0.0.1:27000 \
   --speculative_algorithm=DSpark --num_speculative_tokens=7 \
-  --draft_sampling_mode=greedy --enable_adaptive_speculative_decode=true \
+  --draft_sampling_mode=greedy --enable_adaptive_spec_prune=true \
   --enable_graph=true --python_graph_backend=aclgraph \
   --disable_graph_warmup=false --enable_schedule_overlap=true \
   --enable_task_pipeline=true --enable_unified_mtp_graph=false \

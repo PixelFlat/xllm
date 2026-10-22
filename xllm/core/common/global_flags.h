@@ -86,7 +86,7 @@ DECLARE_string(speculative_algorithm);
 DECLARE_string(draft_sampling_mode);
 
 DECLARE_bool(enable_mtp_draft_body_tp1);
-DECLARE_bool(enable_adaptive_speculative_decode);
+DECLARE_bool(enable_adaptive_spec_prune);
 
 DECLARE_double(adaptive_speculative_min_gain);
 DECLARE_string(adaptive_dspark_cost_table);

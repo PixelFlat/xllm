@@ -119,7 +119,6 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   DraftBlock draft_block;
   draft_block.proposal = DraftProposal(std::move(sampled.token_ids),
                                        std::move(sampled.draft_logits));
-  draft_block.confidence_probs = std::move(sampled.confidence_probs);
   draft_block.retained_inputs = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               draft_timer.elapsed_seconds());

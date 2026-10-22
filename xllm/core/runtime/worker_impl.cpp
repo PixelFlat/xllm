@@ -2306,7 +2306,7 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
        (options.enable_speculative_decode() &&
         (!SpeculativeConfig::is_mtp_algorithm(
              options.speculative_algorithm()) ||
-         options.enable_adaptive_speculative_decode())))) {
+         options.enable_adaptive_spec_prune())))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline prefill CP requires an NPU GLM DSA target, KV split "

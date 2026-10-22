@@ -28,9 +28,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_params_view.h"
-#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/embedding_cache.h"
 #include "core/kv_cache/layout/kv_cache_capacity.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
@@ -413,12 +411,6 @@ bool DraftModelSpecWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 #endif
 
 template <typename TargetInput>
-bool DraftModelSpecWorkerImpl<TargetInput>::adaptive_enabled() const {
-  return adaptive_spec_controller_ != nullptr &&
-         adaptive_spec_controller_->enabled();
-}
-
-template <typename TargetInput>
 TargetInput
 DraftModelSpecWorkerImpl<TargetInput>::update_input_by_last_step_output(
     TargetInput& inputs) {
@@ -458,58 +450,6 @@ void DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input(
         token_ids[row_idx],
         bootstrap_embeddings.select(/*dim=*/0, i));
   }
-}
-
-template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::
-    sync_dp_global_token_nums_after_prune(TargetModelParams& input_params,
-                                          int32_t local_total_val_tokens) {
-  // Static speculative width already keeps the DP counts consistent.
-  if (!adaptive_enabled()) {
-    return;
-  }
-  ProcessGroup* dp_group = parallel_args_.dp_local_process_group_;
-  if (dp_group == nullptr || dp_group->world_size() <= 1) {
-    return;
-  }
-  const int32_t dp_size = static_cast<int32_t>(dp_group->world_size());
-  // Every DP rank must contribute its actual validation width after pruning.
-  torch::Tensor local = torch::tensor(
-      {local_total_val_tokens},
-      torch::TensorOptions().dtype(torch::kInt32).device(device_.unwrap()));
-  torch::Tensor gathered = dp_group->allgather_base_sync(local);
-
-  std::vector<int32_t>& token_nums = input_params.parallel.dp_global_token_nums;
-  std::vector<int32_t>& raw_token_nums =
-      input_params.parallel.raw_dp_global_token_nums;
-  CHECK_EQ(static_cast<int32_t>(token_nums.size()), dp_size)
-      << "dp_global_token_nums size must match DP group world size";
-  token_nums = tensor_to_vector<int32_t>(gathered.view({dp_size}));
-  if (!raw_token_nums.empty()) {
-    CHECK_EQ(static_cast<int32_t>(raw_token_nums.size()), dp_size)
-        << "raw_dp_global_token_nums size must match DP group world size";
-    raw_token_nums = token_nums;
-  }
-}
-
-template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::
-    sync_dp_global_token_nums_for_idle_rank(TargetModelParams& input_params) {
-  if (!adaptive_enabled()) {
-    return;
-  }
-  ProcessGroup* dp_group = parallel_args_.dp_local_process_group_;
-  if (dp_group == nullptr || dp_group->world_size() <= 1) {
-    return;
-  }
-  // Idle ranks contribute the dummy validation width prepared by the caller.
-  const int32_t dp_rank = static_cast<int32_t>(dp_group->rank());
-  const std::vector<int32_t>& token_nums =
-      input_params.parallel.dp_global_token_nums;
-  CHECK_LT(dp_rank, static_cast<int32_t>(token_nums.size()))
-      << "DP rank out of range for dp_global_token_nums";
-  sync_dp_global_token_nums_after_prune(
-      input_params, token_nums[static_cast<size_t>(dp_rank)]);
 }
 
 template class DraftModelSpecWorkerImpl<LlmForwardInput>;

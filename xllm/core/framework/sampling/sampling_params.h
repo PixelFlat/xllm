@@ -328,21 +328,6 @@ inline void expand_sampling_params_for_verify(
   repeat_interleave_if_defined(sampling_params.do_sample, repeats);
 }
 
-// Per-sequence variant: uploads the row counts as an int64 device tensor and
-// delegates to the tensor overload above.
-inline void expand_sampling_params_for_verify(
-    SamplingParameters& sampling_params,
-    const std::vector<int32_t>& per_seq_val_tokens,
-    int64_t total_num_val_tokens,
-    const torch::Device& device) {
-  torch::Tensor repeats_tensor =
-      async_h2d_tensor(std::vector<int64_t>(per_seq_val_tokens.begin(),
-                                            per_seq_val_tokens.end()),
-                       device);
-  expand_sampling_params_for_verify(
-      sampling_params, repeats_tensor, total_num_val_tokens, device);
-}
-
 // Mode-aware draft sampling policy: clears logprob outputs and, in GREEDY
 // mode, flips the batch to greedy; PROBABILISTIC exposes draft logits
 // exactly when the verifier needs q.

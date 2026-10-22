@@ -61,13 +61,6 @@ message AllocateKVCacheRequest {
   KVCacheShape kv_cache_shape = 1;
 }
 
-message SpeculativeValidateTimePredictor {
-  double intercept_ms = 1;
-  reserved 2;  // was: double batch_ms (dropped, dead field)
-  double query_token_ms = 3;
-  double query_prefix_ms = 4;
-}
-
 // Startup-only DSpark calibration control. Each command is handled only after
 // all previously submitted task-pipeline results have been retired.
 message DSparkCalibrationRequest {
@@ -483,8 +476,6 @@ service DistributeWorker {
   rpc ProcessGroupTest (Empty) returns (Status);
   rpc ProfileDeviceMemory (Empty) returns (DeviceMemory);
   rpc AllocateKVCache (AllocateKVCacheRequest) returns (Status);
-  rpc SetSpeculativeValidateTimePredictor(SpeculativeValidateTimePredictor)
-      returns (Status) {}
   rpc DSparkCalibration(DSparkCalibrationRequest)
       returns (DSparkCalibrationResponse) {}
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheRequest) returns (Status) {}

@@ -22,7 +22,6 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
-#include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/runtime/llm_worker_impl.h"
 #include "core/runtime/mtp_runtime_helpers.h"
@@ -49,9 +48,9 @@ runtime::Options unified_leaf_options(const runtime::Options& options,
 
 using mtp_detail::check_mtp_decode_states;
 
-bool supports_unified_mtp_request(const LlmForwardInput& input, bool adaptive) {
+bool supports_unified_mtp_request(const LlmForwardInput& input) {
   const SamplingParameters& sampling = input.sampling_params;
-  return !adaptive && input.json_object_states.empty() &&
+  return input.json_object_states.empty() &&
          input.input_params.multi_block_tables.empty() &&
          sampling.sampling_mode == SamplingMode::GREEDY &&
          !sampling.use_beam_search && !sampling.has_sampling_fields();
@@ -61,14 +60,12 @@ UnifiedMtpWorkerImpl::UnifiedMtpWorkerImpl(const ParallelArgs& parallel_args,
                                            const torch::Device& device,
                                            const runtime::Options& options,
                                            WorkerType worker_type)
-    : MTPWorkerImpl<LlmForwardInput>(
-          parallel_args,
-          device,
-          options,
-          unified_leaf_options(options, false),
-          unified_leaf_options(options, true),
-          worker_type,
-          /*enable_adaptive_speculative_decode=*/true) {}
+    : MTPWorkerImpl<LlmForwardInput>(parallel_args,
+                                     device,
+                                     options,
+                                     unified_leaf_options(options, false),
+                                     unified_leaf_options(options, true),
+                                     worker_type) {}
 
 UnifiedMtpWorkerImpl::~UnifiedMtpWorkerImpl() {
   // Derived graph owners must survive all queued work, before base teardown.
@@ -126,7 +123,7 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
       options_.num_speculative_tokens() <= 0 ||
-      options_.enable_adaptive_speculative_decode()) {
+      options_.enable_adaptive_spec_prune()) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Unified MTP task pipeline requires fixed greedy MTP models.");
@@ -210,10 +207,7 @@ bool UnifiedMtpWorkerImpl::supports_unified_python_mtp_graph(
     const LlmForwardInput& input) const {
   return unified_graph_capable_ &&
          draft_sampling_mode_ == DraftSamplingMode::GREEDY &&
-         supports_unified_mtp_request(
-             input,
-             adaptive_enabled() && SpeculativeProfileRegistry::get_instance()
-                                       .has_validate_time_predictor());
+         supports_unified_mtp_request(input);
 }
 
 bool UnifiedMtpWorkerImpl::supports_unified_configuration() const {

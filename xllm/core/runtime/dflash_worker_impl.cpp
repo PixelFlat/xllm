@@ -31,10 +31,6 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
-#include "core/framework/sampling/logits_utils.h"
-#include "core/framework/speculative/adaptive_pruning_helpers.h"
-#include "core/framework/speculative/adaptive_speculative_controller.h"
-#include "core/framework/speculative/speculative_profile_registry.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/sampling/sampling_params.h"
@@ -339,13 +335,10 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             return std::make_unique<LLMWorkerImpl>(
                 parallel_args, device, draft_options(options));
           }) {
-  // Adaptive per-seq validate pruning. DP is supported: the worker gathers
-  // each rank's true validate token count over the DP group before the target
-  // forward (see sync_dp_global_token_nums_after_prune).
   CHECK((options.adaptive_dspark_cost_table().empty() &&
          options.adaptive_dspark_calibration().empty()) ||
         (options.enable_task_pipeline() &&
-         options.enable_adaptive_speculative_decode() &&
+         options.enable_adaptive_spec_prune() &&
          SpeculativeConfig::is_dspark_algorithm(
              options.speculative_algorithm()) &&
          (options.num_speculative_tokens() == 5 ||
@@ -354,19 +347,12 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
          "Draft5/7 "
          "task "
          "pipeline.";
-  const bool enable_adaptive = options.enable_adaptive_speculative_decode() &&
-                               options.num_speculative_tokens() > 1 &&
-                               !options.enable_task_pipeline();
-  if (enable_adaptive) {
-    adaptive_spec_controller_ =
-        std::make_unique<AdaptiveSpeculativeController>(options);
-  }
 }
 
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      (options_.enable_adaptive_speculative_decode() &&
+      (options_.enable_adaptive_spec_prune() &&
        !SpeculativeConfig::is_dspark_algorithm(
            options_.speculative_algorithm())) ||
       options_.num_speculative_tokens() <= 0 || target_is_hybrid_recurrent_) {
@@ -417,7 +403,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
        draft_args.model_type() == "DSparkDraftModel") &&
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
-  capacity.adaptive_dspark = options_.enable_adaptive_speculative_decode();
+  capacity.adaptive_dspark = options_.enable_adaptive_spec_prune();
   capacity.adaptive_min_gain = options_.adaptive_speculative_min_gain();
   capacity.startup_calibration = capacity.adaptive_dspark;
   capacity.calibration_leader = parallel_args_.rank() == 0;
@@ -643,12 +629,6 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // anchor + drafts forward.
   scale_speculative_parallel_token_counts(
       validate_input.input_params, options_.num_speculative_tokens() + 1);
-  // Deadlock-safety under DP: when all ranks decode but this rank's shard is
-  // empty (fake input), busy peers reach run_validate and allgather their
-  // pruned validate counts before the target forward. This idle rank runs the
-  // same target forward and must join that allgather in lockstep, contributing
-  // its own uniform (unpruned) count. No-op unless adaptive + dp_size>1.
-  sync_dp_global_token_nums_for_idle_rank(validate_input.input_params);
   ForwardOutput output =
       run_worker_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
@@ -778,13 +758,10 @@ DFlashWorkerImpl::DraftBlock DFlashWorkerImpl::run_decode_draft(
 void DFlashWorkerImpl::fill_validate_input_from_draft_outputs(
     const DraftBlock& draft_block,
     LlmForwardInput& validate_input,
-    Stream& compute_stream,
-    int32_t effective_val_tokens) {
+    Stream& compute_stream) {
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t num_val_tokens = effective_val_tokens;
-  const int32_t effective_speculative_tokens = effective_val_tokens - 1;
-  CHECK_GE(effective_speculative_tokens, 0);
-  CHECK_LE(effective_speculative_tokens, num_speculative_tokens);
+  CHECK_GT(num_speculative_tokens, 0);
+  const int32_t num_val_tokens = num_speculative_tokens + 1;
   const torch::Tensor& draft_token_ids = draft_block.proposal.token_ids();
   CHECK(draft_token_ids.defined())
       << "DFlash draft token_ids must be defined for validate token fill";
@@ -808,24 +785,11 @@ void DFlashWorkerImpl::fill_validate_input_from_draft_outputs(
       validate_input.token_ids.view({num_sequences, num_val_tokens});
 
   validate_input.runtime.device_tensors_ready = false;
-  if (effective_speculative_tokens == 0) {
-    // Controller pruned every seq's speculation down to zero; nothing to fill
-    // beyond the anchor column that already holds the real token.
-    validate_input.runtime.device_tensors_ready = true;
-    // still need to publish the compute-stream write below.
-  } else {
-    using ISlice = torch::indexing::Slice;
-    torch::Tensor draft_slice =
-        draft_token_ids
-            .index({ISlice(),
-                    ISlice(/*start=*/0, /*end=*/effective_speculative_tokens)})
-            .contiguous();
-    torch::Tensor draft_tokens =
-        safe_to(draft_slice, token_options, /*non_blocking=*/true);
-    validate_token_rows.index({ISlice(), ISlice(1, num_val_tokens)})
-        .copy_(draft_tokens, /*non_blocking=*/true);
-    validate_input.runtime.device_tensors_ready = true;
-  }
+  torch::Tensor draft_tokens = safe_to(
+      draft_token_ids.contiguous(), token_options, /*non_blocking=*/true);
+  validate_token_rows.slice(/*dim=*/1, /*start=*/1, /*end=*/num_val_tokens)
+      .copy_(draft_tokens, /*non_blocking=*/true);
+  validate_input.runtime.device_tensors_ready = true;
   // Publish this compute-stream write so the target's prepare stage (which
   // consumes validate_input.token_ids under ACL-graph double buffering) waits
   // for the copy to complete before staging into the graph's persistent
@@ -833,137 +797,14 @@ void DFlashWorkerImpl::fill_validate_input_from_draft_outputs(
   record_metadata_ready_event(compute_stream, validate_input);
 }
 
-void DFlashWorkerImpl::fill_validate_input_from_draft_outputs_varlen(
-    const DraftBlock& draft_block,
-    LlmForwardInput& validate_input,
-    Stream& compute_stream,
-    const std::vector<int32_t>& per_seq_val_tokens) {
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int64_t num_sequences = static_cast<int64_t>(per_seq_val_tokens.size());
-  const torch::Tensor& draft_token_ids = draft_block.proposal.token_ids();
-  CHECK(draft_token_ids.defined())
-      << "DFlash draft token_ids must be defined for varlen validate fill";
-  CHECK_EQ(draft_token_ids.dim(), 2);
-  CHECK_EQ(draft_token_ids.size(0), num_sequences);
-  CHECK_EQ(draft_token_ids.size(1), num_speculative_tokens);
-  CHECK(validate_input.token_ids.defined());
-  CHECK_EQ(validate_input.token_ids.dim(), 1);
-
-  const torch::TensorOptions token_options = validate_input.token_ids.options();
-  c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
-  wait_metadata_ready_event(validate_input, compute_stream);
-
-  validate_input.runtime.device_tensors_ready = false;
-
-  // Compute destination offsets: seq i's draft tokens go at
-  // [cu_offset[i] + 1, cu_offset[i] + per_seq_val_tokens[i]).
-  std::vector<int64_t> dst_idx_vec;
-  std::vector<int64_t> src_idx_vec;
-  // Upper bound: each seq contributes at most num_speculative_tokens draft
-  // rows (seq_val_tokens - 1 <= num_speculative_tokens).
-  const size_t max_draft_rows =
-      static_cast<size_t>(num_sequences) * num_speculative_tokens;
-  dst_idx_vec.reserve(max_draft_rows);
-  src_idx_vec.reserve(max_draft_rows);
-  int64_t cu_offset = 0;
-  for (int64_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    const int32_t seq_val_tokens =
-        per_seq_val_tokens[static_cast<size_t>(seq_id)];
-    for (int32_t j = 0; j < seq_val_tokens - 1; ++j) {
-      dst_idx_vec.push_back(cu_offset + 1 + j);
-      src_idx_vec.push_back(seq_id * num_speculative_tokens + j);
-    }
-    cu_offset += seq_val_tokens;
-  }
-
-  if (!dst_idx_vec.empty()) {
-    const torch::Device index_device = validate_input.token_ids.device();
-    torch::Tensor dst_idx = async_h2d_tensor(dst_idx_vec, index_device);
-    torch::Tensor src_idx = async_h2d_tensor(src_idx_vec, index_device);
-    // Flatten [B, N] -> [B*N] and gather via src_idx.
-    torch::Tensor draft_flat = draft_token_ids.view({-1});
-    torch::Tensor draft_selected = draft_flat.index_select(/*dim=*/0, src_idx);
-    torch::Tensor draft_tokens =
-        safe_to(draft_selected, token_options, /*non_blocking=*/true);
-    validate_input.token_ids.index_copy_(/*dim=*/0, dst_idx, draft_tokens);
-  }
-  validate_input.runtime.device_tensors_ready = true;
-  record_metadata_ready_event(compute_stream, validate_input);
-}
-
 std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     const LlmForwardInput& input,
-    const DraftBlock& draft_block_in,
+    const DraftBlock& draft_block,
     LlmForwardInput& validate_input) {
   Timer target_timer;
-  // Adaptive-speculative per-seq varlen validate:
-  // 1. controller decides per-seq prefix_lengths from confidence/proposal
-  //    probs.
-  // 2. we rebuild validate_input as a *true varlen* [Σ (prefix_i+1), ...]
-  //    batch — target forward runs only Σ (prefix_i+1) tokens, so batches with
-  //    even a single high-confidence seq do not force the whole batch to full
-  //    N+1 width (the batch-max regression from v1). MTP already scatters
-  //    varlen target output back into padded dense before rejection sampling
-  //    — we do the same here.
-  // 3. rejection sampler is dense-only; scatter varlen target output into
-  //    [B, N+1, ...] with -inf at padded positions.
-  // 4. apply_pruned_prefix_lengths clips the sampler output at each seq's
-  //    prefix_len so the accepted_token_ids beyond prefix_i become -1.
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  const int32_t default_val_tokens = num_speculative_tokens + 1;
-  const int32_t batch_size = input.input_params.meta.num_sequences;
-
-  DraftBlock draft_block = draft_block_in;
-  std::vector<int32_t> prefix_lengths =
-      compute_adaptive_prefix_lengths(draft_block, input);
-  std::vector<int32_t> per_seq_val_tokens;
-  bool did_prune = false;
-  int32_t max_val_tokens = default_val_tokens;
-  if (!prefix_lengths.empty()) {
-    // Pruned outputs are overwritten later, so the proposal stays untouched.
-    per_seq_val_tokens.resize(batch_size);
-    max_val_tokens = 0;
-    for (int32_t i = 0; i < batch_size; ++i) {
-      int32_t p = std::clamp(prefix_lengths[static_cast<size_t>(i)],
-                             /*min=*/0,
-                             /*max=*/num_speculative_tokens);
-      // Per-seq validate width = accepted-draft-count + 1 bonus. When the
-      // controller decides prefix=0 (don't speculate this step), the seq
-      // still must verify its bonus token, so the minimum is 1 slot — not
-      // 2. A previous floor to 2 forced a phantom "draft slot" at position
-      // 0 that leaked whatever the sampler emitted there past the intended
-      // prefix, showing up as duplicate/garbage tokens in adaptive output.
-      const int32_t width = p + 1;
-      per_seq_val_tokens[static_cast<size_t>(i)] = width;
-      max_val_tokens = std::max(max_val_tokens, width);
-      if (width < default_val_tokens) {
-        did_prune = true;
-      }
-    }
-  }
-
-  if (did_prune) {
-    apply_per_seq_varlen_prune(input, validate_input, per_seq_val_tokens);
-    fill_validate_input_from_draft_outputs_varlen(
-        draft_block, validate_input, *compute_stream_, per_seq_val_tokens);
-  } else {
-    fill_validate_input_from_draft_outputs(
-        draft_block, validate_input, *compute_stream_, max_val_tokens);
-  }
-  // Under DP, publish this rank's true validate token count to all DP peers so
-  // DpEpPadding computes matching MoE all-to-all pads. Runs on both branches
-  // (pruned and dense) and on every DP rank so the collective stays in
-  // lockstep. No-op when the DP group spans a single rank.
-  int32_t local_total_val_tokens = 0;
-  if (did_prune) {
-    for (int32_t v : per_seq_val_tokens) {
-      local_total_val_tokens += v;
-    }
-  } else {
-    local_total_val_tokens = batch_size * max_val_tokens;
-  }
-  sync_dp_global_token_nums_after_prune(validate_input.input_params,
-                                        local_total_val_tokens);
+  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  fill_validate_input_from_draft_outputs(
+      draft_block, validate_input, *compute_stream_);
 
   ForwardOutput target_output =
       run_worker_no_sync_impl(
@@ -972,40 +813,11 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               target_timer.elapsed_seconds());
 
-  // Scatter varlen target output back to dense [B, max_val_tokens] layout so
-  // the rejection sampler (dense API) can consume it.
-  if (did_prune) {
-    adaptive_pruning::scatter_varlen_target_output_to_dense(
-        target_output, per_seq_val_tokens, batch_size, max_val_tokens);
-  }
-
   Timer validation_timer;
-  SampleOutput val_output = validate(
-      input.sampling_params, draft_block, target_output, max_val_tokens);
-  // Post-process: mask sampler output beyond each seq's prefix_len so seq
-  // accepted counts respect the per-seq decision even under batch-max
-  // dense rejection sampling.
-  if (did_prune) {
-    // effective_prefix[i] mirrors the controller's decision (0-based, clamped
-    // to [0, num_speculative_tokens]). Since per_seq_val_tokens[i] is exactly
-    // prefix_lengths[i] + 1 now (bonus slot only when prefix=0), we could
-    // equivalently write per_seq_val_tokens[i] - 1; keeping the raw
-    // prefix_lengths read here documents the semantic and stays robust if the
-    // width calculation grows another guard later.
-    std::vector<int32_t> effective_prefix(batch_size);
-    for (int32_t i = 0; i < batch_size; ++i) {
-      int32_t p = prefix_lengths[static_cast<size_t>(i)];
-      effective_prefix[static_cast<size_t>(i)] =
-          std::clamp(p, 0, options_.num_speculative_tokens());
-    }
-    const torch::Tensor pruning_masks =
-        adaptive_pruning::build_pruned_prefix_masks(
-            effective_prefix,
-            max_val_tokens - 1,
-            val_output.next_tokens.device());
-    adaptive_pruning::apply_pruned_prefix_lengths(
-        val_output, max_val_tokens - 1, pruning_masks);
-  }
+  SampleOutput val_output = validate(input.sampling_params,
+                                     draft_block.proposal,
+                                     target_output,
+                                     num_val_tokens);
   COUNTER_ADD(speculative_execution_latency_seconds_validation,
               validation_timer.elapsed_seconds());
 
@@ -1022,27 +834,14 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   }
   return finalize_verify_output(std::move(target_output),
                                 std::move(val_output),
-                                did_prune ? &prefix_lengths : nullptr,
                                 input.json_object_states);
-}
-
-SampleOutput DFlashWorkerImpl::validate(
-    const SamplingParameters& sampling_params,
-    const DraftBlock& draft_block,
-    const ForwardOutput& target_output,
-    int32_t effective_val_tokens) {
-  const int32_t effective_speculative_tokens = effective_val_tokens - 1;
-  DraftProposal pruned =
-      draft_block.proposal.slice_speculative(0, effective_speculative_tokens);
-  return validate(sampling_params, pruned, target_output, effective_val_tokens);
 }
 
 SampleOutput DFlashWorkerImpl::validate(
     const SamplingParameters& sampling_params,
     const DraftProposal& draft_proposal,
     const ForwardOutput& target_output,
-    int32_t effective_val_tokens) {
-  const int32_t num_val_tokens = effective_val_tokens;
+    int32_t num_val_tokens) {
   // Derive batch_size from the target logits rows rather than next_tokens so
   // the reshape stays valid regardless of how the target was sampled.
   const int32_t num_logits_rows =
@@ -1374,77 +1173,6 @@ void DFlashWorkerImpl::write_target_context_to_cache(
       validate_output.embeddings,
       options_.num_speculative_tokens(),
       /*retain_previous_embedding=*/false);
-}
-
-// -----------------------------------------------------------------------------
-// Adaptive-speculative helpers (DFlash + DSpark).
-// -----------------------------------------------------------------------------
-
-std::vector<int32_t> DFlashWorkerImpl::compute_adaptive_prefix_lengths(
-    const DraftBlock& draft_block,
-    const LlmForwardInput& input) {
-  // The current Qwen3.8 GDN spec-verify kernel requires a uniform validation
-  // width.  Keep DFlash adaptive pruning off for hybrid targets until the
-  // generic varlen builder carries the same recurrent checkpoint contract as
-  // MTP's specialized path.
-  if (target_is_hybrid_recurrent_) {
-    return {};
-  }
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  if (!adaptive_enabled()) {
-    return {};
-  }
-  // The ConfidenceHead is not STS-calibrated yet (DSpark v1) and can
-  // over-prune — DSPARK_CONFIDENCE_TEMPERATURE approximates STS for now.
-  torch::Tensor probs_for_controller = draft_block.confidence_probs;
-  if (!probs_for_controller.defined() &&
-      draft_block.proposal.logits().has_value()) {
-    probs_for_controller = gather_probs_from_logits(
-        *draft_block.proposal.logits(), draft_block.proposal.token_ids());
-  }
-  if (!probs_for_controller.defined()) {
-    return {};
-  }
-  if (probs_for_controller.dim() != 2 ||
-      probs_for_controller.size(1) != num_speculative_tokens) {
-    LOG(WARNING) << "Adaptive: unexpected probs shape "
-                 << probs_for_controller.sizes()
-                 << " — falling back to full width.";
-    return {};
-  }
-
-  const int32_t batch_size = input.input_params.meta.num_sequences;
-  std::vector<double> per_seq_kv_lens(static_cast<size_t>(batch_size), 0.0);
-  const Slice<int32_t> kv_seq_lens =
-      input.input_params.attention.host.kv_seq_lens;
-  for (int32_t i = 0; i < batch_size; ++i) {
-    per_seq_kv_lens[static_cast<size_t>(i)] = static_cast<double>(
-        specBuilder::calc_kv_len(kv_seq_lens, i, /*offset=*/0));
-  }
-
-  std::vector<int32_t> prefix_lengths =
-      adaptive_spec_controller_->select_pruned_prefix_lengths(
-          probs_for_controller,
-          /*full_draft_time_ms=*/0.0,
-          per_seq_kv_lens);
-  return prefix_lengths;
-}
-
-void DFlashWorkerImpl::apply_per_seq_varlen_prune(
-    const LlmForwardInput& input,
-    LlmForwardInput& validate_input,
-    const std::vector<int32_t>& per_seq_val_tokens) {
-  const int32_t num_sequences = input.input_params.meta.num_sequences;
-  CHECK_EQ(static_cast<int32_t>(per_seq_val_tokens.size()), num_sequences);
-  c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
-  LlmForwardInput prepared_input = input.clone();
-  prepared_input.runtime.metadata_ready_event.reset();
-  LlmForwardInput new_validate;
-  SpeculativeWorkerImpl<LlmForwardInput>::prepare_validate_inputs(
-      prepared_input, new_validate, per_seq_val_tokens);
-  new_validate.input_params.embedding.input_embedding = torch::Tensor();
-  record_metadata_ready_event(*prepare_stream_, new_validate);
-  validate_input = std::move(new_validate);
 }
 
 }  // namespace xllm

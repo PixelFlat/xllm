@@ -48,12 +48,6 @@ std::vector<int32_t> build_step_time_profile_batch_sizes(
 // default 16 to keep measured memory aligned with real captures.
 int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len);
 
-// The adaptive DSpark task pipeline profiles its warmed graph buckets itself.
-// Other speculative paths still consume the legacy validate-time predictor.
-bool should_profile_legacy_speculative_validate(
-    const SpeculativeConfig& speculative_config,
-    bool enable_task_pipeline);
-
 std::string dspark_calibration_compatibility(const runtime::Options& options);
 class ProfileManager {
  private:
@@ -171,10 +165,6 @@ class ProfileManager {
   void train_prefill_time_predictor(
       std::vector<std::pair<int32_t, double>> time_profiling_data);
 
-  void train_speculative_validate_time_predictor(
-      const std::vector<std::tuple<int32_t, int32_t, int32_t, double>>&
-          time_profiling_data);
-
   double get_constant_overhead();
 
   int32_t get_quadratic_root(Sequence* sequence, double budget);
@@ -216,12 +206,6 @@ class ProfileManager {
   void eval_batch_latency_prediction(const std::string mode);
 
   void profile_token_budget();
-
-  // Profile only speculative paths that consume the legacy predictor, not
-  // adaptive DSpark task pipelines with their own graph-bucket measurements.
-  bool should_profile_speculative_validate() const;
-
-  void profile_speculative_validate_time();
 
   // Warm up eager NPU operators before the service becomes ready.
   void warmup_for_eager();
@@ -284,7 +268,6 @@ class ProfileManager {
 
   std::unique_ptr<TimePredictor> prefill_time_predictor_;
   std::unique_ptr<TimePredictor> decode_time_predictor_;
-  std::unique_ptr<TimePredictor> speculative_validate_time_predictor_;
 
   const Options options_;
 

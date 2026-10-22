@@ -66,7 +66,7 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
-  // DFlash-style drafts that record per-seq validate metrics inline.
+  // Drafts that generate a block of speculative tokens in one forward.
   static bool is_block_diffusion_algorithm(std::string_view algorithm) {
     return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm) ||
            is_dspark_algorithm(algorithm);
@@ -79,8 +79,7 @@ class SpeculativeConfig final {
   }
 
   static bool supports_adaptive_speculative_decode(std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) ||
-           is_block_diffusion_algorithm(algorithm);
+    return is_dspark_algorithm(algorithm);
   }
 
   static bool requires_aux_hidden_capture(std::string_view algorithm) {
@@ -123,7 +122,7 @@ class SpeculativeConfig final {
          "draft_sampling_mode",
          "enable_mtp_draft_body_tp1",
          "enable_atb_spec_kernel",
-         "enable_adaptive_speculative_decode",
+         "enable_adaptive_spec_prune",
          "adaptive_speculative_min_gain",
          "adaptive_dspark_cost_table",
          "adaptive_dspark_calibration",
@@ -155,7 +154,7 @@ class SpeculativeConfig final {
 
   PROPERTY(bool, enable_atb_spec_kernel) = false;
 
-  PROPERTY(bool, enable_adaptive_speculative_decode) = false;
+  PROPERTY(bool, enable_adaptive_spec_prune) = false;
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
 

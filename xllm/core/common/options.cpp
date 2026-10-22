@@ -50,8 +50,7 @@ std::string Options::to_string() const {
      << ", speculative_suffix_use_tree_spec: "
      << speculative_suffix_use_tree_spec()
      << ", enable_mtp_draft_body_tp1: " << enable_mtp_draft_body_tp1()
-     << ", enable_adaptive_speculative_decode: "
-     << enable_adaptive_speculative_decode()
+     << ", enable_adaptive_spec_prune: " << enable_adaptive_spec_prune()
      << ", adaptive_speculative_min_gain: " << adaptive_speculative_min_gain()
      << ", adaptive_dspark_cost_table: " << adaptive_dspark_cost_table()
      << ", adaptive_dspark_calibration: " << adaptive_dspark_calibration()

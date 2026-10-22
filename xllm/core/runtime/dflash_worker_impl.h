@@ -97,9 +97,6 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   // per-step outputs an autoregressive drafter (e.g. MTP) yields.
   struct DraftBlock {
     DraftProposal proposal;
-    // Adaptive controller signal: the DSpark ConfidenceHead output when
-    // present, the drafted token's prob under q otherwise.
-    torch::Tensor confidence_probs;
     // No-sync draft inputs must outlive validation's stream sync.
     std::vector<std::shared_ptr<const void>> retained_inputs;
   };
@@ -136,48 +133,16 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
 
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               LlmForwardInput& validate_input,
-                                              Stream& compute_stream,
-                                              int32_t effective_val_tokens);
-
-  // Per-seq varlen variant. Handles the case where validate_input.token_ids
-  // is a flat [Σ per_seq_val_tokens] layout (i.e. the base per_seq builder
-  // produced it), copying draft tokens into the varlen slots per seq.
-  void fill_validate_input_from_draft_outputs_varlen(
-      const DraftBlock& draft_block,
-      LlmForwardInput& validate_input,
-      Stream& compute_stream,
-      const std::vector<int32_t>& per_seq_val_tokens);
+                                              Stream& compute_stream);
 
   std::optional<ForwardOutput> run_validate(const LlmForwardInput& input,
                                             const DraftBlock& draft_block,
                                             LlmForwardInput& validate_input);
 
   SampleOutput validate(const SamplingParameters& sampling_params,
-                        const DraftBlock& draft_block,
-                        const ForwardOutput& target_output,
-                        int32_t effective_val_tokens);
-
-  SampleOutput validate(const SamplingParameters& sampling_params,
                         const DraftProposal& draft_proposal,
                         const ForwardOutput& target_output,
-                        int32_t effective_val_tokens);
-
-  // Adaptive-speculative helper: run controller on draft acceptance
-  // probabilities and return per-seq prefix_len vector (each entry in
-  // [0, num_speculative_tokens]). Returns empty vector when adaptive is off,
-  // in which case the caller keeps the full draft block.
-  std::vector<int32_t> compute_adaptive_prefix_lengths(
-      const DraftBlock& draft_block,
-      const LlmForwardInput& input);
-
-  // Per-seq varlen prune: rebuild validate_input as a true varlen
-  // [Σ per_seq_val_tokens[i], ...] batch so target forward only spends
-  // compute on tokens each seq's prefix_len actually needs. Reuses the base
-  // SpeculativeWorkerImpl<LlmForwardInput> per-seq builder.
-  void apply_per_seq_varlen_prune(
-      const LlmForwardInput& input,
-      LlmForwardInput& validate_input,
-      const std::vector<int32_t>& per_seq_val_tokens);
+                        int32_t num_val_tokens);
 
   // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
   // commits the same prefix. No-op for a single rank.
@@ -199,8 +164,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
   // Whether the target model owns recurrent (linear attention) layers.
-  // Fixed once the target finishes loading; the hybrid spec-verify gates and
-  // the adaptive-pruning guard read this instead of re-scanning layer_types.
+  // Fixed once the target finishes loading; hybrid spec-verify gates read
+  // this instead of re-scanning layer_types.
   bool target_is_hybrid_recurrent_ = false;
   dflash_detail::DSparkSasMode draft_sas_mode_ =
       dflash_detail::DSparkSasMode::NOT_DSPARK;

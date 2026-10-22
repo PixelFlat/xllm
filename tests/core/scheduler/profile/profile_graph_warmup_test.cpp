@@ -81,13 +81,13 @@ class ScopedVmmConfigSnapshot final {
 class ScopedSpeculativeSamplingConfigSnapshot final {
  public:
   ScopedSpeculativeSamplingConfigSnapshot()
-      : adaptive_(SpeculativeConfig::get_instance()
-                      .enable_adaptive_speculative_decode()),
+      : adaptive_(
+            SpeculativeConfig::get_instance().enable_adaptive_spec_prune()),
         algorithm_(SpeculativeConfig::get_instance().speculative_algorithm()) {}
 
   ~ScopedSpeculativeSamplingConfigSnapshot() {
     SpeculativeConfig::get_instance()
-        .enable_adaptive_speculative_decode(adaptive_)
+        .enable_adaptive_spec_prune(adaptive_)
         .speculative_algorithm(algorithm_);
   }
 
@@ -95,84 +95,6 @@ class ScopedSpeculativeSamplingConfigSnapshot final {
   bool adaptive_;
   std::string algorithm_;
 };
-
-TEST(SpeculativeValidateProfileGateTest, AdaptiveAndTaskPipelineRemainOptIn) {
-  SpeculativeConfig speculative;
-  const ProfileManager::Options options;
-
-  EXPECT_FALSE(speculative.enable_adaptive_speculative_decode());
-  EXPECT_FALSE(options.enable_task_pipeline());
-  EXPECT_FALSE(should_profile_legacy_speculative_validate(
-      speculative, options.enable_task_pipeline()));
-
-  speculative.speculative_algorithm("DSpark").num_speculative_tokens(7);
-  EXPECT_FALSE(should_profile_legacy_speculative_validate(
-      speculative, /*enable_task_pipeline=*/true));
-  EXPECT_FALSE(should_profile_legacy_speculative_validate(
-      speculative, /*enable_task_pipeline=*/false));
-}
-
-TEST(SpeculativeValidateProfileGateTest,
-     DSparkPipelineUsesOwnGraphBucketCosts) {
-  SpeculativeConfig speculative;
-  speculative.enable_adaptive_speculative_decode(true).num_speculative_tokens(
-      7);
-  ProfileManager::Options options;
-  options.enable_profile_step_time(true);
-
-  for (const std::string algorithm : {"DSpark", "dspark", "DSPARK", "dSpArK"}) {
-    SCOPED_TRACE(algorithm);
-    speculative.speculative_algorithm(algorithm);
-    options.enable_task_pipeline(true);
-    EXPECT_FALSE(should_profile_legacy_speculative_validate(
-        speculative, options.enable_task_pipeline()));
-    // The separate scheduler prefill/decode profiling flag stays enabled.
-    EXPECT_TRUE(options.enable_profile_step_time());
-
-    options.enable_task_pipeline(false);
-    EXPECT_TRUE(should_profile_legacy_speculative_validate(
-        speculative, options.enable_task_pipeline()));
-  }
-}
-
-TEST(SpeculativeValidateProfileGateTest, OtherAlgorithmsKeepLegacyRouting) {
-  SpeculativeConfig speculative;
-  speculative.enable_adaptive_speculative_decode(true).num_speculative_tokens(
-      3);
-  for (const std::string algorithm : {"MTP", "mtp", "DFlash", "DFlash2"}) {
-    speculative.speculative_algorithm(algorithm);
-    for (bool enable_task_pipeline : {false, true}) {
-      EXPECT_TRUE(should_profile_legacy_speculative_validate(
-          speculative, enable_task_pipeline))
-          << algorithm;
-    }
-  }
-}
-
-TEST(SpeculativeValidateProfileGateTest, UnsupportedOrNonPrunableSkipsSweep) {
-  SpeculativeConfig speculative;
-  speculative.enable_adaptive_speculative_decode(true);
-  for (const std::string algorithm : {"MTP", "DFlash", "DFlash2", "DSpark"}) {
-    speculative.speculative_algorithm(algorithm);
-    for (const int32_t num_speculative_tokens : {0, 1}) {
-      speculative.num_speculative_tokens(num_speculative_tokens);
-      for (bool enable_task_pipeline : {false, true}) {
-        EXPECT_FALSE(should_profile_legacy_speculative_validate(
-            speculative, enable_task_pipeline))
-            << algorithm;
-      }
-    }
-  }
-  speculative.num_speculative_tokens(7);
-  for (const std::string algorithm : {"Eagle3", "Suffix", "unknown"}) {
-    speculative.speculative_algorithm(algorithm);
-    for (bool enable_task_pipeline : {false, true}) {
-      EXPECT_FALSE(should_profile_legacy_speculative_validate(
-          speculative, enable_task_pipeline))
-          << algorithm;
-    }
-  }
-}
 
 TEST(DecodeGraphWarmupConfigTest, OrdinaryTargetUsesSingleTokenShape) {
   ExecutionConfig config;
@@ -425,7 +347,7 @@ TEST(GraphWarmupTest, OnlyAdaptiveDsparkPipelineUsesGreedySyntheticRequests) {
         SCOPED_TRACE(adaptive);
         SCOPED_TRACE(pipeline);
         SpeculativeConfig::get_instance()
-            .enable_adaptive_speculative_decode(adaptive)
+            .enable_adaptive_spec_prune(adaptive)
             .speculative_algorithm(algorithm);
         RecordingProfileEngine engine;
         ProfileManager::Options options;

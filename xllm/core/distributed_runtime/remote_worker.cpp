@@ -79,11 +79,6 @@ bool RemoteWorker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return channel_->allocate_kv_cache(kv_cache_shape);
 }
 
-bool RemoteWorker::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
-  return channel_->set_speculative_validate_time_predictor(predictor);
-}
-
 std::optional<std::string> RemoteWorker::dspark_calibration(
     const DSparkCalibrationCommand& command) {
   return channel_->dspark_calibration(command);

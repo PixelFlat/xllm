@@ -76,21 +76,6 @@ DistributedWorkerManager::DistributedWorkerManager(
     std::vector<std::shared_ptr<WorkerClient>> worker_clients)
     : worker_clients_(std::move(worker_clients)) {}
 
-bool DistributedWorkerManager::set_speculative_validate_time_predictor(
-    const SpeculativeProfileRegistry::ValidateTimePredictor& predictor) {
-  bool success = true;
-  for (size_t worker_rank = 0; worker_rank < worker_clients_.size();
-       ++worker_rank) {
-    if (!worker_clients_[worker_rank]->set_speculative_validate_time_predictor(
-            predictor)) {
-      LOG(ERROR) << "Failed to set speculative validate predictor for worker "
-                 << worker_rank;
-      success = false;
-    }
-  }
-  return success;
-}
-
 std::optional<std::vector<std::string>>
 DistributedWorkerManager::dspark_calibration(
     const DSparkCalibrationCommand& command) {

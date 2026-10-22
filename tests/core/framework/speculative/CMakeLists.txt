@@ -95,31 +95,6 @@ cc_test(
 
 cc_test(
   NAME
-    adaptive_speculative_controller_test
-  SRCS
-    adaptive_speculative_controller_test.cpp
-    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/adaptive_speculative_controller.cpp"
-    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_profile_registry.cpp"
-  DEPS
-    torch
-    glog::glog
-    proto::xllm_proto
-    GTest::gtest_main
-)
-
-cc_test(
-  NAME
-    speculative_profile_registry_test
-  SRCS
-    speculative_profile_registry_test.cpp
-    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/speculative_profile_registry.cpp"
-  DEPS
-    glog::glog
-    GTest::gtest_main
-)
-
-cc_test(
-  NAME
     embedding_cache_test
   SRCS
     embedding_cache_test.cpp

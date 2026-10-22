@@ -220,7 +220,7 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
         << "VLM speculative decoding does not support disaggregated PD";
     CHECK(!options_.enable_service_routing())
         << "VLM speculative decoding does not support service routing";
-    CHECK(!options_.enable_adaptive_speculative_decode())
+    CHECK(!options_.enable_adaptive_spec_prune())
         << "VLM speculative decoding does not support adaptive speculative "
            "decode";
     const std::string draft_model_path =
@@ -244,8 +244,7 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
             options_.speculative_suffix_max_cached_requests())
         .speculative_suffix_use_tree_spec(
             options_.speculative_suffix_use_tree_spec())
-        .enable_adaptive_speculative_decode(
-            options_.enable_adaptive_speculative_decode())
+        .enable_adaptive_spec_prune(options_.enable_adaptive_spec_prune())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
         .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
         .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())

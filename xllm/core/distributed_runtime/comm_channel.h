@@ -26,7 +26,6 @@ limitations under the License.
 
 #include "common/types.h"
 #include "core/framework/allocator/virtual_memory/mapped_virtual_memory_region.h"
-#include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/prefetch_result.h"
 #include "runtime/forward_params.h"
@@ -47,9 +46,6 @@ class CommChannel {
   virtual bool hello();
 
   virtual bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
-
-  virtual bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor);
 
   virtual std::optional<std::string> dspark_calibration(
       const DSparkCalibrationCommand& command);

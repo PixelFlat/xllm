@@ -69,17 +69,17 @@ DEFINE_bool(enable_atb_spec_kernel,
             false,
             "Whether to use ATB speculative kernel.");
 
-DEFINE_bool(enable_adaptive_speculative_decode,
+DEFINE_bool(enable_adaptive_spec_prune,
             false,
-            "Enable adaptive speculative length for MTP or supported DSpark "
-            "decode. DSpark graph task pipelines calibrate full-step costs "
-            "at startup unless a saved cost table is supplied.");
+            "Enable asynchronous adaptive DSpark Draft5/7 with Python ACL "
+            "graphs and task pipeline. Full-step costs are calibrated at "
+            "startup unless a saved cost table is supplied.");
 
 DEFINE_double(
     adaptive_speculative_min_gain,
     0.0,
-    "Minimum relative throughput gain required to include a draft token in "
-    "adaptive speculative validation.");
+    "Minimum predicted relative throughput gain required to change the "
+    "adaptive DSpark verification budget.");
 
 DEFINE_string(
     adaptive_dspark_cost_table,
@@ -119,7 +119,7 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_speculative_decode);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_spec_prune);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_calibration);
@@ -127,6 +127,9 @@ void SpeculativeConfig::from_flags() {
 }
 
 void SpeculativeConfig::from_json(const JsonReader& json) {
+  CHECK(!json.contains("enable_adaptive_speculative_decode"))
+      << "enable_adaptive_speculative_decode was renamed to "
+         "enable_adaptive_spec_prune; update the JSON configuration.";
   XLLM_CONFIG_ASSIGN_FROM_JSON(draft_model);
   XLLM_CONFIG_ASSIGN_FROM_JSON(num_speculative_tokens);
   XLLM_CONFIG_ASSIGN_FROM_JSON(speculative_algorithm);
@@ -139,7 +142,7 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_speculative_decode);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_spec_prune);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_calibration);
@@ -174,7 +177,7 @@ void SpeculativeConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_atb_spec_kernel);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_adaptive_speculative_decode);
+      config_json, default_config, enable_adaptive_spec_prune);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -200,24 +203,27 @@ void SpeculativeConfig::initialize() {
 
 void SpeculativeConfig::validate() const {
   CHECK(adaptive_dspark_calibration().empty() ||
-        (adaptive_dspark_cost_table().empty() &&
-         enable_adaptive_speculative_decode() &&
+        (adaptive_dspark_cost_table().empty() && enable_adaptive_spec_prune() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_calibration requires adaptive DSpark Draft5/7 "
          "without "
          "a cost-table input.";
   CHECK(adaptive_dspark_cost_table_output().empty() ||
-        (adaptive_dspark_cost_table().empty() &&
-         enable_adaptive_speculative_decode() &&
+        (adaptive_dspark_cost_table().empty() && enable_adaptive_spec_prune() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_cost_table_output requires startup calibration.";
   CHECK(adaptive_dspark_cost_table().empty() ||
-        (enable_adaptive_speculative_decode() &&
+        (enable_adaptive_spec_prune() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_cost_table requires adaptive DSpark Draft5/7.";
+  CHECK(!enable_adaptive_spec_prune() ||
+        (supports_adaptive_speculative_decode(speculative_algorithm()) &&
+         (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
+      << "Adaptive speculative decoding supports only DSpark Draft5/7; "
+         "MTP, DFlash and DFlash2 require fixed-width decoding.";
   const DraftSamplingMode mode =
       parse_draft_sampling_mode(draft_sampling_mode());
   const std::string& algorithm = speculative_algorithm();

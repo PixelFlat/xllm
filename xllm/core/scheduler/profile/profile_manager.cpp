@@ -39,7 +39,6 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/request/request_state.h"
-#include "core/framework/speculative/speculative_profile_registry.h"
 #include "core/runtime/acl_graph_bucket_policy.h"
 #include "core/scheduler/profile/graph_warmup.h"
 #include "core/util/rec_model_utils.h"
@@ -78,28 +77,12 @@ int32_t warmup_decode_seq_len(bool fia_enabled, int32_t max_context_len) {
       max_context_len);
 }
 
-bool should_profile_legacy_speculative_validate(
-    const SpeculativeConfig& speculative_config,
-    bool enable_task_pipeline) {
-  const std::string& algorithm = speculative_config.speculative_algorithm();
-  const bool is_supported_algo =
-      SpeculativeConfig::is_mtp_algorithm(algorithm) ||
-      SpeculativeConfig::is_block_diffusion_algorithm(algorithm);
-  // Worker admission validates adaptive DSpark graph capabilities before the
-  // scheduler starts. That pipeline never creates the legacy Host controller.
-  const bool uses_dspark_pipeline =
-      enable_task_pipeline && SpeculativeConfig::is_dspark_algorithm(algorithm);
-  return speculative_config.enable_adaptive_speculative_decode() &&
-         speculative_config.num_speculative_tokens() > 1 && is_supported_algo &&
-         !uses_dspark_pipeline;
-}
 namespace {
 
 void configure_profile_sampling(RequestSamplingParam& sampling,
                                 const SpeculativeConfig& speculative_config,
                                 bool enable_task_pipeline) {
-  if (enable_task_pipeline &&
-      speculative_config.enable_adaptive_speculative_decode() &&
+  if (enable_task_pipeline && speculative_config.enable_adaptive_spec_prune() &&
       SpeculativeConfig::is_dspark_algorithm(
           speculative_config.speculative_algorithm())) {
     // Startup costs use a fixed greedy sampling policy. Serving may sample
@@ -167,17 +150,9 @@ ProfileManager::ProfileManager(
       options.enable_profile_kv_blocks(), true /*is_prefill*/);
   decode_time_predictor_ = std::make_unique<TimePredictor>(
       options.enable_profile_kv_blocks(), false /*is_prefill*/);
-  speculative_validate_time_predictor_ = std::make_unique<TimePredictor>(
-      options.enable_profile_kv_blocks(), false /*is_prefill*/);
   if (options.enable_profile_step_time()) {
     LOG(INFO) << "Starting profiliing step time.";
     profile_step_time(false);
-    // The validate-time predictor is only consumed by the adaptive
-    // speculative controller, so skip the whole prefix/query/batch sweep
-    // unless adaptive speculative decode is actually enabled.
-    if (should_profile_speculative_validate()) {
-      profile_speculative_validate_time();
-    }
     // test accuracy
     // eval_sequence_latency_prediction();
     // eval_batch_latency_prediction("only_prefill");
@@ -522,152 +497,6 @@ void ProfileManager::train_prefill_time_predictor(
 void ProfileManager::train_decode_time_predictor(
     std::vector<std::tuple<int32_t, int32_t, double>> time_profiling_data) {
   decode_time_predictor_->fit_for_decode(time_profiling_data);
-}
-
-void ProfileManager::train_speculative_validate_time_predictor(
-    const std::vector<std::tuple<int32_t, int32_t, int32_t, double>>&
-        time_profiling_data) {
-  if (time_profiling_data.empty()) {
-    return;
-  }
-
-  // The least-squares fit + error metrics + coefficient sanitization live in
-  // TimePredictor (shared with the prefill/decode predictors). Here we only
-  // map the fitted coefficients into the registry struct and publish them.
-  speculative_validate_time_predictor_->fit_for_speculative_validate(
-      time_profiling_data);
-  const std::vector<double> coefficients =
-      speculative_validate_time_predictor_->get_coefficients();
-  CHECK_EQ(coefficients.size(), 3u)
-      << "speculative validate predictor must have 3 coefficients";
-
-  SpeculativeProfileRegistry::ValidateTimePredictor predictor;
-  predictor.intercept_ms = coefficients[0];
-  predictor.query_token_ms = coefficients[1];
-  predictor.query_prefix_ms = coefficients[2];
-  // Broadcast to workers FIRST, then commit locally. Workers gate the
-  // adaptive path on their own SpeculativeProfileRegistry, so any rank
-  // that misses the predictor will diverge from ranks that received it:
-  // one side runs adaptive (per-seq variable validate width), the other
-  // runs static, which corrupts collectives and shape assumptions.
-  // Treat broadcast failure as fatal for the adaptive path and leave the
-  // registry unset so every rank consistently falls back to static.
-  if (distributed_worker_manager_ == nullptr ||
-      !distributed_worker_manager_->set_speculative_validate_time_predictor(
-          predictor)) {
-    LOG(ERROR)
-        << "Failed to broadcast speculative validate predictor to workers. "
-        << "Disabling adaptive speculative decode on all ranks to avoid "
-        << "cross-rank divergence.";
-    SpeculativeProfileRegistry::get_instance().reset_validate_time_predictor();
-    return;
-  }
-  SpeculativeProfileRegistry::get_instance().set_validate_time_predictor(
-      predictor);
-}
-
-bool ProfileManager::should_profile_speculative_validate() const {
-  return should_profile_legacy_speculative_validate(
-      SpeculativeConfig::get_instance(), options_.enable_task_pipeline());
-}
-
-void ProfileManager::profile_speculative_validate_time() {
-  // The adaptive gate lives at the call site (should_profile_speculative_
-  // validate); guard here too so a direct call cannot profile a config the
-  // adaptive controller would never consume.
-  if (!should_profile_speculative_validate()) {
-    return;
-  }
-  const SpeculativeConfig& speculative_config =
-      ::xllm::SpeculativeConfig::get_instance();
-  const std::string& speculative_algorithm =
-      speculative_config.speculative_algorithm();
-  LOG(INFO) << "Starting speculative validate profile for "
-            << speculative_algorithm << ", "
-            << "adaptive_enabled="
-            << speculative_config.enable_adaptive_speculative_decode();
-
-  auto& model_args = engine_->model_args();
-  const int32_t max_context_len = model_args.max_position_embeddings();
-  const int32_t profile_max_prompt_length =
-      std::min(max_context_len, options_.profile_max_prompt_length());
-  if (profile_max_prompt_length <= 16) {
-    LOG(WARNING)
-        << "Skip speculative validate profile because prompt length is too "
-        << "small: " << profile_max_prompt_length;
-    return;
-  }
-
-  const int32_t max_query_len =
-      std::min<int32_t>(speculative_config.num_speculative_tokens() + 1, 10);
-  const int32_t max_batch_size =
-      std::min<int32_t>(options_.max_seqs_per_batch(), 256);
-  std::vector<int32_t> query_lens;
-  query_lens.push_back(1);
-  if (max_query_len > 2) {
-    query_lens.push_back((max_query_len + 1) / 2);
-  }
-  if (max_query_len > 1) {
-    query_lens.push_back(max_query_len);
-  }
-  query_lens.erase(std::unique(query_lens.begin(), query_lens.end()),
-                   query_lens.end());
-
-  constexpr int32_t kMaxProfileBatchSize = 32;
-  std::vector<int32_t> candidate_batch_sizes = {1, 16, 32};
-  std::vector<int32_t> batch_sizes;
-  for (const int32_t batch_size : candidate_batch_sizes) {
-    if (batch_size <= max_batch_size && batch_size <= kMaxProfileBatchSize) {
-      batch_sizes.push_back(batch_size);
-    }
-  }
-  if (batch_sizes.empty()) {
-    batch_sizes.push_back(std::min<int32_t>(
-        std::max<int32_t>(max_batch_size, 1), kMaxProfileBatchSize));
-  }
-
-  std::vector<int32_t> prefix_lens;
-  prefix_lens.push_back(profile_max_prompt_length);
-  if (profile_max_prompt_length >= 64) {
-    prefix_lens.push_back(profile_max_prompt_length / 4);
-  }
-  prefix_lens.push_back(16);
-  for (int32_t& prefix_len : prefix_lens) {
-    prefix_len = std::clamp(prefix_len, 16, profile_max_prompt_length);
-  }
-  std::sort(prefix_lens.begin(), prefix_lens.end());
-  prefix_lens.erase(std::unique(prefix_lens.begin(), prefix_lens.end()),
-                    prefix_lens.end());
-
-  std::vector<std::tuple<int32_t, int32_t, int32_t, double>>
-      time_profiling_data;
-  const int32_t total_blocks =
-      static_cast<int32_t>(block_manager_pool_->num_blocks());
-  const auto block_size = block_manager_pool_->options().block_size();
-  for (const int32_t prefix_len : prefix_lens) {
-    for (const int32_t query_len : query_lens) {
-      for (const int32_t batch_size : batch_sizes) {
-        const int32_t token_length = prefix_len + query_len;
-        const int32_t blocks_per_seq =
-            (prefix_len + block_size - 1) / block_size +
-            (token_length + block_size - 1) / block_size;
-        if (batch_size * blocks_per_seq > total_blocks * 9 / 10) {
-          continue;
-        }
-        double latency_mean = 0.0;
-        for (int32_t k = 0; k < profile_count_per_step_; ++k) {
-          latency_mean += run_request(token_length, prefix_len, batch_size);
-        }
-        latency_mean /= static_cast<double>(profile_count_per_step_);
-        LOG(INFO) << "[spec_validate_profile] batch=" << batch_size
-                  << " query_len=" << query_len << " prefix_len=" << prefix_len
-                  << " latency_ms=" << latency_mean;
-        time_profiling_data.emplace_back(
-            batch_size, query_len, prefix_len, latency_mean);
-      }
-    }
-  }
-  train_speculative_validate_time_predictor(time_profiling_data);
 }
 
 // ----------------------predict step time-----------------------

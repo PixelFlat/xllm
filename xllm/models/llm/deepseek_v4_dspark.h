@@ -78,8 +78,7 @@ class DeepseekV4DSparkModelImpl final : public DeepseekV4ModelImpl {
     // flag, so presence is decided by whether the weight loads. Only stand it
     // up under adaptive speculative decode, which is its sole consumer;
     // otherwise its weights would occupy device memory unused.
-    if (SpeculativeConfig::get_instance()
-            .enable_adaptive_speculative_decode()) {
+    if (SpeculativeConfig::get_instance().enable_adaptive_spec_prune()) {
       confidence_head_.initialize(context.get_tensor_options(),
                                   args.hidden_size(),
                                   args.markov_rank(),

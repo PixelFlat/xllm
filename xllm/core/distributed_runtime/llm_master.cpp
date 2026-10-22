@@ -198,8 +198,7 @@ LLMMaster::LLMMaster(const Options& options)
             options_.speculative_suffix_max_cached_requests())
         .speculative_suffix_use_tree_spec(
             options_.speculative_suffix_use_tree_spec())
-        .enable_adaptive_speculative_decode(
-            options_.enable_adaptive_speculative_decode())
+        .enable_adaptive_spec_prune(options_.enable_adaptive_spec_prune())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
         .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
         .adaptive_dspark_calibration(options_.adaptive_dspark_calibration());
@@ -307,35 +306,35 @@ LLMMaster::LLMMaster(const Options& options)
     response_options.system_fingerprint =
         api_service::openai_system_fingerprint(options_, &model_args_);
   }
-  auto create_scheduler = [this, &scheduler_options, &response_options](
-                              auto* engine) {
-    scheduler_options
-        .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())
-        .enable_adaptive_dspark(options_.enable_task_pipeline() &&
-                                options_.enable_adaptive_speculative_decode() &&
-                                SpeculativeConfig::is_dspark_algorithm(
-                                    options_.speculative_algorithm()))
-        .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
-        .adaptive_dspark_cost_table_output(
-            options_.adaptive_dspark_cost_table_output());
-    CHECK(options_.adaptive_dspark_cost_table_output().empty() ||
-          scheduler_options.enable_adaptive_dspark())
-        << "DSpark cost-table output requires an adaptive DSpark task "
-           "pipeline.";
-    if (scheduler_options.enable_adaptive_dspark() ||
-        !options_.adaptive_dspark_calibration().empty() ||
-        !options_.adaptive_dspark_cost_table().empty()) {
-      scheduler_options.dspark_calibration_compatibility(
-          dspark_calibration_compatibility(engine->options()));
-    }
-    scheduler_ = create_continuous_scheduler(
-        engine,
-        scheduler_options,
-        distributed_worker_manager_,
-        llm_engine_ != nullptr ? model_residency_coordinator_ : nullptr,
-        kv_transfer_coordinator_,
-        std::move(response_options));
-  };
+  auto create_scheduler =
+      [this, &scheduler_options, &response_options](auto* engine) {
+        scheduler_options
+            .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())
+            .enable_adaptive_dspark(options_.enable_task_pipeline() &&
+                                    options_.enable_adaptive_spec_prune() &&
+                                    SpeculativeConfig::is_dspark_algorithm(
+                                        options_.speculative_algorithm()))
+            .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
+            .adaptive_dspark_cost_table_output(
+                options_.adaptive_dspark_cost_table_output());
+        CHECK(options_.adaptive_dspark_cost_table_output().empty() ||
+              scheduler_options.enable_adaptive_dspark())
+            << "DSpark cost-table output requires an adaptive DSpark task "
+               "pipeline.";
+        if (scheduler_options.enable_adaptive_dspark() ||
+            !options_.adaptive_dspark_calibration().empty() ||
+            !options_.adaptive_dspark_cost_table().empty()) {
+          scheduler_options.dspark_calibration_compatibility(
+              dspark_calibration_compatibility(engine->options()));
+        }
+        scheduler_ = create_continuous_scheduler(
+            engine,
+            scheduler_options,
+            distributed_worker_manager_,
+            llm_engine_ != nullptr ? model_residency_coordinator_ : nullptr,
+            kv_transfer_coordinator_,
+            std::move(response_options));
+      };
   dispatch_engine(create_scheduler,
                   llm_engine_.get(),
                   suffix_engine_.get(),

@@ -4,14 +4,11 @@ cc_library(
   NAME
     speculative
   HDRS
-    adaptive_speculative_controller.h
     dspark/dspark_budget_planner.h
     dspark/dspark_adaptive_cost_cache.h
     dspark/dspark_sps_cost_model.h
     dspark/dspark_window_collector.h
     dspark/dspark_startup_calibration.h
-    speculative_profile_registry.h
-    adaptive_pruning_helpers.h
     draft_config.h
     spec_input_builder.h
     mtp_async_input_builder.h
@@ -24,14 +21,11 @@ cc_library(
     verify_layout.h
     spec_verify.h
   SRCS
-    adaptive_speculative_controller.cpp
     dspark/dspark_budget_planner.cpp
     dspark/dspark_adaptive_cost_cache.cpp
     dspark/dspark_sps_cost_model.cpp
     dspark/dspark_window_collector.cpp
     dspark/dspark_startup_calibration.cpp
-    speculative_profile_registry.cpp
-    adaptive_pruning_helpers.cpp
     draft_config.cpp
     spec_input_builder.cpp
     mtp_async_input_builder.cpp

@@ -68,12 +68,6 @@ class WorkerService : public proto::DistributeWorker {
                        proto::Status* response,
                        ::google::protobuf::Closure* done) override;
 
-  void SetSpeculativeValidateTimePredictor(
-      ::google::protobuf::RpcController* controller,
-      const proto::SpeculativeValidateTimePredictor* request,
-      proto::Status* response,
-      ::google::protobuf::Closure* done) override;
-
   void DSparkCalibration(::google::protobuf::RpcController* controller,
                          const proto::DSparkCalibrationRequest* request,
                          proto::DSparkCalibrationResponse* response,

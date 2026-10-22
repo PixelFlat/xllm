@@ -18,7 +18,7 @@ limitations under the License.
 
 namespace xllm {
 class UnifiedMtpExecutor;
-bool supports_unified_mtp_request(const LlmForwardInput& input, bool adaptive);
+bool supports_unified_mtp_request(const LlmForwardInput& input);
 // Unified MTP worker. Shared model/cache lifetime is supplied by
 // MTPWorkerImpl<LlmForwardInput>; unsupported requests use its legacy decode
 // path.

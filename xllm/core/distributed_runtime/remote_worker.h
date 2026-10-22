@@ -55,10 +55,6 @@ class RemoteWorker : public WorkerClient {
 
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 
-  bool set_speculative_validate_time_predictor(
-      const SpeculativeProfileRegistry::ValidateTimePredictor& predictor)
-      override;
-
   std::optional<std::string> dspark_calibration(
       const DSparkCalibrationCommand& command) override;
 

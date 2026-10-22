@@ -26,7 +26,6 @@ limitations under the License.
 
 namespace xllm {
 
-class AdaptiveSpeculativeController;
 class EmbeddingCache;
 class LLMWorkerImpl;
 
@@ -102,19 +101,8 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
 
   void prepare_draft_input(const TargetInput& input);
 
-  // All DP ranks, including unpruned ranks, must join this collective each
-  // validation step so MoE padding uses matching post-pruning token counts.
-  void sync_dp_global_token_nums_after_prune(TargetModelParams& input_params,
-                                             int32_t local_total_val_tokens);
-
-  // Idle ranks join the same collective using their prepared dummy width.
-  void sync_dp_global_token_nums_for_idle_rank(TargetModelParams& input_params);
-
-  bool adaptive_enabled() const;
-
   std::unique_ptr<LLMWorkerImpl> draft_impl_;
   std::unique_ptr<EmbeddingCache> embedding_cache_;
-  std::unique_ptr<AdaptiveSpeculativeController> adaptive_spec_controller_;
 
   DraftSamplingMode draft_sampling_mode_ = DraftSamplingMode::GREEDY;
 };
