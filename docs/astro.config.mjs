@@ -159,6 +159,14 @@ export default defineConfig({
 							translations: { 'zh-CN': '高级功能' },
 							autogenerate: { directory: 'features' },
 						},
+						{
+							label: 'xLLM Service',
+							items: [
+								'xllm_service/overview',
+								'xllm_service/getting_started',
+								'xllm_service/kv_events',
+							],
+						},
 					],
 				},
 				{
