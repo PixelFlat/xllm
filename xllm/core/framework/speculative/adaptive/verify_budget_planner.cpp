@@ -19,6 +19,7 @@ limitations under the License.
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <vector>
 
 namespace xllm {
@@ -277,6 +278,133 @@ std::optional<VerifyBudgetPlan> VerifyBudgetPlanner::plan(
     }
   }
   return best;
+}
+
+std::optional<std::vector<VerifyBudgetPlan>> VerifyBudgetPlanner::parallel_plan(
+    std::span<const int32_t> requests,
+    std::span<const float> lagged_confidence,
+    std::span<const uint64_t> rounds_since_full_width,
+    std::span<const SpecGraphCost> prewarmed_costs,
+    const VerifyBudgetOptions& options) {
+  const double fixed_time_ms =
+      options.fixed_draft_time_ms + options.commit_time_ms;
+  if (requests.empty() || !valid_options(options) ||
+      !valid_costs(prewarmed_costs, fixed_time_ms) ||
+      std::any_of(requests.begin(), requests.end(), [&](int32_t count) {
+        return count < 0 || static_cast<uint32_t>(count) >
+                                std::numeric_limits<uint32_t>::max() /
+                                    (options.draft_width + 1);
+      })) {
+    return std::nullopt;
+  }
+  const uint64_t total =
+      std::accumulate(requests.begin(), requests.end(), uint64_t{0});
+  const uint32_t maximum = *std::max_element(requests.begin(), requests.end());
+  const uint32_t width = options.draft_width;
+  if (maximum == 0 ||
+      (!lagged_confidence.empty() &&
+       lagged_confidence.size() != total * width) ||
+      (!rounds_since_full_width.empty() &&
+       rounds_since_full_width.size() != total) ||
+      std::any_of(
+          lagged_confidence.begin(), lagged_confidence.end(), [](float value) {
+            return !std::isfinite(value) ||
+                   (value != -1.0F && (value < 0.0F || value > 1.0F));
+          })) {
+    return std::nullopt;
+  }
+  const auto full =
+      std::lower_bound(prewarmed_costs.begin(),
+                       prewarmed_costs.end(),
+                       maximum * (width + 1),
+                       [](const SpecGraphCost& cost, uint32_t rows) {
+                         return cost.graph_rows < rows;
+                       });
+  if (full == prewarmed_costs.end()) {
+    return std::nullopt;
+  }
+  const auto plans = [&](uint32_t graph_rows) {
+    std::vector<VerifyBudgetPlan> result;
+    result.reserve(requests.size());
+    for (const int32_t count : requests) {
+      result.emplace_back(
+          VerifyBudgetPlan{std::min(static_cast<uint32_t>(count) * width,
+                                    graph_rows - static_cast<uint32_t>(count)),
+                           graph_rows});
+    }
+    return result;
+  };
+  if (lagged_confidence.empty() || full->target_time_ms == 0.0 ||
+      (options.cost_scope == SpecCostScope::VERIFY_TAIL &&
+       options.fixed_draft_time_ms == 0.0)) {
+    return plans(full->graph_rows);
+  }
+  uint32_t minimum_rows = maximum;
+  uint64_t first = 0;
+  std::vector<std::vector<double>> progress;
+  progress.reserve(requests.size());
+  for (const int32_t count : requests) {
+    const auto confidence =
+        lagged_confidence.subspan(first * width, count * width);
+    const auto rounds = rounds_since_full_width.empty()
+                            ? std::span<const uint64_t>()
+                            : rounds_since_full_width.subspan(first, count);
+    first += count;
+    const bool full_width =
+        std::find(confidence.begin(), confidence.end(), -1.0F) !=
+            confidence.end() ||
+        std::any_of(rounds.begin(), rounds.end(), [&](uint64_t round) {
+          return round >= options.exploration_interval;
+        });
+    if (full_width) {
+      minimum_rows =
+          std::max(minimum_rows, static_cast<uint32_t>(count) * (width + 1));
+    }
+    std::vector<double> paths;
+    paths.reserve(count * width);
+    for (int32_t row = 0; row < count; ++row) {
+      double path = 1.0;
+      for (uint32_t column = 0; column < width; ++column) {
+        path *= std::max(0.0F, confidence[row * width + column]);
+        paths.emplace_back(path);
+      }
+    }
+    std::sort(paths.begin(), paths.end(), std::greater<double>());
+    std::vector<double> expected;
+    expected.reserve(paths.size() + 1);
+    expected.emplace_back(static_cast<double>(count));
+    for (const double probability : paths) {
+      expected.emplace_back(expected.back() + probability);
+    }
+    progress.emplace_back(std::move(expected));
+  }
+  uint32_t best_rows = full->graph_rows;
+  double best_score = -1.0;
+  for (const SpecGraphCost& cost : prewarmed_costs) {
+    if (cost.graph_rows < minimum_rows || cost.graph_rows > full->graph_rows ||
+        cost.target_time_ms == 0.0) {
+      continue;
+    }
+    const auto candidate = plans(cost.graph_rows);
+    double expected = 0.0;
+    for (uint32_t shard = 0; shard < requests.size(); ++shard) {
+      expected += progress[shard][candidate[shard].draft_budget];
+    }
+    const double score = expected / (fixed_time_ms + cost.target_time_ms);
+    if (score > best_score) {
+      best_rows = cost.graph_rows;
+      best_score = score;
+    }
+  }
+  double full_progress = 0.0;
+  for (const auto& expected : progress) {
+    full_progress += expected.back();
+  }
+  const double full_score =
+      full_progress / (fixed_time_ms + full->target_time_ms);
+  return plans(best_score > full_score * (1.0 + options.min_gain)
+                   ? best_rows
+                   : full->graph_rows);
 }
 
 }  // namespace xllm

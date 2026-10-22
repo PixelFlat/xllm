@@ -175,6 +175,8 @@ class WorkerService : public proto::DistributeWorker {
                    ::google::protobuf::Closure* done) override;
 
  private:
+  friend class WorkerServiceOutputTest;
+
   void step_llm_model(
       LlmForwardInput& input,
       ForwardOutput& cpu_output,

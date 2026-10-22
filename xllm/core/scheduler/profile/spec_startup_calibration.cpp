@@ -241,7 +241,7 @@ int32_t ProfileManager::adaptive_calibration_warmup_seq_len(
 void ProfileManager::calibrate_spec_startup() {
   CHECK(distributed_worker_manager_ != nullptr);
   CHECK(options_.enable_task_pipeline());
-  CHECK_EQ(options_.dp_size(), 1);
+  CHECK_GT(options_.dp_size(), 0);
   const auto& execution = ExecutionConfig::get_instance();
   CHECK(execution.enable_graph() && !execution.disable_graph_warmup());
   const auto capabilities = distributed_worker_manager_->spec_calibration(
@@ -327,6 +327,11 @@ void ProfileManager::calibrate_spec_startup() {
       geometry.at("target_graph_rows").get<std::vector<uint32_t>>();
   if (options_.adaptive_target_verify_calibration().empty()) {
     config.request_buckets = requests;
+    std::erase_if(config.request_buckets, [&](uint32_t count) {
+      const uint64_t total = static_cast<uint64_t>(count) * options_.dp_size();
+      return total > static_cast<uint64_t>(options_.max_seqs_per_batch()) ||
+             total > static_cast<uint64_t>(options_.max_tokens_per_batch());
+    });
   }
   const auto configuration =
       nlohmann::json::parse(serialize_spec_startup_calibration(config));
@@ -353,10 +358,10 @@ void ProfileManager::calibrate_spec_startup() {
   CHECK(points)
       << "Calibration requires captured buckets and full-width coverage.";
   for (const auto& point : *points) {
-    CHECK_LE(point.requests,
-             static_cast<uint32_t>(options_.max_seqs_per_batch()));
-    CHECK_LE(point.requests,
-             static_cast<uint32_t>(options_.max_tokens_per_batch()));
+    CHECK_LE(static_cast<uint64_t>(point.requests) * options_.dp_size(),
+             static_cast<uint64_t>(options_.max_seqs_per_batch()));
+    CHECK_LE(static_cast<uint64_t>(point.requests) * options_.dp_size(),
+             static_cast<uint64_t>(options_.max_tokens_per_batch()));
     CHECK_LE(
         static_cast<uint64_t>(point.context.max_kv_length),
         static_cast<uint64_t>(engine_->model_args().max_position_embeddings()));
@@ -459,11 +464,12 @@ void ProfileManager::run_startup_speculative_sample(
       1, engine_->model_args().vocab_size() - 1);
   std::vector<std::shared_ptr<Request>> owned;
   std::vector<Sequence*> sequences;
-  owned.reserve(point.requests);
-  sequences.reserve(point.requests);
+  const uint32_t total_requests = point.requests * options_.dp_size();
+  owned.reserve(total_requests);
+  sequences.reserve(total_requests);
   const size_t capacity = point.context.prefill_tokens +
                           (decode_rounds + 3) * (config.draft_width + 1);
-  for (uint32_t row = 0; row < point.requests; ++row) {
+  for (uint32_t row = 0; row < total_requests; ++row) {
     std::vector<int32_t> prompt(point.context.prefill_tokens);
     std::generate(
         prompt.begin(), prompt.end(), [&]() { return token(random); });
@@ -488,6 +494,7 @@ void ProfileManager::run_startup_speculative_sample(
                                              "",
                                              std::move(state));
     Sequence* sequence = request->sequences().front().get();
+    sequence->set_dp_rank(static_cast<int32_t>(row / point.requests));
     CHECK(block_manager_pool_->allocate(sequence, capacity))
         << "Insufficient KV capacity for internal speculative calibration.";
     sequences.emplace_back(sequence);

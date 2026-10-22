@@ -227,13 +227,12 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if not 0 < batch_size <= self.max_batch:
             raise ValueError("prepared ACL graph batch size exceeds capacity or is empty")
         if dspark_adaptive is not None and (
-            self.dp_size != 1
-            or self._block_draft
+            self._block_draft
             or not self.attention_backend.is_mla
             or input_embedding is not None
             or mtp_topk_indices is not None
         ):
-            raise ValueError("adaptive DSpark requires an ordinary MLA target graph with DP=1 and token-only inputs")
+            raise ValueError("adaptive DSpark requires an ordinary MLA target graph with token-only inputs")
         self._validate_prepared_dp(input_ids, metadata)
         if self._block_draft:
             if metadata.is_prefill or not metadata.is_chunked_prefill or metadata.is_spec_verify:

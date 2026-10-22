@@ -114,13 +114,21 @@ draft 的生成宽度在启动时固定。
 ### 支持的配置
 
 当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
-head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy draft、DP=1/CP=1、
-ACL graph、异步调度和 task pipeline。必须启用 graph warmup；添加
+head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy draft、CP=1、
+ACL graph、异步调度和 task pipeline。普通 ACL graph 也支持 DP：所有分片接收
+一致的 n−2 confidence 元数据，选择共同的物理 target graph 桶，并保留各自的
+draft 验证预算，不在 draft 与 target 之间增加 Device 回读或 collective。
+必须启用 graph warmup；添加
 `--enable_unified_mtp_graph=true` 可捕获完整自适应轮次，包括 greedy heads、
 confidence 共识、打包、验证及已接受 context 更新。unified graph 当前仅支持
-`temperature=0`；正温度或混合温度请求必须使用普通 graph，若开启 unified graph
+DP=1 和 `temperature=0`；正温度或混合温度请求必须使用普通 graph，若开启 unified graph
 则会在执行前拒绝，不会静默改成 greedy。固定步数 DSpark 和其他算法的执行限制
 保持各自原有约定。
+
+DP=2 使用 `--dp_size=2 --enable_unified_mtp_graph=false`。标定请求桶表示每个
+DP 分片的容量，例如桶 4 会同时构造 8 条合成请求；全局请求数和 token 上限
+需要容纳所有分片。已保存成本表的兼容性元数据包含 DP 拓扑，不能直接复用
+DP=1 的表来运行 DP=2。
 
 ### 启动示例
 

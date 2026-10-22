@@ -257,6 +257,32 @@ def test_adaptive_prepared_binding_ignores_live_device_control(
     runner._fill_entry.assert_not_called()
 
 
+@pytest.mark.parametrize("dp_rank", [0, 1])
+@pytest.mark.parametrize("draft_width", [5, 7])
+def test_adaptive_prepared_dp_requires_common_physical_rows(
+    runner: PreparedAclGraphRunner, dp_rank: int, draft_width: int
+) -> None:
+    runner.max_batch = 8
+    runner.dp_size = 2
+    runner.dp_rank = dp_rank
+    runner.attention_backend.is_mla = True
+    runner.attention_backend.logical_page_size = 128
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"), draft_width=draft_width)
+    metadata.dp_execution_token_counts = (8, 8)
+    metadata.dp_is_decode = (True, True)
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    binding = runner._prepared_binding(tokens, positions, metadata, dspark_adaptive=inputs)
+    for raw_counts in ((0, 1), (3, 2)):
+        metadata.raw_dp_execution_token_counts = raw_counts
+        inputs.control.fill_(1 | (int(raw_counts[dp_rank] == 0) << 32))
+        runner.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+        assert runner._prepared_binding(tokens, positions, metadata, dspark_adaptive=inputs) == binding
+    assert runner._capture.call_count == 1
+    metadata.dp_execution_token_counts = (8, 4)
+    with pytest.raises(ValueError, match="execution counts|same decode batch"):
+        runner.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -335,16 +361,14 @@ def test_adaptive_and_ordinary_prepared_bindings_can_coexist(runner: PreparedAcl
     assert len(runner._prepared_graphs) == 2
 
 
-@pytest.mark.parametrize("case", ["dp", "draft", "attention", "hidden", "topk"])
+@pytest.mark.parametrize("case", ["draft", "attention", "hidden", "topk"])
 def test_adaptive_prepared_rejects_non_target_contract(runner: PreparedAclGraphRunner, case: str) -> None:
     runner.max_batch = 8
     runner.attention_backend.is_mla = True
     runner.attention_backend.logical_page_size = 128
     tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
     hidden = topk = None
-    if case == "dp":
-        runner.dp_size = 2
-    elif case == "draft":
+    if case == "draft":
         runner._block_draft = True
     elif case == "attention":
         runner.attention_backend.is_mla = False

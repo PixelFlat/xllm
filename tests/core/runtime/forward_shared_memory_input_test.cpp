@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -92,6 +93,21 @@ class ForwardSharedMemoryInputTest : public ::testing::Test {
 using TokenInputTypes =
     ::testing::Types<LlmForwardInput, VlmForwardInput, RecForwardInput>;
 TYPED_TEST_SUITE(ForwardSharedMemoryInputTest, TokenInputTypes);
+
+TYPED_TEST(ForwardSharedMemoryInputTest,
+           RejectsPackedInputSchemaBeforeDpFeedback) {
+  const TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(source.to_packed_proto(&packed));
+  constexpr uint16_t kPreviousVersion = 8;
+  ASSERT_GE(packed.payload().size(),
+            sizeof(uint64_t) + sizeof(kPreviousVersion));
+  std::memcpy(packed.mutable_payload()->data() + sizeof(uint64_t),
+              &kPreviousVersion,
+              sizeof(kPreviousVersion));
+  TypeParam decoded;
+  EXPECT_FALSE(decoded.from_packed_proto(packed));
+}
 
 TYPED_TEST(ForwardSharedMemoryInputTest,
            PackedInputPreservesEngineSelectedMtpDepth) {
@@ -177,6 +193,26 @@ TYPED_TEST(ForwardSharedMemoryInputTest,
   expect_role_offsets(decoded.transfer_kv_infos.front()
                           .dst_virtual_kv_cache_layer_global_offsets,
                       shorter);
+}
+
+TYPED_TEST(ForwardSharedMemoryInputTest,
+           PackedInputPreservesDpLaggedConfidence) {
+  TypeParam source = make_input<TypeParam>({});
+  auto& parallel = source.input_params.parallel;
+  parallel.dp_global_token_nums = {2, 1};
+  parallel.raw_dp_global_token_nums = {2, 1};
+  parallel.dp_global_sequence_nums = {1, 1};
+  parallel.dp_dspark_confidence.assign(14, 0.4F);
+  parallel.dp_dspark_rounds_since_full_width = {2, 5};
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(source.to_packed_proto(&packed));
+  TypeParam lazy;
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  const auto decoded = lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
+  EXPECT_EQ(decoded.input_params.parallel.dp_dspark_confidence,
+            parallel.dp_dspark_confidence);
+  EXPECT_EQ(decoded.input_params.parallel.dp_dspark_rounds_since_full_width,
+            parallel.dp_dspark_rounds_since_full_width);
 }
 
 }  // namespace

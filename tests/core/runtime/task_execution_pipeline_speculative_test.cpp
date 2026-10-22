@@ -1016,6 +1016,30 @@ class SpeculativePipelineTest : public ::testing::Test {
     return value;
   }
 
+  LlmForwardInput dspark_dp_batch_input(uint32_t batch_size, bool decode) {
+    auto value = dspark_batch_input(batch_size, decode);
+    auto& parallel = value.input_params.parallel;
+    parallel.dp_global_token_nums.assign(capacity_.common.dp_size,
+                                         batch_size * (decode ? 1 : 2));
+    parallel.raw_dp_global_token_nums = parallel.dp_global_token_nums;
+    parallel.dp_global_sequence_nums.assign(capacity_.common.dp_size,
+                                            batch_size);
+    parallel.dp_global_kv_max_seq_lens.assign(capacity_.common.dp_size,
+                                              decode ? 3 : 2);
+    parallel.dp_is_decode.assign(capacity_.common.dp_size, decode ? 1 : 0);
+    return value;
+  }
+
+  void warmup_dspark_dp_graphs() {
+    for (const uint32_t batch_size : {1U, 2U, 3U}) {
+      execute(dspark_dp_batch_input(batch_size, /*decode=*/false));
+      auto warmup = dspark_dp_batch_input(batch_size, /*decode=*/true);
+      warmup.input_params.meta.is_graph_warmup = true;
+      const auto output = execute(warmup);
+      ASSERT_TRUE(output.is_graph_warmup);
+    }
+  }
+
   void warmup_dspark_batch_graphs() {
     for (uint32_t batch_size = 1;
          batch_size <=
@@ -2431,6 +2455,84 @@ TEST_F(SpeculativePipelineTest, DSparkRejectsUnsupportedTopologyBeforeLaunch) {
                    pipeline_)
                    .ok());
   EXPECT_EQ(pipeline_, nullptr);
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveDsparkDpUsesCommonPrunedGraphAndReturnsFeedback) {
+  configure_adaptive_dspark();
+  capacity_.common.dp_size = 2;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs();
+  execute(dspark_dp_batch_input(1, /*decode=*/false));
+  auto decode = dspark_dp_batch_input(1, /*decode=*/true);
+  decode.input_params.parallel.dp_dspark_confidence.assign(14, 0.01F);
+  decode.input_params.parallel.dp_dspark_rounds_since_full_width.assign(2, 1);
+  const auto output = execute(decode);
+  ASSERT_TRUE(output.sample_output.next_tokens.defined());
+  EXPECT_EQ(output.dspark_feedback.confidence.size(), 7U);
+  EXPECT_EQ(output.dspark_feedback.rounds_since_full_width.size(), 1U);
+  EXPECT_EQ(target_->forward_counts.back(), (std::vector<int32_t>{1, 1}));
+  EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{7, 7}));
+  ASSERT_EQ(output.spec_verify_layouts.size(), 1U);
+  EXPECT_EQ(output.spec_verify_layouts.front().verify_len, 0);
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveDsparkDpKeepsPeerKvBoundOutOfLocalPageTable) {
+  configure_adaptive_dspark();
+  auto profile = capacity_.adaptive_costs->lookup(/*draft_requests=*/1,
+                                                  /*max_kv_length=*/27);
+  ASSERT_TRUE(profile);
+  // Only the global peer KV bound is calibrated. A local-bound cost lookup
+  // would choose full width instead of the one-row pruned graph below.
+  profile->min_kv_length = 27;
+  auto costs = std::make_shared<SpecCostProfileStore>();
+  ASSERT_TRUE(costs->store(std::move(*profile)));
+  capacity_.adaptive_costs = std::move(costs);
+  capacity_.common.dp_size = 2;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs();
+  execute(dspark_dp_batch_input(1, /*decode=*/false));
+  auto decode = dspark_dp_batch_input(1, /*decode=*/true);
+  auto& host = decode.input_params.attention.host;
+  // The local request needs only its first 16-token page. Its peer has
+  // progressed into a second page, without changing the common graph tier.
+  host.block_tables = host.block_tables.narrow(1, 0, 1).contiguous();
+  auto& parallel = decode.input_params.parallel;
+  parallel.dp_global_kv_max_seq_lens = {3, 20};
+  parallel.dp_dspark_confidence.assign(14, 0.01F);
+  parallel.dp_dspark_rounds_since_full_width.assign(2, 1);
+  const auto output = execute(decode);
+  ASSERT_TRUE(output.sample_output.next_tokens.defined());
+  EXPECT_EQ(output.sample_output.next_tokens[0][0].item<int64_t>(), 4);
+  EXPECT_EQ(output.dspark_feedback.confidence.size(), 7U);
+  EXPECT_EQ(target_->forward_counts.back(), (std::vector<int32_t>{1, 1}));
+  EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{7, 7}));
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveDsparkDpIdleShardRetainsCommonModelShapes) {
+  configure_adaptive_dspark();
+  capacity_.common.dp_size = 2;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs();
+  auto idle = dspark_dp_batch_input(0, /*decode=*/true);
+  auto& parallel = idle.input_params.parallel;
+  parallel.dp_global_token_nums = {0, 1};
+  parallel.raw_dp_global_token_nums = {0, 1};
+  parallel.dp_global_sequence_nums = {0, 1};
+  parallel.dp_global_kv_max_seq_lens = {0, 3};
+  parallel.dp_dspark_confidence.assign(7, 0.01F);
+  parallel.dp_dspark_rounds_since_full_width = {1};
+  const auto output = execute(idle);
+  EXPECT_TRUE(output.dspark_feedback.confidence.empty());
+  EXPECT_TRUE(!output.sample_output.next_tokens.defined() ||
+              output.sample_output.next_tokens.numel() == 0);
+  EXPECT_EQ(target_->forward_counts.back(), (std::vector<int32_t>{1, 1}));
+  EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{7, 7}));
 }
 
 TEST_F(SpeculativePipelineTest,

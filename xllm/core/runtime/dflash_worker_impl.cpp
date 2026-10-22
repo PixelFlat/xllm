@@ -372,6 +372,14 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
         "dense target attention needs a device-length prepared contract.");
   }
   const auto& draft_args = draft_impl_->context_.get_model_args();
+  if (options_.enable_adaptive_target_verify() &&
+      parallel_args_.dp_size() > 1 &&
+      ExecutionConfig::get_instance().enable_unified_mtp_graph()) {
+    return ::xllm::Status(
+        StatusCode::INVALID_ARGUMENT,
+        "Adaptive DSpark DP currently requires split ACL graphs; "
+        "disable unified graphs.");
+  }
   if (draft_args.hidden_size() != capacity.common.hidden_size ||
       draft_args.vocab_size() != capacity.common.vocab_size ||
       expected_context_hidden_size_ <= 0 ||

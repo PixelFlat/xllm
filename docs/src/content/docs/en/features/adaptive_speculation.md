@@ -125,14 +125,24 @@ scripts and JSON configurations; the old name is not an alias.
 
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
 draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy draft sampling,
-DP=1/CP=1, ACL graphs, schedule overlap and task pipeline. Graph warmup must be
+CP=1, ACL graphs, schedule overlap and task pipeline. Ordinary ACL graphs also
+support data parallelism. All DP shards receive the same retired n-2 confidence
+metadata and select a common physical target graph, with separate local draft
+budgets. This adds no Device readback or collective between Draft and Target.
+Graph warmup must be
 enabled. Add `--enable_unified_mtp_graph=true` to capture each complete adaptive
 round, including the greedy heads, confidence consensus, packing, verification
-and accepted-context update. Unified graphs currently require `temperature=0`;
+and accepted-context update. Unified graphs currently require DP=1 and `temperature=0`;
 positive or mixed temperatures must use ordinary graphs. Such requests are
 rejected before execution when unified graphs are enabled, never silently
 decoded greedily. Fixed-width DSpark and other algorithms retain their own
 execution contracts.
+
+For DP=2 use `--dp_size=2 --enable_unified_mtp_graph=false`. Calibration request
+buckets are per-DP-shard capacities: a bucket of four uses eight simultaneous
+synthetic requests. Keep the global sequence/token limits large enough for all
+shards. Saved cost tables include DP topology in their compatibility metadata;
+do not reuse a DP=1 table for DP=2.
 
 ### Launch example
 

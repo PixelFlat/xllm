@@ -5,6 +5,7 @@ cc_library(
     speculative
   HDRS
     adaptive/verify_budget_planner.h
+    adaptive/dspark_dp_coordinator.h
     adaptive/spec_cost_profile_store.h
     adaptive/spec_cost_model.h
     adaptive/spec_window_collector.h
@@ -24,6 +25,7 @@ cc_library(
     spec_verify.h
   SRCS
     adaptive/verify_budget_planner.cpp
+    adaptive/dspark_dp_coordinator.cpp
     adaptive/spec_cost_profile_store.cpp
     adaptive/spec_cost_model.cpp
     adaptive/spec_window_collector.cpp

@@ -425,6 +425,7 @@ void WorkerService::collect_llm_output(const ForwardOutput& output,
                                        bool cpu_ready_result) {
   cpu_output.prepared_token = output.prepared_token;
   cpu_output.json_object_errors = output.json_object_errors;
+  cpu_output.dspark_feedback = output.dspark_feedback;
   const auto& sample = output.sample_output;
   const auto& beam = output.beam_search_output;
   auto copy_output_to_host = [&]() {

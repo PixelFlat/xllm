@@ -570,5 +570,93 @@ TEST(VerifyBudgetPlannerTest,
   EXPECT_EQ(plan->draft_budget, 14U);
 }
 
+TEST(VerifyBudgetPlannerTest, DpBudgetsShareOneGraphWithUnequalAndEmptyShards) {
+  const auto options = profile_options();
+  const std::array<int32_t, 2> counts{1, 2};
+  const std::vector<float> confidence(21, 0.01F);
+  const auto plan = VerifyBudgetPlanner::parallel_plan(
+      counts, confidence, {}, kCosts, options);
+  ASSERT_TRUE(plan);
+  ASSERT_EQ(plan->size(), 2U);
+  EXPECT_EQ((*plan)[0].graph_rows, 2U);
+  EXPECT_EQ((*plan)[1].graph_rows, 2U);
+  EXPECT_EQ((*plan)[0].draft_budget, 1U);
+  EXPECT_EQ((*plan)[1].draft_budget, 0U);
+
+  const std::array<int32_t, 2> idle{0, 2};
+  const auto empty = VerifyBudgetPlanner::parallel_plan(
+      idle, std::vector<float>(14, 0.01F), {}, kCosts, options);
+  ASSERT_TRUE(empty);
+  EXPECT_EQ((*empty)[0].draft_budget, 0U);
+  EXPECT_EQ((*empty)[0].graph_rows, (*empty)[1].graph_rows);
+}
+
+TEST(VerifyBudgetPlannerTest,
+     DpMissingFeedbackAndExplorationKeepRequiredFullWidth) {
+  const std::array<int32_t, 2> counts{1, 2};
+  const auto options = profile_options();
+  const auto cold =
+      VerifyBudgetPlanner::parallel_plan(counts, {}, {}, kCosts, options);
+  ASSERT_TRUE(cold);
+  EXPECT_EQ((*cold)[0].graph_rows, 16U);
+  EXPECT_EQ((*cold)[0].draft_budget, 7U);
+  EXPECT_EQ((*cold)[1].draft_budget, 14U);
+  std::vector<float> confidence(7, -1.0F);
+  confidence.insert(confidence.end(), 14, 0.01F);
+  const auto partial = VerifyBudgetPlanner::parallel_plan(
+      counts, confidence, {}, kCosts, options);
+  ASSERT_TRUE(partial);
+  EXPECT_EQ((*partial)[0].graph_rows, 8U);
+  EXPECT_EQ((*partial)[0].draft_budget, 7U);
+  EXPECT_EQ((*partial)[1].draft_budget, 6U);
+  const std::array<uint64_t, 3> rounds{0, 32, 0};
+  const auto explored = VerifyBudgetPlanner::parallel_plan(
+      counts, std::vector<float>(21, 0.01F), rounds, kCosts, options);
+  ASSERT_TRUE(explored);
+  EXPECT_EQ((*explored)[0].graph_rows, 16U);
+  EXPECT_EQ((*explored)[1].draft_budget, 14U);
+}
+
+TEST(VerifyBudgetPlannerTest, DpKeepsKernelLimitsOutsideSharedPlanning) {
+  const std::array<int32_t, 2> counts{1, 1};
+  const std::array<SpecGraphCost, 2> costs{{{1, 1.0}, {128, 128.0}}};
+  for (const uint32_t width : {1U, 3U, 5U, 7U, 64U}) {
+    auto options = profile_options();
+    options.draft_width = width;
+    const auto plan =
+        VerifyBudgetPlanner::parallel_plan(counts, {}, {}, costs, options);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ((*plan)[0].draft_budget, width);
+    EXPECT_EQ((*plan)[1].draft_budget, width);
+    options.draft_width = std::numeric_limits<uint32_t>::max() - 1;
+    const std::array<int32_t, 2> overflowing{2, 1};
+    EXPECT_FALSE(VerifyBudgetPlanner::parallel_plan(
+        overflowing, {}, {}, costs, options));
+  }
+}
+
+TEST(VerifyBudgetPlannerTest, DpSupportsBothWidthsAndRejectsMalformedMetadata) {
+  const std::array<int32_t, 2> counts{1, 1};
+  for (const uint32_t width : {5U, 7U}) {
+    auto options = profile_options();
+    options.draft_width = width;
+    const auto plan = VerifyBudgetPlanner::parallel_plan(
+        counts, std::vector<float>(2 * width, 0.01F), {}, kCosts, options);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ((*plan)[0].graph_rows, (*plan)[1].graph_rows);
+    EXPECT_LT((*plan)[0].draft_budget, width);
+    EXPECT_FALSE(VerifyBudgetPlanner::parallel_plan(
+        counts, std::vector<float>(width, 0.01F), {}, kCosts, options));
+    EXPECT_FALSE(VerifyBudgetPlanner::parallel_plan(
+        counts, std::vector<float>(2 * width, -0.5F), {}, kCosts, options));
+    const std::array<int32_t, 2> negative{-1, 1};
+    EXPECT_FALSE(
+        VerifyBudgetPlanner::parallel_plan(negative, {}, {}, kCosts, options));
+    const std::array<int32_t, 2> idle{0, 0};
+    EXPECT_FALSE(
+        VerifyBudgetPlanner::parallel_plan(idle, {}, {}, kCosts, options));
+  }
+}
+
 }  // namespace
 }  // namespace xllm

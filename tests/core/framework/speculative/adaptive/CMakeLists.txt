@@ -1,6 +1,15 @@
 include(cc_test)
 
 cc_test(
+  NAME dspark_dp_coordinator_test
+  NO_NPU_RUNTIME
+  SRCS
+    dspark_dp_coordinator_test.cpp
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/adaptive/dspark_dp_coordinator.cpp"
+  DEPS GTest::gtest_main
+)
+
+cc_test(
   NAME
     draft_step_selector_test
   SRCS

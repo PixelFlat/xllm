@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "core/framework/speculative/adaptive/spec_cost_model.h"
 
@@ -77,6 +78,18 @@ class VerifyBudgetPlanner final {
       const VerifyBudgetOptions& options,
       std::optional<VerifyBudgetPlan> previous = std::nullopt,
       uint64_t rounds_since_full_width = 0);
+
+  // Every shard receives the same retired feedback and computes the same
+  // physical graph G. Budgets remain shard local; the score sums expected
+  // progress across shards for the common measured step cost. A -1 feedback
+  // value means an unseen request and requires that shard to run full width.
+  // Empty shards keep budget zero but participate in the selected graph.
+  static std::optional<std::vector<VerifyBudgetPlan>> parallel_plan(
+      std::span<const int32_t> requests,
+      std::span<const float> lagged_confidence,
+      std::span<const uint64_t> rounds_since_full_width,
+      std::span<const SpecGraphCost> prewarmed_costs,
+      const VerifyBudgetOptions& options);
 };
 
 }  // namespace xllm

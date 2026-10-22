@@ -118,6 +118,26 @@ class ForwardSharedMemoryOutputTest : public ::testing::Test {
   std::unique_ptr<ForwardSharedMemoryManager> reader_;
 };
 
+TEST_F(ForwardSharedMemoryOutputTest, LlmPreservesDsparkHostFeedback) {
+  ForwardOutput source;
+  source.sample_output.next_tokens = torch::tensor({7, 9}, torch::kInt64);
+  source.dspark_feedback.confidence.assign(14, 0.5F);
+  source.dspark_feedback.rounds_since_full_width = {3, 4};
+  ASSERT_TRUE(
+      writer_->llm_output_write(source, /*speculative_token_stats=*/{}));
+  RawForwardOutput decoded;
+  ASSERT_TRUE(reader_->llm_output_read(decoded));
+  EXPECT_EQ(decoded.dspark_feedback.confidence,
+            source.dspark_feedback.confidence);
+  EXPECT_EQ(decoded.dspark_feedback.rounds_since_full_width,
+            source.dspark_feedback.rounds_since_full_width);
+  const uint64_t version = published_version();
+  source.dspark_feedback.confidence.pop_back();
+  EXPECT_FALSE(
+      writer_->llm_output_write(source, /*speculative_token_stats=*/{}));
+  EXPECT_EQ(published_version(), version);
+}
+
 TEST_F(ForwardSharedMemoryOutputTest,
        LlmPreservesSpeculativeTokensAndJsonErrors) {
   ForwardOutput source;

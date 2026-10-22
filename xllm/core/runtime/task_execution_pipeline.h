@@ -339,6 +339,8 @@ class TaskExecutionPipeline final {
   void launch_adaptive_dspark(SpeculativeSlot& slot);
   Status plan_adaptive_dspark(SpeculativeSlot& slot,
                               const LlmForwardInput& input);
+  Status plan_dp_adaptive_dspark(SpeculativeSlot& slot,
+                                 const LlmForwardInput& input);
   Status warmup_adaptive_dspark_graphs(const LlmForwardInput& input);
   Status warmup_adaptive_unified_graphs(const LlmForwardInput& input);
   std::vector<SpecCalibrationGraphCoverage> adaptive_dspark_graph_coverage()

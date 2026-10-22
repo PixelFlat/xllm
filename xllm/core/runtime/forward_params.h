@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/speculative/adaptive/dspark_dp_coordinator.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "framework/config/execution_config.h"
 #include "framework/model/llm_model_params.h"
@@ -624,6 +625,7 @@ class ForwardOutput final {
   // the sole marker of a verify result (ordinary decode emits 1-D tokens);
   // consumed before proto/shared-memory serialization.
   std::vector<VerifyRowLayout> spec_verify_layouts;
+  DSparkDpFeedback dspark_feedback;
   std::vector<JsonObjectOutputError> json_object_errors;
   // Keep no-sync input tensor handles alive until downstream consumers finish
   // using outputs on the same compute stream. Composite workers append child
@@ -688,6 +690,7 @@ struct RawSampleOutput {
 
 class RawForwardOutput final {
  public:
+  DSparkDpFeedback dspark_feedback;
   std::vector<RawSampleOutput> outputs;  // num seqs
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<int64_t> expert_load_data;

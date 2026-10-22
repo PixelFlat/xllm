@@ -92,6 +92,16 @@ bool decode_llm_output(const proto::LLMForwardResponse& response,
                        RawForwardOutput& output) {
   Timer timer;
   RawForwardOutput decoded_output;
+  decoded_output.dspark_feedback.confidence.assign(
+      response.dspark_confidence().begin(), response.dspark_confidence().end());
+  decoded_output.dspark_feedback.rounds_since_full_width.assign(
+      response.dspark_rounds_since_full_width().begin(),
+      response.dspark_rounds_since_full_width().end());
+  if (!valid_dspark_dp_feedback(decoded_output.dspark_feedback,
+                                response.outputs_size())) {
+    LOG(ERROR) << "Invalid adaptive DSpark feedback layout.";
+    return false;
+  }
   decoded_output.expert_load_data.assign(response.expert_load_data().begin(),
                                          response.expert_load_data().end());
   decoded_output.src_seq_idxes.assign(response.src_seq_idxes().begin(),
@@ -176,6 +186,11 @@ bool encode_llm_output(
   }
   proto::LLMForwardResponse encoded_output;
   proto::LLMForwardResponse* pb_forward_output = &encoded_output;
+  ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_dspark_confidence(),
+                      output.dspark_feedback.confidence);
+  ADD_VECTOR_TO_PROTO(
+      pb_forward_output->mutable_dspark_rounds_since_full_width(),
+      output.dspark_feedback.rounds_since_full_width);
   Timer timer;
   if (!valid_token_output(
           next_tokens, logprobs, top_tokens, top_logprobs, embeddings) ||
@@ -208,6 +223,10 @@ bool encode_llm_output(
   if (!speculative_token_stats.empty() &&
       speculative_token_stats.size() != static_cast<size_t>(num_seqs)) {
     LOG(ERROR) << "Speculative token stats must match forward output rows.";
+    return false;
+  }
+  if (!valid_dspark_dp_feedback(output.dspark_feedback, num_seqs)) {
+    LOG(ERROR) << "Invalid adaptive DSpark feedback layout.";
     return false;
   }
   if (embeddings.defined() &&

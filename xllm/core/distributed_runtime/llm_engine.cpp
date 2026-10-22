@@ -128,6 +128,13 @@ LLMEngine::LLMEngine(
   // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
   // DP-local TP width is divided by CP.
   dp_local_tp_size_ = dp_local_size_ / cp_size;
+  if (dp_size_ > 1 && options_.enable_adaptive_target_verify() &&
+      SpeculativeConfig::is_dspark_algorithm(
+          options_.speculative_algorithm()) &&
+      !options_.is_draft_engine()) {
+    dspark_dp_coordinator_ = std::make_unique<DSparkDpCoordinator>(
+        options_.num_speculative_tokens());
+  }
 
   process_group_test();
   if (options_.enable_adaptive_draft_step() && !options_.is_draft_engine()) {
@@ -604,6 +611,48 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
       << "The processed forward inputs size " << forward_inputs.size()
       << " is not equal to dp size " << dp_size_ << ".";
 
+  if (dspark_dp_coordinator_ != nullptr && !is_graph_warmup) {
+    std::vector<std::vector<std::string>> sequence_ids;
+    sequence_ids.reserve(forward_inputs.size());
+    for (uint32_t shard = 0; shard < forward_inputs.size(); ++shard) {
+      const auto& embedding = forward_inputs[shard].input_params.embedding;
+      CHECK_EQ(embedding.embedding_ids.size(), embedding.request_ids.size());
+      std::vector<std::string> ids;
+      ids.reserve(embedding.embedding_ids.size());
+      for (uint32_t row = 0; row < embedding.embedding_ids.size(); ++row) {
+        ids.emplace_back(std::to_string(shard) + ":" +
+                         std::to_string(embedding.embedding_ids[row]) + ":" +
+                         embedding.request_ids[row]);
+      }
+      sequence_ids.emplace_back(std::move(ids));
+    }
+    const auto& parallel = forward_inputs.front().input_params.parallel;
+    const bool decode = std::all_of(parallel.dp_is_decode.begin(),
+                                    parallel.dp_is_decode.end(),
+                                    [](int32_t phase) { return phase == 1; });
+    const auto feedback =
+        dspark_dp_coordinator_->prepare(std::move(sequence_ids), decode);
+    CHECK(feedback.has_value()) << "Invalid adaptive DSpark DP dispatch order.";
+    std::vector<int32_t> kv_bounds = parallel.dp_global_kv_max_seq_lens;
+    if (decode) {
+      for (uint32_t shard = 0; shard < forward_inputs.size(); ++shard) {
+        const torch::Tensor tokens = forward_inputs[shard].host_token_ids();
+        const bool pending =
+            tokens.defined() && tokens.numel() != 0 &&
+            std::any_of(tokens.const_data_ptr<int32_t>(),
+                        tokens.const_data_ptr<int32_t>() + tokens.numel(),
+                        [](int32_t token) { return token < 0; });
+        kv_bounds[shard] += pending ? options_.num_speculative_tokens() : 0;
+      }
+    }
+    for (auto& input : forward_inputs) {
+      input.input_params.parallel.dp_dspark_confidence = feedback->confidence;
+      input.input_params.parallel.dp_dspark_rounds_since_full_width =
+          feedback->rounds_since_full_width;
+      input.input_params.parallel.dp_global_kv_max_seq_lens = kv_bounds;
+    }
+  }
+
   std::vector<folly::SemiFuture<std::optional<RawForwardOutput>>> futures;
   futures.reserve(worker_clients_num_);
 
@@ -712,6 +761,16 @@ void LLMEngine::update_last_step_result(BatchGroup& last_batch) {
     if (!is_graph_warmup) {
       observe_draft_step_acceptance(raw_forward_outputs.back());
     }
+  }
+
+  if (dspark_dp_coordinator_ != nullptr && !is_graph_warmup) {
+    std::vector<DSparkDpFeedback> feedback;
+    feedback.reserve(raw_forward_outputs.size());
+    for (auto& output : raw_forward_outputs) {
+      feedback.emplace_back(std::move(output.dspark_feedback));
+    }
+    CHECK(dspark_dp_coordinator_->retire(feedback))
+        << "Invalid adaptive DSpark DP result or retirement order.";
   }
 
   for (auto i = 0; i < last_batch.size(); i++) {

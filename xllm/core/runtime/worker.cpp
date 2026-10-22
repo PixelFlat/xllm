@@ -138,7 +138,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
             (!options.enable_adaptive_target_verify() ||
              (SpeculativeConfig::is_dspark_algorithm(
                   options.speculative_algorithm()) &&
-              options.enable_graph() && parallel_args.dp_size() == 1)))) &&
+              options.enable_graph())))) &&
           !options.enable_prefill_piecewise_graph() &&
           !options.enable_offline_inference() &&
           !EPLBConfig::get_instance().enable_eplb() &&
@@ -146,7 +146,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !LoadConfig::get_instance().enable_rolling_load() &&
           parallel_args.layerwise_split_size() == 1)
         << "Task pipeline requires Python LLM, fixed "
-           "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs with DP=1 and "
+           "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs and "
            "a layerwise split of one.";
     CHECK(options.host_blocks_factor() <= 1.0 ||
           (Platform::is_npu() && (!options.enable_speculative_decode() ||

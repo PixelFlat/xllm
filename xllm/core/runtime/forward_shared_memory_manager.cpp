@@ -103,7 +103,7 @@ constexpr PackedInputDomain packed_input_domain() {
   return PackedInputDomain::LLM;
 }
 constexpr uint64_t kPackedInputMagic = 0x584c4c4d494e5032;
-constexpr uint16_t kPackedInputSchemaVersion = 8;
+constexpr uint16_t kPackedInputSchemaVersion = 9;
 constexpr uint32_t kPackedInputHeaderBytes = 40;
 
 struct RawInputLayoutHeader final {
@@ -2674,6 +2674,8 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.dp_global_kv_max_seq_lens);
   read_vector(context, input_params.parallel.dp_global_json_object_active);
   read_vector(context, input_params.parallel.dp_is_decode);
+  read_vector(context, input_params.parallel.dp_dspark_confidence);
+  read_vector(context, input_params.parallel.dp_dspark_rounds_since_full_width);
   read_vector(context, input_params.embedding.embedding_ids);
   read_vector(context, input_params.embedding.linear_state_ids);
   read_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
@@ -3014,6 +3016,9 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor,
                input_params.parallel.dp_global_json_object_active);
   write_vector(context.descriptor, input_params.parallel.dp_is_decode);
+  write_vector(context.descriptor, input_params.parallel.dp_dspark_confidence);
+  write_vector(context.descriptor,
+               input_params.parallel.dp_dspark_rounds_since_full_width);
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
   write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
@@ -3934,6 +3939,10 @@ bool ForwardSharedMemoryManager::llm_output_write(
     return false;
   }
 
+  if (!valid_dspark_dp_feedback(output.dspark_feedback, row_count)) {
+    LOG(ERROR) << "Invalid adaptive DSpark shared-memory feedback layout.";
+    return false;
+  }
   const bool speculative = tokens.defined() && tokens.dim() == 2;
   const int64_t token_columns = speculative ? tokens.size(1) : 1;
   const bool has_tokens = tokens.defined() && tokens.numel() > 0;
@@ -3985,6 +3994,10 @@ bool ForwardSharedMemoryManager::llm_output_write(
       4 * sizeof(uint64_t) + expert_count * sizeof(int64_t) +
       static_cast<uint64_t>(beam_count) * (2 * sizeof(int32_t) + sizeof(float));
   payload_bytes += sizeof(int64_t) + sizeof(bool);
+  payload_bytes +=
+      2 * sizeof(uint64_t) +
+      output.dspark_feedback.confidence.size() * sizeof(float) +
+      output.dspark_feedback.rounds_since_full_width.size() * sizeof(uint64_t);
   if (size() < static_cast<int64_t>(sizeof(ControlMetadata)) ||
       payload_bytes > static_cast<uint64_t>(size()) - sizeof(ControlMetadata)) {
     LOG(ERROR) << "LLM shared-memory output size exceeds segment capacity";
@@ -4063,6 +4076,12 @@ bool ForwardSharedMemoryManager::llm_output_write(
       static_cast<uint64_t>(beam_count));
   write_data(cursor, output.prepared_token);
   write_data(cursor, /*has_dit_output=*/false);
+  write_output_values(cursor,
+                      output.dspark_feedback.confidence.data(),
+                      output.dspark_feedback.confidence.size());
+  write_output_values(cursor,
+                      output.dspark_feedback.rounds_since_full_width.data(),
+                      output.dspark_feedback.rounds_since_full_width.size());
   CHECK_EQ(static_cast<uint64_t>(cursor - payload_begin), payload_bytes);
   std::atomic_thread_fence(std::memory_order_release);
   control_ptr_->version = ++last_version_;
@@ -4102,6 +4121,9 @@ bool ForwardSharedMemoryManager::llm_output_read(RawForwardOutput& output) {
       !reader.read_vector(decoded.out_logprobs) ||
       !reader.read(decoded.prepared_token) ||
       !reader.read_bool(has_dit_output) || has_dit_output ||
+      !reader.read_vector(decoded.dspark_feedback.confidence) ||
+      !reader.read_vector(decoded.dspark_feedback.rounds_since_full_width) ||
+      !valid_dspark_dp_feedback(decoded.dspark_feedback, rows) ||
       decoded.src_seq_idxes.size() != decoded.out_tokens.size() ||
       decoded.src_seq_idxes.size() != decoded.out_logprobs.size()) {
     LOG(ERROR) << "Invalid LLM shared-memory output fields";
