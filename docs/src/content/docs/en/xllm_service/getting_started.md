@@ -7,7 +7,7 @@ title: "Build and run"
 
 Build service in a Linux development environment with CMake 3.26 or later, a compiler supporting C++20, Rust/Cargo, Python with PyTorch, Git and the native build tools required by its dependencies. Most service targets use C++17; the DeepSeek V4 chat-template target requires C++20. For Ascend engines, prepare the compatible xLLM/CANN environment using [Quick start](/en/getting_started/quick_start/). Install the etcd server separately using the [official releases](https://github.com/etcd-io/etcd/releases).
 
-Service uses vcpkg for dependencies including Boost, gRPC, Protobuf, OpenSSL and, in the KV events revision, ZeroMQ. ZeroMQ comes from service's own manifest and does not require Motor build artifacts. CMake detects PyTorch's C++ ABI; use a consistent build environment. `prepare.sh` patches cpprestsdk for the etcd C++ client's static-library requirement.
+Service uses vcpkg for dependencies including Boost, gRPC, Protobuf, OpenSSL and ZeroMQ. CMake detects PyTorch's C++ ABI; use a consistent build environment. `prepare.sh` patches cpprestsdk for the etcd C++ client's static-library requirement.
 
 ## Build service
 
@@ -51,7 +51,7 @@ From the service repository, start the combined HTTP/RPC entry point:
   --tokenizer_path=/models/Qwen2-7B-Instruct
 ```
 
-`tokenizer_path` must contain the tokenizer configuration for the engines' model. HTTP accepts client requests; RPC communicates with engines. The HTTP port may remain closed until a complete instance group registers.
+`tokenizer_path` must contain the tokenizer configuration for the engines' model. HTTP accepts client requests; RPC communicates with engines. The HTTP port may remain closed until a complete instance group registers. Engines must be able to reach the RPC port; in PD mode, Decode returns all generated tokens, including the first, through this port.
 
 ## Start engines
 

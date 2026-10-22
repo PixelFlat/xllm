@@ -3,15 +3,11 @@ title: "KV events and CAR"
 ---
 <!-- Copyright 2026 The xLLM Authors. Licensed under the Apache License, Version 2.0. -->
 
-## Version requirements
-
-This page describes the tiered KV events directory and CAR implementation introduced by [xllm-service PR #93](https://github.com/xLLM-AI/xllm-service/pull/93) (reference revision `eb388de`). Build a service revision containing that change and use an xLLM engine supporting the event and full-snapshot protocols described here. Older service releases require an upgrade. See [Build and run](/en/xllm_service/getting_started/) for the base deployment.
-
 ## What the directory tracks
 
 Service subscribes to xLLM ZeroMQ KV events in background threads and maintains a prefix directory separated by instance, DP rank and Device/Host tier. It stores metadata, never KV tensors. `kv_directory` handles subscriptions and discovery, `kv_index` maintains tiered prefixes, and `kv_event_decoder` decodes events.
 
-CAR and the internal query endpoint share this directory. This revision replaces the old GlobalKVCacheMgr, KV heartbeat consumption and KV etcd reads/writes/watch. Instance discovery, health checks, load heartbeats and load synchronization through etcd remain. RR and SLO_AWARE retain their selection logic.
+CAR and the internal query endpoint share this directory. KV metadata comes from engine events. Instance discovery, health checks and load synchronization use etcd; KV metadata does not. RR and SLO_AWARE retain their selection logic.
 
 ## Configure engines and service
 
@@ -154,15 +150,15 @@ D does not receive prefix-hit credit for reserved blocks. Equal-cost candidates 
 
 Service can choose an instance but cannot pin its internal DP rank. A multi-DP instance therefore receives the **minimum hit ratio across all its DP ranks**, never the best rank or a sum. A missing or unsynchronized DP makes the instance's hit ratio zero; it can still be selected by the cost formula. CAR checks incarnation identity, or registration time for older engines, to avoid crediting a replacement process with stale cache.
 
-Disconnects, sequence gaps and incomplete snapshots affect cache credit without blocking routing. Each service replica independently subscribes and recovers. The deprecated heartbeat `cache_event` field is ignored, and this revision no longer reads or writes `XLLM:CACHE:` keys.
+Disconnects, sequence gaps and incomplete snapshots affect cache credit without blocking routing. Each service replica independently subscribes and recovers. The deprecated heartbeat `cache_event` field is ignored, and service does not read or write `XLLM:CACHE:` keys.
 
 ## Events and recovery semantics
 
-The live protocol has three frames: `topic | uint64 big-endian sequence | MessagePack`. A batch is `[timestamp, events, dp_rank]`; typed event maps include `BlockStored`, `BlockRemoved` and `AllBlocksCleared`, with `gpu`/`cpu` media. Device/Host data is already in this channel; no `motor_pool_endpoint` is needed. Support covers current xLLM flat-text events, not arbitrary vLLM versions or LoRA/multimodal contexts.
+The live protocol has three frames: `topic | uint64 big-endian sequence | MessagePack`. A batch is `[timestamp, events, dp_rank]`; typed event maps include `BlockStored`, `BlockRemoved` and `AllBlocksCleared`, with `gpu`/`cpu` media. The same channel carries Device and Host metadata. The index supports plain-text prefixes; LoRA and multimodal contexts are outside its scope.
 
-The index builds XXH3-128 content keys from full prefix context and tokens, retaining engine-hash mappings for removals and tokenless replica events. A folded 64-bit wire hash is not the old service's XXH3-128 key. Device removal leaves a Host replica intact.
+The index builds XXH3-128 content keys from full prefix context and tokens, retaining engine-hash mappings for removals and tokenless replica events. The 64-bit wire hash and the internal XXH3-128 content key are distinct. Device removal leaves a Host replica intact.
 
-On first connection, gaps, errors or reconnection, the xLLM replay endpoint returns a **current full snapshot**, not arbitrary historical events. A DEALER sends `[empty delimiter, 8-byte starting sequence]`, receives `[empty delimiter, snapshot watermark, MessagePack]`, then waits for a UINT64_MAX/empty-payload terminator. This differs from the live topic envelope and does not imply generic vLLM historical-replay compatibility.
+On first connection, gaps, errors or reconnection, the xLLM replay endpoint returns a **current full snapshot**, not arbitrary historical events. A DEALER sends `[empty delimiter, 8-byte starting sequence]`, receives `[empty delimiter, snapshot watermark, MessagePack]`, then waits for a UINT64_MAX/empty-payload terminator. Snapshot replies use a different envelope from live events.
 
 Recovery buffers bounded live deltas, removes duplicates against the watermark and publishes a complete query view atomically. A live full batch containing `AllBlocksCleared + Stored` can also restore synchronization. Sequence gaps, unknown parents, parsing errors, disconnects or resource-limit violations invalidate the affected stream and expose an unsynchronized state instead of stale hits. Periodic snapshots detect silently lost tail events; a quiet publisher alone does not mean a disconnect. Parent-first snapshots skip orphaned suffixes whose parents have left both tiers, while allowing other independent prefixes; a missing parent in incremental events triggers recovery.
 

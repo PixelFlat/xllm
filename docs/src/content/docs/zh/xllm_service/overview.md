@@ -26,6 +26,6 @@ title: "概述"
 
 可选的 [KV events 目录与 CAR 路由](/zh/xllm_service/kv_events/) 在后台异步维护 Device/Host 前缀元数据，调度器在请求路径查询本地目录。目录不存储或迁移 KV tensor；缓存分配、卸载与实际复用由引擎负责。
 
-早期架构中的 Global KV Cache Manager、动态 KV 迁移、Event Plane、Planner 包含设计方向，不能据此认定当前已经实现自动迁移或扩缩容规划器。本文流程不包含自动托管引擎、自动扩缩容或 Kubernetes controller。KV 目录所需的 service 版本前提集中说明在 KV events 页面。
+本文流程不包含自动托管引擎、自动扩缩容、Kubernetes controller 或跨实例 KV 迁移。
 
 下一步：[编译与运行](/zh/xllm_service/getting_started/)。

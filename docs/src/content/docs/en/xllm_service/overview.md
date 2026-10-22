@@ -26,6 +26,6 @@ The service HTTP listener becomes available only when a suitable instance group 
 
 The optional [KV events directory and CAR routing](/en/xllm_service/kv_events/) asynchronously track Device and Host prefix metadata. The scheduler queries this local directory during routing. The directory neither stores nor migrates KV tensors; the engines retain ownership of cache allocation, offload and reuse.
 
-Earlier architecture descriptions name a Global KV Cache Manager, dynamic KV migration, an Event Plane and a Planner. These describe architectural goals rather than a guarantee that automatic migration or a scaling planner is available. Automatic engine provisioning, autoscaling and a Kubernetes controller are not implemented by the workflow documented here. KV directory availability depends on the service revision described on the KV events page.
+Automatic engine provisioning, autoscaling, a Kubernetes controller and cross-instance KV migration are outside the deployment workflow described here.
 
 Continue with [Build and run](/en/xllm_service/getting_started/).

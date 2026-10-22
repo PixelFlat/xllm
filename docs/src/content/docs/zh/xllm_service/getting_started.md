@@ -7,7 +7,7 @@ title: "编译与运行"
 
 使用 Linux 开发环境，准备 CMake 3.26 或更新版本、支持 C++20 的编译器、Rust/Cargo、安装了 PyTorch 的 Python、Git 及依赖所需的原生构建工具。service 大部分目标使用 C++17，DeepSeek V4 chat template 目标需要 C++20。Ascend 引擎环境参考[快速开始](/zh/getting_started/quick_start/)准备兼容的 xLLM/CANN 环境。etcd 服务端需从[官方发行版](https://github.com/etcd-io/etcd/releases)单独安装。
 
-service 通过 vcpkg 管理 Boost、gRPC、Protobuf、OpenSSL，以及 KV events 版本中的 ZeroMQ。ZeroMQ 使用 service 自身的 manifest，不依赖 Motor 构建产物。CMake 会检测 PyTorch 的 C++ ABI，构建时需要保持环境一致。`prepare.sh` 为 cpprestsdk 添加补丁，以满足 etcd C++ 客户端对静态库的要求。
+service 通过 vcpkg 管理 Boost、gRPC、Protobuf、OpenSSL 和 ZeroMQ。CMake 会检测 PyTorch 的 C++ ABI，构建时需要保持环境一致。`prepare.sh` 为 cpprestsdk 添加补丁，以满足 etcd C++ 客户端对静态库的要求。
 
 ## 编译 service
 
@@ -51,7 +51,7 @@ cd ..
   --tokenizer_path=/models/Qwen2-7B-Instruct
 ```
 
-`tokenizer_path` 应包含与引擎模型一致的 tokenizer 配置。HTTP 接收客户端请求，RPC 与引擎交互。完整实例组注册前，HTTP 端口可能尚未监听。
+`tokenizer_path` 应包含与引擎模型一致的 tokenizer 配置。HTTP 接收客户端请求，RPC 与引擎交互。完整实例组注册前，HTTP 端口可能尚未监听。引擎必须能够访问 RPC 端口；PD 模式下，Decode 通过该端口返回首 token 及后续生成结果。
 
 ## 启动引擎
 

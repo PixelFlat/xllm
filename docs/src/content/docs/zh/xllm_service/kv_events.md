@@ -3,25 +3,22 @@ title: "KV events 与 CAR"
 ---
 <!-- Copyright 2026 The xLLM Authors. Licensed under the Apache License, Version 2.0. -->
 
-## 版本前提
+## 目录维护的内容
 
-本页描述 [xllm-service PR #93](https://github.com/xLLM-AI/xllm-service/pull/93) 的分层 KV events 索引与 CAR 实现（参考修订 `eb388de`），并非所有已发布 service 版本的默认能力。使用前需确认所构建的 service 已包含该实现，并使用支持本页事件与全量快照协议的 xLLM 引擎。基础构建与注册流程见[编译与运行](/zh/xllm_service/getting_started/)。
+service 在后台订阅 xLLM 的 ZMQ KV events，维护按实例、DP、Device/Host
+区分的前缀目录。目录只保存元数据，不存储或搬运 KV tensor。
+`kv_directory` 管理订阅与发现，`kv_index` 维护分层前缀索引，
+`kv_event_decoder` 解析事件。
 
-本功能在 xllm-service 进程内后台订阅 xLLM 的 ZMQ KV events，维护按实例、DP、
-Device/Host 区分的前缀目录。目录只保存元数据，不存储或搬运 KV tensor。
-实现位于 `xllm_service/kv_indexer/`，对应回归位于
-`tests/xllm_service/kv_indexer/`。
-其中 `kv_directory` 管理订阅与发现，`kv_index` 维护分层前缀索引，
-`kv_event_decoder` 解析事件；回归入口为 `kv_directory_test`。
+CAR 结合目录中的 Device/Host 连续前缀命中和实例负载选点，内部查询接口与 CAR
+共用该目录。KV 元数据来自引擎事件；etcd 负责实例发现、健康状态和负载同步，
+不存储 KV 元数据。RR/SLO_AWARE 保持各自的选点逻辑。
 
-CAR 直接使用新索引中的 Device/Host 连续前缀命中，并结合负载选实例；
-内部只读查询与 CAR 共用目录。旧 GlobalKVCacheMgr、KV 心跳消费、KV etcd
-读写及 watch 已删除。实例发现、健康检测、负载心跳和负载的 etcd 同步继续保留。
-订阅复用现有实例注册信息，不需要修改 xLLM。RR/SLO_AWARE 的选点逻辑保持原有实现。
+基础部署流程见[编译与运行](/zh/xllm_service/getting_started/)。
 
 ## 构建和回归
 
-ZeroMQ 由 service 自身的 vcpkg manifest 管理，不依赖 Motor 的编译产物。
+ZeroMQ 由 service 自身的 vcpkg manifest 管理。
 在已准备好项目依赖的开发环境执行：
 
 ```bash
@@ -64,7 +61,7 @@ Docker 或 K8s 启动。自动订阅与 service 是否负责拉起引擎相互�
 
 service 的 `kv_events_config_file` 是 JSON **文件路径**；引擎的 `kv_events_config`
 是 JSON **字符串**。空文件路径关闭索引；此时 CAR 在启动日志中提示，并将 P 的命中比置零。
-该参数在 `xllm_master_serving` 入口接入；独立的示例 HTTP/RPC serving 程序不在本版范围。
+该参数用于 `xllm_master_serving` 入口，独立的示例 HTTP/RPC serving 程序不读取此配置。
 
 ## 自动发现配置
 
@@ -98,7 +95,7 @@ service 的 `kv_events_config_file` 是 JSON **文件路径**；引擎的 `kv_ev
 无需额外配置模型分组。`block_size` 须与引擎实际发布的事件一致。
 
 订阅符合条件的 xLLM DEFAULT/PREFILL 实例，以及当前承担 PREFILL 的 MIX 实例。
-DECODE 实例和其他后端不纳入本版目录。沿用现有实例状态机：租约丢失的宽限期
+DECODE 实例和其他后端不纳入目录。沿用现有实例状态机：租约丢失的宽限期
 保留订阅，进入 SUSPECT 或移出实例目录后删除订阅及查询项。
 发现间隔默认 1000 ms，可设 50–60000 ms；实例状态通常在下一个发现周期更新，
 下线判定所需的探测和宽限时间沿用现有实例状态机。
@@ -233,7 +230,7 @@ CAR 同时比对实例 incarnation，旧版无 incarnation 时比较注册时间
 
 旧心跳 protobuf 的 `cache_event` 字段仅为兼容已有引擎保留并标记 deprecated，
 service 不读取它，也不再读写 `XLLM:CACHE:`。引擎尚未关闭旧心跳上报时，
-该字段会被忽略；本次不改引擎。各 service 副本各自订阅和恢复目录，
+该字段会被忽略。各 service 副本各自订阅和恢复目录，
 主从切换无需迁移旧 KV etcd 数据。原有 `--block_size` 不用于新索引，
 实际事件块大小以发现配置中的 `block_size` 为准。
 
@@ -242,8 +239,7 @@ service 不读取它，也不再读写 `XLLM:CACHE:`。引擎尚未关闭旧心�
 消费当前 xLLM 的三帧协议：`topic | uint64 大端序号 | MessagePack`。
 batch 为 `[timestamp, events, dp_rank]`，事件为带 `type` 的 map，支持
 `BlockStored`、`BlockRemoved`、`AllBlocksCleared` 及 `gpu`/`cpu` 介质。
-主事件通道已经提供 Device/Host 信息，不需要 `motor_pool_endpoint`。
-本版适配 xLLM flat text 的事件，不声明支持任意 vLLM 版本或 LoRA/多模态上下文。
+同一事件通道承载 Device/Host 元数据，索引支持纯文本前缀，不包含 LoRA 或多模态上下文。
 
 目录用完整前缀上下文和 tokens 生成内部 XXH3-128 内容键，并保留
 `engine_hash → 内容键` 映射供删除和 tokenless 副本事件使用。不能把线上折叠的
