@@ -140,11 +140,10 @@ Worker::Worker(const ParallelArgs& parallel_args,
            "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs with DP=1 and "
            "a layerwise split of one.";
     CHECK(options.host_blocks_factor() <= 1.0 ||
-          (Platform::is_npu() &&
-           (!options.enable_speculative_decode() ||
-            (SpeculativeConfig::is_mtp_algorithm(
-                 options.speculative_algorithm()) &&
-             !options.enable_adaptive_speculative_decode()))))
+          (Platform::is_npu() && (!options.enable_speculative_decode() ||
+                                  (SpeculativeConfig::is_mtp_algorithm(
+                                       options.speculative_algorithm()) &&
+                                   !options.enable_adaptive_spec_prune()))))
         << "Task pipeline Host KV cache requires NPU ordinary or fixed MTP "
            "decoding.";
   }
