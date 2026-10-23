@@ -86,6 +86,34 @@ TEST(MtpWorkerSelectionTest, RejectsLegacyAdaptiveExecutionBeforeModelSetup) {
                "requires DSpark Draft5/7 with task pipeline");
 }
 
+TEST(MtpWorkerSelectionTest, RejectsDsparkDpUnifiedGraphsBeforeModelSetup) {
+  const ModelConfig model_config = ModelConfig::get_instance();
+  const ExecutionConfig execution_config = ExecutionConfig::get_instance();
+  ScopeGuard restore_config([&] {
+    ModelConfig::get_instance() = model_config;
+    ExecutionConfig::get_instance() = execution_config;
+  });
+  ModelConfig::get_instance().model_impl("python");
+  ExecutionConfig::get_instance() = ExecutionConfig();
+  ExecutionConfig::get_instance().enable_unified_mtp_graph(true);
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/2, /*dp_size=*/2, /*process_group=*/nullptr);
+  const torch::Device device(torch::kCPU);
+  runtime::Options options;
+  options.enable_speculative_decode(true)
+      .enable_task_pipeline(true)
+      .enable_graph(true)
+      .speculative_algorithm("dSpArK");
+  for (const bool adaptive : {false, true}) {
+    for (const int32_t width : {5, 7}) {
+      options.enable_adaptive_target_verify(adaptive).num_speculative_tokens(
+          width);
+      EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+                   "DP DSpark task pipeline requires split ACL graphs");
+    }
+  }
+}
+
 TEST(MtpWorkerSelectionTest, RequestRoutingDoesNotRejectUnsupportedSampling) {
   LlmForwardInput input;
   input.sampling_params.sampling_mode = SamplingMode::GREEDY;

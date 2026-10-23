@@ -953,6 +953,18 @@ class SpeculativePipelineTest : public ::testing::Test {
     capacity_.adaptive_costs = std::move(costs);
   }
 
+  void configure_fixed_dspark_dp() {
+    configure_dspark_batch_graphs();
+    capacity_.common.dp_size = 2;
+    // Four requests borrow page pairs 1/2 through 7/8; page zero is padding.
+    for (auto* caches : {&target_cache_, &draft_cache_}) {
+      caches->clear();
+      caches->emplace_back(
+          KVCacheTensors{torch::zeros({9, 16, 1, 1}, target_->options()),
+                         torch::zeros({9, 16, 1, 1}, target_->options())});
+    }
+  }
+
   LlmForwardInput dspark_batch_input(uint32_t batch_size,
                                      bool decode,
                                      bool placeholder = false,
@@ -1030,8 +1042,8 @@ class SpeculativePipelineTest : public ::testing::Test {
     return value;
   }
 
-  void warmup_dspark_dp_graphs() {
-    for (const uint32_t batch_size : {1U, 2U, 3U}) {
+  void warmup_dspark_dp_graphs(uint32_t max_batch_size = 3) {
+    for (uint32_t batch_size = 1; batch_size <= max_batch_size; ++batch_size) {
       execute(dspark_dp_batch_input(batch_size, /*decode=*/false));
       auto warmup = dspark_dp_batch_input(batch_size, /*decode=*/true);
       warmup.input_params.meta.is_graph_warmup = true;
@@ -2447,6 +2459,7 @@ TEST_F(SpeculativePipelineTest, DSparkRejectsUnsupportedTopologyBeforeLaunch) {
   capacity_.common.model.max_sequences = 1;
   capacity_.context_hidden_size = 2;
   capacity_.common.dp_size = 2;
+  capacity_.unified_graph = true;
   EXPECT_FALSE(TaskExecutionPipeline::create(
                    state_thread_,
                    {*target_, *target_executor_, target_cache_},
@@ -2455,6 +2468,94 @@ TEST_F(SpeculativePipelineTest, DSparkRejectsUnsupportedTopologyBeforeLaunch) {
                    pipeline_)
                    .ok());
   EXPECT_EQ(pipeline_, nullptr);
+}
+
+TEST_F(SpeculativePipelineTest,
+       FixedDsparkDpKeepsFullWidthWithoutAdaptiveFeedback) {
+  configure_fixed_dspark_dp();
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs(/*max_batch_size=*/4);
+  const size_t target_warmups = target_->graph_warmup_bindings.size();
+  const size_t draft_warmups = draft_->graph_warmup_bindings.size();
+  for (const uint32_t rows : {1U, 4U, 2U, 3U}) {
+    execute(dspark_dp_batch_input(rows, /*decode=*/false));
+    const auto output = execute(dspark_dp_batch_input(rows, /*decode=*/true));
+    ASSERT_TRUE(output.sample_output.next_tokens.defined());
+    EXPECT_EQ(output.sample_output.next_tokens.size(0), rows);
+    EXPECT_EQ(output.sample_output.next_tokens.size(1), 8);
+    const auto metrics = make_spec_metrics(output.sample_output.next_tokens,
+                                           output.spec_verify_layouts);
+    EXPECT_EQ(metrics.num_draft_tokens, rows * 7);
+    EXPECT_EQ(metrics.num_accepted_tokens, rows * 7);
+    EXPECT_EQ(metrics.num_committed_tokens, rows * 8);
+    EXPECT_TRUE(output.dspark_feedback.confidence.empty());
+    EXPECT_TRUE(output.dspark_feedback.rounds_since_full_width.empty());
+    EXPECT_EQ(target_->graph_warmup_bindings.size(), target_warmups);
+    EXPECT_EQ(draft_->graph_warmup_bindings.size(), draft_warmups);
+  }
+  EXPECT_FALSE(
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}}));
+}
+
+TEST_F(SpeculativePipelineTest,
+       FixedDsparkDpUnequalPeersReuseCommonFullWidthGraphs) {
+  configure_fixed_dspark_dp();
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs(/*max_batch_size=*/4);
+  const auto with_larger_peer = [](LlmForwardInput input, bool decode) {
+    auto& parallel = input.input_params.parallel;
+    parallel.dp_global_token_nums[1] = decode ? 4 : 8;
+    parallel.raw_dp_global_token_nums = parallel.dp_global_token_nums;
+    parallel.dp_global_sequence_nums[1] = 4;
+    return input;
+  };
+  for (const uint32_t rows : {1U, 3U, 2U}) {
+    execute(with_larger_peer(dspark_dp_batch_input(rows, /*decode=*/false),
+                             /*decode=*/false));
+    const auto output = execute(with_larger_peer(
+        dspark_dp_batch_input(rows, /*decode=*/true), /*decode=*/true));
+    ASSERT_TRUE(output.sample_output.next_tokens.defined());
+    EXPECT_EQ(output.sample_output.next_tokens.size(0), rows);
+    EXPECT_EQ(target_->forward_counts.back(), (std::vector<int32_t>{32, 32}));
+    EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{28, 28}));
+    EXPECT_EQ(target_->forward_inputs.back().numel(), 32);
+    EXPECT_EQ(draft_->forward_inputs.back().numel(), 28);
+    EXPECT_TRUE(torch::equal(
+        draft_->context_slots.back().narrow(0, rows * 8, 32 - rows * 8).cpu(),
+        torch::full({32 - rows * 8}, -1, torch::kInt32)));
+    const auto metrics = make_spec_metrics(output.sample_output.next_tokens,
+                                           output.spec_verify_layouts);
+    EXPECT_EQ(metrics.num_draft_tokens, rows * 7);
+  }
+}
+
+TEST_F(SpeculativePipelineTest,
+       FixedDsparkDpIdleShardRunsModelsWithoutSamplingOrContextWrites) {
+  configure_fixed_dspark_dp();
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_dp_graphs(/*max_batch_size=*/4);
+  const uint32_t target_logits = target_->logits_calls.load();
+  const uint32_t draft_logits = draft_->logits_calls.load();
+  const size_t context_writes = draft_->context_slots.size();
+  auto idle = dspark_dp_batch_input(0, /*decode=*/true);
+  auto& parallel = idle.input_params.parallel;
+  parallel.dp_global_token_nums = {0, 1};
+  parallel.raw_dp_global_token_nums = {0, 1};
+  parallel.dp_global_sequence_nums = {0, 1};
+  parallel.dp_global_kv_max_seq_lens = {0, 3};
+  parallel.dp_is_decode = {0, 1};
+  const auto output = execute(idle);
+  EXPECT_TRUE(!output.sample_output.next_tokens.defined() ||
+              output.sample_output.next_tokens.numel() == 0);
+  EXPECT_TRUE(output.dspark_feedback.confidence.empty());
+  EXPECT_EQ(target_->forward_counts.back(), (std::vector<int32_t>{8, 8}));
+  EXPECT_EQ(draft_->forward_counts.back(), (std::vector<int32_t>{7, 7}));
+  EXPECT_EQ(target_->logits_calls.load(), target_logits);
+  EXPECT_EQ(draft_->logits_calls.load(), draft_logits);
+  EXPECT_EQ(draft_->context_slots.size(), context_writes);
 }
 
 TEST_F(SpeculativePipelineTest,

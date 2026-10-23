@@ -128,7 +128,8 @@ DP=1 和 `temperature=0`；正温度或混合温度请求必须使用普通 grap
 DP=2 使用 `--dp_size=2 --enable_unified_mtp_graph=false`。标定请求桶表示每个
 DP 分片的容量，例如桶 4 会同时构造 8 条合成请求；全局请求数和 token 上限
 需要容纳所有分片。已保存成本表的兼容性元数据包含 DP 拓扑，不能直接复用
-DP=1 的表来运行 DP=2。
+DP=1 的表来运行 DP=2。固定步数和自适应 DSpark 都会拒绝 DP>1 与
+`--enable_unified_mtp_graph=true` 的组合，不会静默改为 split graph。
 
 ### 启动示例
 

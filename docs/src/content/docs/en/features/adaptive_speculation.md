@@ -142,7 +142,9 @@ For DP=2 use `--dp_size=2 --enable_unified_mtp_graph=false`. Calibration request
 buckets are per-DP-shard capacities: a bucket of four uses eight simultaneous
 synthetic requests. Keep the global sequence/token limits large enough for all
 shards. Saved cost tables include DP topology in their compatibility metadata;
-do not reuse a DP=1 table for DP=2.
+do not reuse a DP=1 table for DP=2. Both fixed-width and adaptive DSpark reject
+DP>1 with `--enable_unified_mtp_graph=true`; the requested mode is never silently
+replaced with split graphs.
 
 ### Launch example
 

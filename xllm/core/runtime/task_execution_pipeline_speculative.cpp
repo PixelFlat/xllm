@@ -304,8 +304,8 @@ Status TaskExecutionPipeline::create(
   const uint64_t rows =
       static_cast<uint64_t>(common.model.max_sequences) * width;
   if (capacity.kind == SpeculativeTaskKind::DSPARK && common.dp_size != 1 &&
-      (!capacity.adaptive_dspark || capacity.unified_graph)) {
-    return invalid("DP DSpark task pipeline requires adaptive split graphs.");
+      capacity.unified_graph) {
+    return invalid("DP DSpark task pipeline requires split graphs.");
   }
   if (capacity.startup_calibration &&
       (!capacity.adaptive_dspark || capacity.adaptive_costs)) {

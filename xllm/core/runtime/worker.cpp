@@ -90,6 +90,12 @@ Worker::Worker(const ParallelArgs& parallel_args,
         ModelConfig::get_instance().model_impl()))
         << "Task pipeline requires the Python model implementation.";
     const auto& execution = ExecutionConfig::get_instance();
+    CHECK(!options.enable_speculative_decode() ||
+          !SpeculativeConfig::is_dspark_algorithm(
+              options.speculative_algorithm()) ||
+          parallel_args.dp_size() <= 1 || !execution.enable_unified_mtp_graph())
+        << "DP DSpark task pipeline requires split ACL graphs; "
+           "disable unified graphs.";
     const std::string& graph_backend = execution.python_graph_backend();
     CHECK(graph_backend.empty() || graph_backend == "off" ||
           graph_backend == "none" || graph_backend == "0" ||
