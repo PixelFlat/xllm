@@ -22,8 +22,8 @@ limitations under the License.
 
 namespace xllm {
 
-RequestSamplingParam make_disagg_sampling_param(const proto::DisaggRequest& req,
-                                                bool enable_task_pipeline);
+RequestSamplingParam make_disagg_sampling_param(
+    const proto::DisaggRequest& req);
 
 SchedulerParam make_disagg_scheduler_param(const proto::DisaggRequest& req);
 

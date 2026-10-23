@@ -23,8 +23,8 @@ limitations under the License.
 
 namespace xllm {
 
-RequestSamplingParam make_disagg_sampling_param(const proto::DisaggRequest& req,
-                                                bool enable_task_pipeline) {
+RequestSamplingParam make_disagg_sampling_param(
+    const proto::DisaggRequest& req) {
   RequestSamplingParam sampling_param;
   sampling_param.frequency_penalty = req.frequency_penalty();
   sampling_param.presence_penalty = req.presence_penalty();
@@ -36,8 +36,6 @@ RequestSamplingParam make_disagg_sampling_param(const proto::DisaggRequest& req,
     sampling_param.seed = req.seed();
   }
   sampling_param.min_tokens = req.min_tokens();
-  sampling_param.device_min_tokens =
-      enable_task_pipeline && sampling_param.min_tokens > 0;
   sampling_param.vocab_size = req.vocab_size();
   if (!req.logit_bias().empty()) {
     sampling_param.logit_bias.reserve(req.logit_bias_size());
