@@ -55,7 +55,8 @@ TEST(DisaggPDRequestConverterTest, PreservesSamplingValuesAndTokenOrder) {
   first_bad_word->add_seq_tokens(5);
   req.add_bad_words_token_ids()->add_seq_tokens(6);
 
-  const RequestSamplingParam param = make_disagg_sampling_param(req);
+  const RequestSamplingParam param =
+      make_disagg_sampling_param(req, /*enable_task_pipeline=*/false);
 
   EXPECT_FLOAT_EQ(param.frequency_penalty, 0.25f);
   EXPECT_FLOAT_EQ(param.presence_penalty, 0.5f);
@@ -86,7 +87,8 @@ TEST(DisaggPDRequestConverterTest, PreservesSamplingValuesAndTokenOrder) {
 
 TEST(DisaggPDRequestConverterTest, KeepsWireDefaultsAndOptionalSeedPresence) {
   proto::DisaggRequest req;
-  const RequestSamplingParam absent = make_disagg_sampling_param(req);
+  const RequestSamplingParam absent =
+      make_disagg_sampling_param(req, /*enable_task_pipeline=*/false);
 
   EXPECT_FALSE(absent.seed.has_value());
   EXPECT_FALSE(absent.allowed_token_ids.has_value());
@@ -108,9 +110,32 @@ TEST(DisaggPDRequestConverterTest, KeepsWireDefaultsAndOptionalSeedPresence) {
   EXPECT_TRUE(absent.bad_words_token_ids.empty());
 
   req.set_seed(0);
-  const RequestSamplingParam explicit_zero = make_disagg_sampling_param(req);
+  const RequestSamplingParam explicit_zero =
+      make_disagg_sampling_param(req, /*enable_task_pipeline=*/false);
   ASSERT_TRUE(explicit_zero.seed.has_value());
   EXPECT_EQ(explicit_zero.seed.value(), 0);
+}
+
+TEST(DisaggPDRequestConverterTest, RestoresMinTokensForDecodeExecutionMode) {
+  proto::DisaggRequest req;
+  req.set_min_tokens(3);
+  req.add_all_stop_token_ids(7);
+
+  const RequestSamplingParam pipeline =
+      make_disagg_sampling_param(req, /*enable_task_pipeline=*/true);
+  EXPECT_TRUE(pipeline.device_min_tokens);
+  EXPECT_EQ(pipeline.min_tokens, 3u);
+  EXPECT_EQ(pipeline.all_stop_token_ids, (std::vector<int32_t>{7}));
+
+  const RequestSamplingParam ordinary =
+      make_disagg_sampling_param(req, /*enable_task_pipeline=*/false);
+  EXPECT_FALSE(ordinary.device_min_tokens);
+  EXPECT_EQ(ordinary.min_tokens, 3u);
+  EXPECT_EQ(ordinary.all_stop_token_ids, pipeline.all_stop_token_ids);
+
+  req.set_min_tokens(0);
+  EXPECT_FALSE(make_disagg_sampling_param(req, /*enable_task_pipeline=*/true)
+                   .device_min_tokens);
 }
 
 TEST(DisaggPDRequestConverterTest, CopiesOnlineSchedulingFields) {
