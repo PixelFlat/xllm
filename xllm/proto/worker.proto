@@ -61,7 +61,9 @@ message AllocateKVCacheRequest {
   KVCacheShape kv_cache_shape = 1;
 }
 
-// Startup-only DSpark calibration control. Each command is handled only after
+// Startup-only speculative calibration control. The DSpark RPC/message names
+// are retained for transport compatibility; MTP also uses this control plane.
+// Each command is handled only after
 // all previously submitted task-pipeline results have been retired.
 message DSparkCalibrationRequest {
   enum Action {

@@ -13,18 +13,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_window_collector.h"
+#include "core/framework/speculative/adaptive/spec_window_collector.h"
 
 #include <algorithm>
 #include <utility>
 
 namespace xllm {
 
-DSparkSteadyWindowCollector::DSparkSteadyWindowCollector(
-    DSparkWindowConfig config)
+SpecSteadyWindowCollector::SpecSteadyWindowCollector(SpecWindowConfig config)
     : config_(std::move(config)), warmup_left_(config_.warmup_steps) {}
 
-void DSparkSteadyWindowCollector::reset() {
+void SpecSteadyWindowCollector::reset() {
   request_ids_.clear();
   window_ = {};
   last_generation_ = 0;
@@ -33,12 +32,12 @@ void DSparkSteadyWindowCollector::reset() {
   warmup_left_ = config_.warmup_steps;
 }
 
-bool DSparkSteadyWindowCollector::finished() const {
+bool SpecSteadyWindowCollector::finished() const {
   return emitted_ >= config_.max_windows;
 }
 
-std::optional<DSparkSteadyWindow> DSparkSteadyWindowCollector::observe(
-    const DSparkSteadyStep& step) {
+std::optional<SpecSteadyWindow> SpecSteadyWindowCollector::observe(
+    const SpecSteadyStep& step) {
   if (finished()) {
     return std::nullopt;
   }
@@ -110,7 +109,7 @@ std::optional<DSparkSteadyWindow> DSparkSteadyWindowCollector::observe(
   window_.last_generation = step.generation;
   window_.elapsed_ms =
       static_cast<double>(step.completed_ns - window_start_ns_) / 1000000.0;
-  const DSparkSteadyWindow result = window_;
+  const SpecSteadyWindow result = window_;
   ++emitted_;
   window_start_ns_ = step.completed_ns;
   window_.first_generation = step.generation;

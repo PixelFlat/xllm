@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_window_collector.h"
+#include "core/framework/speculative/adaptive/spec_window_collector.h"
 
 #include <gtest/gtest.h>
 
@@ -21,13 +21,13 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "core/framework/speculative/dspark/dspark_budget_planner.h"
+#include "core/framework/speculative/adaptive/verify_budget_planner.h"
 
 namespace xllm {
 namespace {
 
-DSparkWindowConfig make_config() {
-  DSparkWindowConfig config;
+SpecWindowConfig make_config() {
+  SpecWindowConfig config;
   config.target_graph_rows = 8;
   config.max_kv_length = 4096;
   config.warmup_steps = 0;
@@ -35,10 +35,10 @@ DSparkWindowConfig make_config() {
   return config;
 }
 
-DSparkSteadyStep make_step(uint64_t generation,
-                           uint64_t completed_ns,
-                           const std::vector<std::string>& ids) {
-  DSparkSteadyStep step;
+SpecSteadyStep make_step(uint64_t generation,
+                         uint64_t completed_ns,
+                         const std::vector<std::string>& ids) {
+  SpecSteadyStep step;
   step.generation = generation;
   step.completed_ns = completed_ns;
   step.logical_requests = static_cast<uint32_t>(ids.size());
@@ -51,8 +51,8 @@ DSparkSteadyStep make_step(uint64_t generation,
   return step;
 }
 
-TEST(DSparkWindowCollectorTest, MeasuresIntervalsNotCompletionCount) {
-  DSparkSteadyWindowCollector collector(make_config());
+TEST(SpecWindowCollectorTest, MeasuresIntervalsNotCompletionCount) {
+  SpecSteadyWindowCollector collector(make_config());
   const std::vector<std::string> ids = {"a"};
   EXPECT_FALSE(collector.observe(make_step(1, 1000000, ids)));
   EXPECT_FALSE(collector.observe(make_step(2, 21000000, ids)));
@@ -66,10 +66,10 @@ TEST(DSparkWindowCollectorTest, MeasuresIntervalsNotCompletionCount) {
   EXPECT_EQ(window->draft_tokens, 14U);
 }
 
-TEST(DSparkWindowCollectorTest, RecordsConfiguredDraftFiveWidth) {
+TEST(SpecWindowCollectorTest, RecordsConfiguredDraftFiveWidth) {
   auto config = make_config();
   config.draft_width = 5;
-  DSparkSteadyWindowCollector collector(config);
+  SpecSteadyWindowCollector collector(config);
   const std::vector<std::string> ids = {"draft-five"};
   for (uint64_t generation = 1; generation <= 3; ++generation) {
     auto step = make_step(generation, generation * 1000000, ids);
@@ -84,10 +84,10 @@ TEST(DSparkWindowCollectorTest, RecordsConfiguredDraftFiveWidth) {
   }
 }
 
-TEST(DSparkWindowCollectorTest, AveragesAcrossBurstRetirementGaps) {
+TEST(SpecWindowCollectorTest, AveragesAcrossBurstRetirementGaps) {
   auto config = make_config();
   config.window_steps = 4;
-  DSparkSteadyWindowCollector collector(config);
+  SpecSteadyWindowCollector collector(config);
   const std::vector<std::string> ids = {"a"};
   EXPECT_FALSE(collector.observe(make_step(1, 1, ids)));
   EXPECT_FALSE(collector.observe(make_step(2, 40000001, ids)));
@@ -98,16 +98,16 @@ TEST(DSparkWindowCollectorTest, AveragesAcrossBurstRetirementGaps) {
   EXPECT_DOUBLE_EQ(window->elapsed_ms / window->steps, 20.0);
 }
 
-TEST(DSparkWindowCollectorTest, RecordsMultiRequestProgressWithoutBonusTokens) {
+TEST(SpecWindowCollectorTest, RecordsMultiRequestProgressWithoutBonusTokens) {
   auto config = make_config();
   config.target_graph_rows = 64;
-  DSparkSteadyWindowCollector collector(config);
+  SpecSteadyWindowCollector collector(config);
   std::vector<std::string> ids;
   ids.reserve(8);
   for (uint32_t row = 0; row < 8; ++row) {
     ids.emplace_back(std::to_string(row));
   }
-  std::optional<DSparkSteadyWindow> window;
+  std::optional<SpecSteadyWindow> window;
   for (uint64_t generation = 1; generation <= 3; ++generation) {
     auto step = make_step(generation, generation * 20000000, ids);
     step.target_graph_rows = 64;
@@ -123,11 +123,10 @@ TEST(DSparkWindowCollectorTest, RecordsMultiRequestProgressWithoutBonusTokens) {
   EXPECT_DOUBLE_EQ(window->elapsed_ms, 40.0);
 }
 
-TEST(DSparkWindowCollectorTest,
-     DiscardsSettlingIntervalsAndRestartsAfterReset) {
+TEST(SpecWindowCollectorTest, DiscardsSettlingIntervalsAndRestartsAfterReset) {
   auto config = make_config();
   config.warmup_steps = 2;
-  DSparkSteadyWindowCollector collector(config);
+  SpecSteadyWindowCollector collector(config);
   const std::vector<std::string> ids = {"a"};
   for (uint64_t generation = 1; generation <= 4; ++generation) {
     EXPECT_FALSE(
@@ -142,9 +141,9 @@ TEST(DSparkWindowCollectorTest,
   EXPECT_FALSE(collector.observe(make_step(7, 70, ids)));
 }
 
-TEST(DSparkWindowCollectorTest, ResetsOnTaskGapsAndNonmonotonicClock) {
+TEST(SpecWindowCollectorTest, ResetsOnTaskGapsAndNonmonotonicClock) {
   for (const bool clock_reset : {false, true}) {
-    DSparkSteadyWindowCollector collector(make_config());
+    SpecSteadyWindowCollector collector(make_config());
     const std::vector<std::string> ids = {"a"};
     EXPECT_FALSE(collector.observe(make_step(1, 100, ids)));
     EXPECT_FALSE(collector.observe(make_step(2, 200, ids)));
@@ -157,8 +156,8 @@ TEST(DSparkWindowCollectorTest, ResetsOnTaskGapsAndNonmonotonicClock) {
   }
 }
 
-TEST(DSparkWindowCollectorTest, ResetsOnMembershipChange) {
-  DSparkSteadyWindowCollector collector(make_config());
+TEST(SpecWindowCollectorTest, ResetsOnMembershipChange) {
+  SpecSteadyWindowCollector collector(make_config());
   const std::vector<std::string> first = {"a"};
   const std::vector<std::string> second = {"b"};
   EXPECT_FALSE(collector.observe(make_step(1, 10, first)));
@@ -170,11 +169,10 @@ TEST(DSparkWindowCollectorTest, ResetsOnMembershipChange) {
   EXPECT_EQ(window->first_generation, 3U);
 }
 
-TEST(DSparkWindowCollectorTest,
-     RejectsPrefillPartialBucketsAndInvalidCounters) {
+TEST(SpecWindowCollectorTest, RejectsPrefillPartialBucketsAndInvalidCounters) {
   const std::vector<std::string> ids = {"a"};
   for (uint32_t kind = 0; kind < 7; ++kind) {
-    DSparkSteadyWindowCollector collector(make_config());
+    SpecSteadyWindowCollector collector(make_config());
     EXPECT_FALSE(collector.observe(make_step(1, 10, ids)));
     EXPECT_FALSE(collector.observe(make_step(2, 20, ids)));
     auto step = make_step(3, 30, ids);
@@ -208,10 +206,10 @@ TEST(DSparkWindowCollectorTest,
   }
 }
 
-TEST(DSparkWindowCollectorTest, ReportsKvRangeAndCapsWindowCount) {
+TEST(SpecWindowCollectorTest, ReportsKvRangeAndCapsWindowCount) {
   auto config = make_config();
   config.max_windows = 1;
-  DSparkSteadyWindowCollector collector(config);
+  SpecSteadyWindowCollector collector(config);
   const std::vector<std::string> ids = {"a"};
   EXPECT_FALSE(collector.observe(make_step(1, 10, ids)));
   auto step = make_step(2, 20, ids);
@@ -229,25 +227,25 @@ TEST(DSparkWindowCollectorTest, ReportsKvRangeAndCapsWindowCount) {
   EXPECT_FALSE(collector.observe(make_step(4, 40, ids)));
 }
 
-TEST(DSparkWindowCollectorTest,
+TEST(SpecWindowCollectorTest,
      ExcludesTransientTasksOutsideCalibratedGraphRange) {
   auto config = make_config();
   config.target_graph_rows = 64;
-  DSparkSteadyWindowCollector collector(config);
-  const std::vector<DSparkGraphCost> graphs = {{1, 0.0},
-                                               {2, 0.0},
-                                               {4, 0.0},
-                                               {8, 0.0},
-                                               {16, 0.0},
-                                               {32, 0.0},
-                                               {48, 0.0},
-                                               {64, 0.0}};
+  SpecSteadyWindowCollector collector(config);
+  const std::vector<SpecGraphCost> graphs = {{1, 0.0},
+                                             {2, 0.0},
+                                             {4, 0.0},
+                                             {8, 0.0},
+                                             {16, 0.0},
+                                             {32, 0.0},
+                                             {48, 0.0},
+                                             {64, 0.0}};
   const std::vector<std::string> single = {"transient"};
   const std::vector<std::string> batch = {
       "a", "b", "c", "d", "e", "f", "g", "h"};
   auto step = make_step(1, 10, single);
   const auto transient =
-      DSparkBudgetPlanner::calibration_plan(/*logical_requests=*/1,
+      VerifyBudgetPlanner::calibration_plan(/*logical_requests=*/1,
                                             /*physical_requests=*/1,
                                             /*requested_graph_rows=*/64,
                                             graphs);
@@ -255,8 +253,8 @@ TEST(DSparkWindowCollectorTest,
   step.target_graph_rows = transient->graph_rows;
   step.draft_tokens = transient->draft_budget;
   EXPECT_FALSE(collector.observe(step));
-  std::optional<DSparkSteadyWindow> window;
-  const auto steady = DSparkBudgetPlanner::calibration_plan(
+  std::optional<SpecSteadyWindow> window;
+  const auto steady = VerifyBudgetPlanner::calibration_plan(
       /*logical_requests=*/8,
       /*physical_requests=*/8,
       /*requested_graph_rows=*/64,

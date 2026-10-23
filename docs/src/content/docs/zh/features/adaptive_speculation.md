@@ -1,5 +1,5 @@
 ---
-title: "自适应 DSpark"
+title: "自适应投机推理"
 sidebar:
   order: 85
 ---
@@ -19,15 +19,99 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-自适应 DSpark 使用 confidence 反馈和已标定的完整步成本选择验证预算。
+自适应投机推理通过调整 draft 生成或 target 验证的工作量，提高预测的输出吞吐。
+两个开关描述的是不同的执行控制方式，而不是某一种投机算法的名称：
+
+| 控制开关 | 本身含义 | 当前接入及适用原因 |
+|:---------|:---------|:-------------------|
+| `enable_adaptive_draft_step` | 调整一次 target 验证前实际执行的顺序 draft forward 步数。 | MTP 顺序生成候选，减少步数既能省去 draft forward，也能缩短验证长度。 |
+| `enable_adaptive_target_verify` | 调整已经生成的候选中，交给 target 验证的数量。 | DSpark 一次 forward 并行生成候选块，裁剪低置信度后缀可减少验证工作，但不改变 draft 的生成宽度。 |
+
+两个开关默认均为 `false`，当前不能同时开启；通用命名不表示其他算法已经接入。
 参数类型和默认值见 [CLI reference](/zh/cli_reference/#speculativeconfig)。
+
+## 自适应 draft 步长（MTP）
+
+`num_speculative_tokens` 是最大步数。每次提交 decode batch 前，engine 根据
+已完成验证结果中的逐位置前缀接受概率，以及各候选步数的完整轮成本，为整个
+batch 选择统一步数，使 `B * (1 + sum(prefix_acceptance[:步数])) / cost_ms` 最大。
+
+启动时实测当前 MTP 服务的 draft forward、target 验证、采样、prefix refresh
+和结果回收。它与 target 验证控制复用 SPS/二维加性拟合代码，不复用 DSpark 的
+实测成本；预测使用 draft 的物理请求容量和 target padding 后的图行数。
+在线反馈直接来自原有结果回收，不额外增加 confidence D2H 或 TP 决策广播。
+
+当前接入要求 NPU GLM DSA Python 模型、普通预热 ACL graph、异步调度、task
+pipeline 和 DP=CP=1，不支持 unified MTP graph 或 PD 分离。在 MTP 启动脚本的
+每个 rank 应用以下配置；下面展示 16 rank 服务的 rank 0，其余 rank 使用各自
+的 `node_rank` 和监听端口：
+
+```bash
+export HCCL_OP_EXPANSION_MODE=AIV
+xllm --model=/models/target --draft_model=/models/mtp \
+  --backend=llm --model_impl=python --npu_kernel_backend=TORCH \
+  --nnodes=16 --node_rank=0 --host=127.0.0.1 --port=8000 \
+  --master_node_addr=127.0.0.1:27000 \
+  --speculative_algorithm=MTP --num_speculative_tokens=5 \
+  --enable_adaptive_draft_step=true --enable_graph=true \
+  --python_graph_backend=aclgraph --disable_graph_warmup=false \
+  --enable_unified_mtp_graph=false --enable_schedule_overlap=true \
+  --enable_task_pipeline=true --dp_size=1 --cp_size=1 \
+  --max_seqs_per_batch=16 --acl_graph_decode_batch_size_limit=16
+```
+
+### 可选的步长配置文件
+
+`adaptive_draft_step_config` 是 **JSON 配置文件的路径**，不是开启功能的开关，
+也不是预先测好的成本表。不传时使用内置默认值，服务仍会启动标定，并打印完整
+生效配置。配置文件分为两部分：
+
+| 配置项 | 用途 | 默认值 |
+|:-------|:-----|:-------|
+| `policy.window_size` | 逐位置前缀接受率的已完成 batch 统计窗口。 | `20` 个 batch |
+| `policy.update_interval` | 每完成多少个 batch 重新评分各候选步数。 | `5` 个 batch |
+| `policy.switch_min_gain` | 切换步数所需的最小预测相对吞吐收益。 | `0.05`（要求严格超过 5%） |
+| `calibration` | 启动采样桶、上下文/KV 覆盖、预热与测量窗口，以及 SPS/二维加性模型选择。 | 二维加性模型、实际捕获的请求桶（最多 128）、最多 2048 的 prefill 和最多 4096 的 KV，受模型与缓存容量限制。 |
+
+例如，传入 `--adaptive_draft_step_config=/configs/draft-steps.json`，文件内容为：
+
+```json
+{
+  "version": 1,
+  "policy": {
+    "window_size": 20,
+    "update_interval": 5,
+    "switch_min_gain": 0.05
+  },
+  "calibration": {
+    "model": "additive",
+    "request_buckets": [1, 2, 4, 8, 16],
+    "contexts": [
+      {"prefill_tokens": 2048, "min_kv_length": 1, "max_kv_length": 4096}
+    ],
+    "warmup_steps": 8,
+    "window_steps": 32,
+    "windows_per_point": 3,
+    "token_seed": 1
+  }
+}
+```
+
+其中任一部分均可省略并使用默认值。显式采样范围必须落在真实预热图和 KV 容量
+内；这些设置影响启动标定的覆盖范围与耗时，不修改客户端请求或采样参数。
+各候选步数均独立实测成本；此参数不支持加载预计算的 `step_cost_models`。
+
+## 自适应 target 验证（DSpark）
+
+当前 DSpark 实现使用滞后的 confidence 反馈和已标定的完整步成本选择验证预算，
+draft 的生成宽度在启动时固定。
 
 自适应裁剪的命令行选项和 JSON 配置项已从
 `enable_adaptive_spec_prune`（更早为 `enable_adaptive_speculative_decode`）
 重命名为 `enable_adaptive_target_verify`。
 请同步更新现有启动脚本和 JSON 配置，旧名称不作为别名保留。
 
-## 支持的配置
+### 支持的配置
 
 当前自适应 task pipeline 支持 NPU 上的 GLM DSA Python target、带 confidence
 head 的 DSpark draft、`num_speculative_tokens=5` 或 `7`、greedy draft、DP=1/CP=1、
@@ -38,7 +122,7 @@ confidence 共识、打包、验证及已接受 context 更新。unified graph �
 则会在执行前拒绝，不会静默改成 greedy。固定步数 DSpark 和其他算法的执行限制
 保持各自原有约定。
 
-## 启动示例
+### 启动示例
 
 在已有多 rank 启动脚本的**每个 rank**中加入下列配置。下面展示 16 rank 服务的
 rank 0；其余 rank 使用各自的 `node_rank` 和监听端口。启动前创建输出目录，
@@ -58,7 +142,7 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --enable_task_pipeline=true --enable_unified_mtp_graph=false \
   --dp_size=1 --cp_size=1 --max_seqs_per_batch=16 \
   --acl_graph_decode_batch_size_limit=16 \
-  --adaptive_dspark_cost_table_output=/results/dspark-costs.json
+  --adaptive_target_verify_cost_table_output=/results/dspark-costs.json
 ```
 
 客户端显式传入 temperature：`temperature=0` 使用 greedy target；
@@ -87,7 +171,7 @@ ACL graph；随机采样和前缀提交在模型图外、task stream 上执行�
 校验，不能在 replay 之间改变；Draft5 和 Draft7 的成本不能混用。
 无版本旧表若未记录 `draft_width`，按 Draft7 处理；新拟合的裸表会显式记录宽度。
 
-## 启动标定
+### 启动标定
 
 标定不需要 HTTP 客户端、手动拟合命令或第二次启动：服务先预热图，再驱动真实
 异步 prefill/decode 流水线，在内存中收集完成时间窗口，随后在 CPU 拟合成本，
@@ -95,7 +179,7 @@ ACL graph；随机采样和前缀提交在模型图外、task stream 上执行�
 Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回读和 confidence
 异步反馈仍然保留。
 
-### 内置默认值
+#### 内置默认值
 
 未指定标定文件和已保存成本表时，内置默认值为：
 
@@ -116,9 +200,9 @@ Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回�
 报错，要求提供更小的显式配置。对所有已捕获桶采样可能增加启动时间，可用 JSON
 限制标定网格。
 
-### 自定义配置
+#### 自定义配置
 
-指定 `--adaptive_dspark_calibration=/configs/dspark.json` 可覆盖默认配置。
+指定 `--adaptive_target_verify_calibration=/configs/dspark.json` 可覆盖默认配置。
 宽度由启动参数推导；若 JSON 显式指定 `draft_width`，其值必须与启动参数一致。例如：
 
 ```json
@@ -135,7 +219,7 @@ Event、耗时采样 D2H 或文件写入；原有结果就绪 Event、结果回�
 }
 ```
 
-### 成本模型与覆盖范围
+#### 成本模型与覆盖范围
 
 `model` 支持 `sps` 和 `additive`。一维 SPS 表按物理 target graph 行数 `G`
 描述每秒完整步数，成本为 `1000 / SPS(G)` 毫秒；二维加性模型拟合
@@ -157,10 +241,10 @@ Unified 启动为每个实际请求数 `B` 捕获最多四个 target 桶：分�
 及实际捕获的图几何。服务过程中不做标定、拟合或 graph recapture。未标定的
 KV 区间或 request 桶使用已经预热的完整宽度准入策略，不做 eager 重试。
 
-## 复用已保存成本表
+### 复用已保存成本表
 
 后续兼容的启动可移除标定和输出参数，改为
-`--adaptive_dspark_cost_table=/results/dspark-costs.json`。日志会打印成本表来源、
+`--adaptive_target_verify_cost_table=/results/dspark-costs.json`。日志会打印成本表来源、
 保存的标定配置和生效覆盖范围，并校验权重/量化配置及并行、执行设置的兼容性。
 加载表只跳过采样与拟合，不跳过 graph warmup。随机 token 标定和较小训练误差
 本身不能证明提速，仍应使用真实请求对比固定步数基线的 TPOT、接受率和接受长度。

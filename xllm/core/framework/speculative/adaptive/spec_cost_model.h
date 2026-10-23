@@ -23,17 +23,27 @@ limitations under the License.
 
 namespace xllm {
 
-// Immutable, Host-only DSpark step costs. JSON fields and units match SGLang's
-// SPS and additive tables. Evaluate physical graph rows, not logical B+K:
-// padding does not reduce the replay's cost. The additive B axis represents
-// the physical Draft request bucket (Bcap), including padded requests.
-class DSparkSpsCostModel final {
+enum class SpecCostScope : uint8_t { VERIFY_TAIL, FULL_STEP };
+
+struct SpecGraphCost {
+  uint32_t graph_rows = 0;
+  // The scope selects verification-tail or full-step latency. Zero denotes
+  // a warmed graph without a usable latency measurement.
+  double target_time_ms = 0.0;
+};
+
+// Immutable, Host-only speculative step costs. JSON fields and units match
+// SGLang's SPS and additive tables. Evaluate physical graph rows, not logical
+// B+K: padding does not reduce the replay's cost. The additive B axis
+// represents the physical Draft request bucket (Bcap), including padded
+// requests.
+class SpecCostModel final {
  public:
   enum class Kind : uint8_t { SPS, ADDITIVE };
 
   // Reject malformed, ambiguous, non-finite or non-positive cost models.
   // Optional max_kv_length bounds the contexts for which a table is valid.
-  static std::optional<DSparkSpsCostModel> from_json(std::string_view text);
+  static std::optional<SpecCostModel> from_json(std::string_view text);
 
   Kind kind() const { return kind_; }
   uint32_t max_kv_length() const { return max_kv_length_; }
@@ -42,7 +52,7 @@ class DSparkSpsCostModel final {
                                      uint32_t target_graph_rows) const;
 
  private:
-  DSparkSpsCostModel() = default;
+  SpecCostModel() = default;
 
   Kind kind_ = Kind::SPS;
   uint32_t max_batch_tokens_ = std::numeric_limits<uint32_t>::max();

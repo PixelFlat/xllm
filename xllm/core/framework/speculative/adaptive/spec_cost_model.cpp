@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_sps_cost_model.h"
+#include "core/framework/speculative/adaptive/spec_cost_model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -97,8 +97,7 @@ double interpolate(const std::vector<uint32_t>& probes,
 
 }  // namespace
 
-std::optional<DSparkSpsCostModel> DSparkSpsCostModel::from_json(
-    std::string_view text) {
+std::optional<SpecCostModel> SpecCostModel::from_json(std::string_view text) {
   const auto data =
       nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
   if (!data.is_object()) {
@@ -114,7 +113,7 @@ std::optional<DSparkSpsCostModel> DSparkSpsCostModel::from_json(
   if (sps == additive) {
     return std::nullopt;
   }
-  DSparkSpsCostModel model;
+  SpecCostModel model;
   const auto kv_bound = data.find("max_kv_length");
   if (kv_bound != data.end() && (!read_index(*kv_bound, model.max_kv_length_) ||
                                  model.max_kv_length_ == 0)) {
@@ -176,7 +175,7 @@ std::optional<DSparkSpsCostModel> DSparkSpsCostModel::from_json(
   return model;
 }
 
-std::optional<double> DSparkSpsCostModel::step_time_ms(
+std::optional<double> SpecCostModel::step_time_ms(
     uint32_t draft_requests,
     uint32_t target_graph_rows) const {
   if (draft_requests == 0 || target_graph_rows < draft_requests ||

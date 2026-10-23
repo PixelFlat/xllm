@@ -39,9 +39,9 @@ limitations under the License.
 namespace xllm {
 
 class ProcessGroup;
-class DSparkAdaptiveCostCache;
-struct DSparkCalibrationCommand;
-struct DSparkCalibrationGraphCoverage;
+class SpecCostProfileStore;
+struct SpecCalibrationCommand;
+struct SpecCalibrationGraphCoverage;
 
 // The owner establishes these model contracts before admission. Persistent
 // storage is allocated before KV budgeting; KV may be populated afterwards.
@@ -111,7 +111,7 @@ struct SpeculativeTaskCapacity {
   bool sparse_dsa_target = false;
   double adaptive_min_gain = 0.0;
   // Startup calibration installs identical immutable costs on sampling ranks.
-  std::shared_ptr<const DSparkAdaptiveCostCache> adaptive_costs;
+  std::shared_ptr<const SpecCostProfileStore> adaptive_costs;
   bool calibration_leader = false;
   bool startup_calibration = false;
 };
@@ -176,8 +176,7 @@ class TaskExecutionPipeline final {
   // Publish all previously accepted model work to the hierarchy producer
   // stream. Waits only for Launch submission, without consuming any results.
   void fence_kv_cache();
-  std::optional<std::string> dspark_calibration(
-      DSparkCalibrationCommand command);
+  std::optional<std::string> spec_calibration(SpecCalibrationCommand command);
   // Only the oldest accepted TaskId may be consumed. Other IDs are rejected
   // without removing a completion. Slot retirement precedes
   // Future completion; successful outputs own independent, ready CPU values.
@@ -342,17 +341,15 @@ class TaskExecutionPipeline final {
                               const LlmForwardInput& input);
   Status warmup_adaptive_dspark_graphs(const LlmForwardInput& input);
   Status warmup_adaptive_unified_graphs(const LlmForwardInput& input);
-  std::vector<DSparkCalibrationGraphCoverage> adaptive_dspark_graph_coverage()
+  std::vector<SpecCalibrationGraphCoverage> adaptive_dspark_graph_coverage()
       const;
   void bind_adaptive_dspark_views(SpeculativeSlot& slot);
   void bind_adaptive_dspark_graph_input(SpeculativeSlot& slot,
                                         bool suppress_kv_writes);
-  std::optional<std::string> dspark_calibration_impl(
-      const DSparkCalibrationCommand& command);
-  std::optional<std::string> draft_step_calibration_geometry() const;
+  std::optional<std::string> spec_calibration_impl(
+      const SpecCalibrationCommand& command);
+  std::optional<std::string> draft_step_calibration_capabilities() const;
   void consume_adaptive_dspark(SpeculativeSlot& slot);
-  void trace_adaptive_dspark(const SpeculativeSlot& slot,
-                             const torch::Tensor& accepted_lengths) const;
   void write_block_context(SpeculativeSlot& slot, bool prefill);
   void synchronize_samples(const TokenResultTensors& result,
                            bool all_greedy = false);

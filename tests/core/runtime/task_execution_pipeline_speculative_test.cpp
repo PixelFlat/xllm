@@ -16,7 +16,6 @@ limitations under the License.
 #include "core/runtime/task_execution_pipeline_speculative.h"
 
 #include <glog/logging.h>
-#include <glog/vlog_is_on.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -32,7 +31,7 @@ limitations under the License.
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include <string_view>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -40,8 +39,8 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/parallel_state/process_group.h"
-#include "core/framework/speculative/dspark/dspark_adaptive_cost_cache.h"
-#include "core/framework/speculative/dspark/dspark_sps_cost_model.h"
+#include "core/framework/speculative/adaptive/spec_cost_model.h"
+#include "core/framework/speculative/adaptive/spec_cost_profile_store.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/runtime/executor_impl_factory.h"
@@ -63,53 +62,6 @@ class PhysicalPagePoolTestPeer final {
 };
 
 namespace {
-
-class AdaptiveTraceSink final : public google::LogSink {
- public:
-  explicit AdaptiveTraceSink(int32_t level)
-      : previous_level_(
-            google::SetVLOGLevel("task_execution_pipeline_speculative",
-                                 level)) {
-    google::AddLogSink(this);
-  }
-
-  ~AdaptiveTraceSink() override {
-    google::RemoveLogSink(this);
-    google::SetVLOGLevel("task_execution_pipeline_speculative",
-                         previous_level_);
-  }
-
-  void send(google::LogSeverity /*severity*/,
-            const char* /*full_filename*/,
-            const char* /*base_filename*/,
-            int /*line*/,
-            const google::LogMessageTime& /*time*/,
-            const char* message,
-            size_t message_length) override {
-    constexpr std::string_view prefix = "DSpark confidence diagnostic: ";
-    const std::string_view text(message, message_length);
-    if (!text.starts_with(prefix)) {
-      return;
-    }
-    std::lock_guard lock(mutex_);
-    records_.emplace_back(text.substr(prefix.size()));
-  }
-
-  std::vector<nlohmann::json> snapshots() {
-    std::lock_guard lock(mutex_);
-    std::vector<nlohmann::json> result;
-    result.reserve(records_.size());
-    for (const auto& record : records_) {
-      result.emplace_back(nlohmann::json::parse(record));
-    }
-    return result;
-  }
-
- private:
-  int32_t previous_level_;
-  std::mutex mutex_;
-  std::vector<std::string> records_;
-};
 
 TEST(UnifiedBlockAdmissionTest, HonorsGraphSwitchAndExpandedBatchLimit) {
   SpeculativeTaskCapacity capacity;
@@ -977,12 +929,12 @@ class SpeculativePipelineTest : public ::testing::Test {
     capacity_.adaptive_dspark = true;
     capacity_.sparse_dsa_target = true;
     draft_->confidence_head = true;
-    auto costs = std::make_shared<DSparkAdaptiveCostCache>();
+    auto costs = std::make_shared<SpecCostProfileStore>();
     if (profiled) {
       for (const uint32_t requests : {1U, 2U, 4U}) {
-        DSparkAdaptiveCostProfile profile;
+        SpecCostProfile profile;
         profile.draft_width = draft_width;
-        profile.draft_graph_rows = requests * draft_width;
+        profile.draft_requests = requests;
         profile.max_kv_length = 32;
         profile.fixed_draft_time_ms = 1.0;
         profile.commit_time_ms = 0.1;
@@ -2564,67 +2516,42 @@ TEST_F(SpeculativePipelineTest,
 }
 
 TEST_F(SpeculativePipelineTest,
-       AdaptiveDSparkTraceUsesRetiredHostFeedbackAndKeepsZeroBudgetRows) {
-  AdaptiveTraceSink trace(/*level=*/2);
+       AdaptiveDSparkRetiredFeedbackPreservesZeroBudgetRowMetrics) {
   configure_adaptive_dspark();
   create();
   ASSERT_NE(pipeline_, nullptr);
   warmup_dspark_batch_graphs();
   execute(dspark_batch_input(3, /*decode=*/false));
-  EXPECT_TRUE(trace.snapshots().empty());
   const auto first = pipeline_->submit(dspark_batch_input(3, /*decode=*/true));
   ASSERT_TRUE(first.status.ok());
   const auto second = pipeline_->submit(dspark_batch_input(
       3, /*decode=*/true, /*placeholder=*/true, /*position=*/3));
   ASSERT_TRUE(second.status.ok());
-  ASSERT_TRUE(pipeline_->take_result_async(first.task_id).get().status.ok());
-  ASSERT_TRUE(pipeline_->take_result_async(second.task_id).get().status.ok());
-  execute(dspark_batch_input(
+  const auto first_result = pipeline_->take_result_async(first.task_id).get();
+  const auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(first_result.status.ok());
+  ASSERT_TRUE(second_result.status.ok());
+  for (const auto* result : {&first_result.output, &second_result.output}) {
+    ASSERT_EQ(result->spec_verify_layouts.size(), 3U);
+    for (const auto& layout : result->spec_verify_layouts) {
+      EXPECT_EQ(layout.verify_len, 7);
+    }
+  }
+  const auto output = execute(dspark_batch_input(
       3, /*decode=*/true, /*placeholder=*/false, /*position=*/18));
+  EXPECT_EQ(target_->forward_inputs.back().numel(), 4);
+  EXPECT_EQ(draft_->forward_inputs.back().numel(), 28);
+  const auto metrics = make_spec_metrics(output.sample_output.next_tokens,
+                                         output.spec_verify_layouts);
+  ASSERT_EQ(metrics.sequence_stats.size(), 3U);
+  EXPECT_EQ(metrics.num_draft_tokens, 1);
+  EXPECT_EQ(metrics.num_accepted_tokens, 1);
+  EXPECT_EQ(metrics.num_committed_tokens, 4);
+  for (uint32_t row = 0; row < 3; ++row) {
+    EXPECT_EQ(metrics.sequence_stats[row].proposed_tokens, row == 0 ? 1 : 0);
+    EXPECT_EQ(metrics.sequence_stats[row].accepted_tokens, row == 0 ? 1 : 0);
+  }
   pipeline_.reset();
-  const auto records = trace.snapshots();
-  ASSERT_EQ(records.size(), 3U);
-  EXPECT_EQ(records[0]["draft_counts"], nlohmann::json({7, 7, 7}));
-  EXPECT_TRUE(records[0]["lagged_conditional_confidence"].empty());
-  const auto& last = records.back();
-  EXPECT_EQ(last["logical_requests"], 3);
-  EXPECT_EQ(last["physical_requests"], 4);
-  EXPECT_EQ(last["target_graph_rows"], 4);
-  EXPECT_EQ(last["selected_draft_tokens"], 1);
-  EXPECT_EQ(last["draft_counts"], nlohmann::json({1, 0, 0}));
-  EXPECT_EQ(last["accepted_counts"], nlohmann::json({1, 0, 0}));
-  EXPECT_EQ(last["request_ids"].size(), 3U);
-  EXPECT_EQ(last["conditional_confidence"].size(), 21U);
-  EXPECT_EQ(last["lagged_conditional_confidence"].size(), 21U);
-  EXPECT_EQ(last["eligible_feedback_generation"], records[0]["generation"]);
-}
-
-TEST_F(SpeculativePipelineTest,
-       AdaptiveDSparkTraceIsDisabledAtNormalVerbosity) {
-  AdaptiveTraceSink trace(/*level=*/0);
-  configure_adaptive_dspark();
-  create();
-  ASSERT_NE(pipeline_, nullptr);
-  warmup_dspark_batch_graphs();
-  execute(dspark_batch_input(3, /*decode=*/false));
-  execute(dspark_batch_input(3, /*decode=*/true));
-  pipeline_.reset();
-  EXPECT_TRUE(trace.snapshots().empty());
-}
-
-TEST_F(SpeculativePipelineTest,
-       AdaptiveDSparkTraceDoesNotDuplicatePeerRecords) {
-  AdaptiveTraceSink trace(/*level=*/2);
-  configure_adaptive_dspark();
-  RecordingSamples peer(device_);
-  capacity_.common.sampling_group = &peer;
-  create();
-  ASSERT_NE(pipeline_, nullptr);
-  warmup_dspark_batch_graphs();
-  execute(dspark_batch_input(3, /*decode=*/false));
-  execute(dspark_batch_input(3, /*decode=*/true));
-  pipeline_.reset();
-  EXPECT_TRUE(trace.snapshots().empty());
 }
 
 TEST_F(SpeculativePipelineTest,
@@ -3219,6 +3146,31 @@ TEST_F(SpeculativePipelineTest,
 }
 
 TEST_F(SpeculativePipelineTest,
+       AdaptiveDSparkKeepsKernelLimitsOutsideSharedCostProfiles) {
+  configure_adaptive_dspark();
+  const auto reject = [this] {
+    const Status status = TaskExecutionPipeline::create(
+        state_thread_,
+        {*target_, *target_executor_, target_cache_, {}},
+        {*draft_, *draft_executor_, draft_cache_, {}},
+        capacity_,
+        pipeline_);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("DSpark Draft5/7"), std::string::npos);
+    EXPECT_EQ(pipeline_, nullptr);
+  };
+  for (const uint32_t width : {1U, 3U, 6U, 8U}) {
+    capacity_.num_speculative_tokens = width;
+    reject();
+  }
+  capacity_.num_speculative_tokens = 7;
+  capacity_.common.model.max_sequences = 129;
+  reject();
+  EXPECT_TRUE(target_->forward_inputs.empty());
+  EXPECT_TRUE(draft_->forward_inputs.empty());
+}
+
+TEST_F(SpeculativePipelineTest,
        AdaptiveDSpark8192PageCapacityRunsShortStartupRequests) {
   configure_adaptive_dspark();
   capacity_.common.model.max_blocks_per_sequence = 8192;
@@ -3508,9 +3460,9 @@ TEST_F(SpeculativePipelineTest,
   EXPECT_TRUE(
       torch::equal(draft_->context_slots.front().cpu(),
                    torch::tensor({16, 17, 48, 49, 80, 81}, torch::kInt32)));
-  for (const uint32_t draft_rows : {7U, 14U, 28U}) {
+  for (const uint32_t requests : {1U, 2U, 4U}) {
     EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_)
-                     .lookup(draft_rows, /*max_kv_length=*/8));
+                     .lookup(requests, /*max_kv_length=*/8));
   }
 
   auto decode = dspark_batch_input(3, /*decode=*/true, /*placeholder=*/true);
@@ -3524,7 +3476,7 @@ TEST_F(SpeculativePipelineTest,
                                           {8, 9, 10, 11, 12, 13, 14, 15}},
                                          torch::kInt64)));
   const auto profile = TaskPipelineTestPeer::adaptive_costs(*pipeline_)
-                           .lookup(/*draft_graph_rows=*/28,
+                           .lookup(/*draft_requests=*/4,
                                    /*max_kv_length=*/18);
   EXPECT_FALSE(profile.has_value());
   const size_t target_forwards = target_->forward_inputs.size();
@@ -3567,7 +3519,7 @@ TEST_F(SpeculativePipelineTest,
               draft_bindings.end());
   }
   const auto reused_profile = TaskPipelineTestPeer::adaptive_costs(*pipeline_)
-                                  .lookup(/*draft_graph_rows=*/28,
+                                  .lookup(/*draft_requests=*/4,
                                           /*max_kv_length=*/18);
   EXPECT_FALSE(reused_profile.has_value());
 }
@@ -3595,8 +3547,8 @@ TEST_F(SpeculativePipelineTest,
   auto warmup = dspark_batch_input(8, /*decode=*/true);
   warmup.input_params.meta.is_graph_warmup = true;
   execute(warmup);
-  const auto capabilities = pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::CAPABILITIES, {}});
+  const auto capabilities =
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}});
   ASSERT_TRUE(capabilities);
   const auto geometry = nlohmann::json::parse(*capabilities);
   const auto& coverage = geometry.at("graph_coverage");
@@ -3623,8 +3575,8 @@ TEST_F(SpeculativePipelineTest,
        // Include the bootstrap and two in-flight Slots in the KV bound.
        {{{"prefill_tokens", 1}, {"min_kv_length", 1}, {"max_kv_length", 64}}}}};
   const auto begin = [&]() {
-    return pipeline_->dspark_calibration(
-        {DSparkCalibrationAction::BEGIN_SAMPLE,
+    return pipeline_->spec_calibration(
+        {SpecCalibrationAction::BEGIN_SAMPLE,
          nlohmann::json{{"configuration", configuration},
                         {"point", uint32_t{0}}}
              .dump()});
@@ -3659,15 +3611,15 @@ TEST_F(SpeculativePipelineTest,
   auto warmup = dspark_batch_input(4, /*decode=*/true);
   warmup.input_params.meta.is_graph_warmup = true;
   execute(warmup);
-  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(28, 32));
+  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(4, 32));
   const auto pending =
       pipeline_->submit(dspark_batch_input(4, /*decode=*/true));
   ASSERT_TRUE(pending.status.ok());
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::CAPABILITIES, {}}));
+  EXPECT_FALSE(
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}}));
   ASSERT_TRUE(pipeline_->take_result_async(pending.task_id).get().status.ok());
-  const auto capabilities = pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::CAPABILITIES, {}});
+  const auto capabilities =
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}});
   ASSERT_TRUE(capabilities);
   const auto geometry = nlohmann::json::parse(*capabilities);
   EXPECT_EQ(geometry["request_buckets"], nlohmann::json({4}));
@@ -3682,22 +3634,22 @@ TEST_F(SpeculativePipelineTest,
   const std::string begin = nlohmann::json{
       {"configuration", configuration},
       {"point", uint32_t{0}}}.dump();
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::BEGIN_SAMPLE, "{}"}));
-  ASSERT_TRUE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::BEGIN_SAMPLE, begin}));
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::BEGIN_SAMPLE, begin}));
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::INSTALL_COSTS, "{}"}));
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::FINISH_SAMPLE, {}}));
+  EXPECT_FALSE(
+      pipeline_->spec_calibration({SpecCalibrationAction::BEGIN_SAMPLE, "{}"}));
+  ASSERT_TRUE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::BEGIN_SAMPLE, begin}));
+  EXPECT_FALSE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::BEGIN_SAMPLE, begin}));
+  EXPECT_FALSE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::INSTALL_COSTS, "{}"}));
+  EXPECT_FALSE(
+      pipeline_->spec_calibration({SpecCalibrationAction::FINISH_SAMPLE, {}}));
   execute(dspark_batch_input(
       4, /*decode=*/true, /*placeholder=*/false, /*position=*/10));
   execute(dspark_batch_input(
       4, /*decode=*/true, /*placeholder=*/false, /*position=*/11));
-  const auto completed = pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::FINISH_SAMPLE, {}});
+  const auto completed =
+      pipeline_->spec_calibration({SpecCalibrationAction::FINISH_SAMPLE, {}});
   ASSERT_TRUE(completed);
   const auto windows = nlohmann::json::parse(*completed);
   ASSERT_EQ(windows.size(), 1U);
@@ -3718,20 +3670,20 @@ TEST_F(SpeculativePipelineTest,
          {"max_kv_length", 64},
          {"request_buckets", {4}},
          {"table", table}}}}}.dump();
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::INSTALL_COSTS, "{}"}));
-  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(28, 32));
-  const auto installed = pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::INSTALL_COSTS, bundle});
+  EXPECT_FALSE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::INSTALL_COSTS, "{}"}));
+  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(4, 32));
+  const auto installed = pipeline_->spec_calibration(
+      {SpecCalibrationAction::INSTALL_COSTS, bundle});
   ASSERT_TRUE(installed);
   EXPECT_EQ(*installed, bundle);
   const auto profile =
-      TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(28, 32);
+      TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(4, 32);
   ASSERT_TRUE(profile);
-  EXPECT_EQ(profile->cost_scope, DSparkCostScope::FULL_STEP);
+  EXPECT_EQ(profile->cost_scope, SpecCostScope::FULL_STEP);
   EXPECT_EQ(profile->fixed_draft_time_ms, 0.0);
-  EXPECT_FALSE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::BEGIN_SAMPLE, begin}));
+  EXPECT_FALSE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::BEGIN_SAMPLE, begin}));
   execute(dspark_batch_input(4, /*decode=*/false));
   EXPECT_TRUE(execute(dspark_batch_input(4, /*decode=*/true))
                   .sample_output.next_tokens.defined());
@@ -3757,14 +3709,13 @@ TEST_F(SpeculativePipelineTest, AdaptiveDSparkUsesExternalFullStepCosts) {
   const auto warmed = execute(warmup);
   ASSERT_TRUE(warmed.sample_output.next_tokens.defined());
   EXPECT_TRUE(warmed.is_graph_warmup);
-  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(28, 32));
-  ASSERT_TRUE(pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::INSTALL_COSTS, table}));
-  const auto profile =
-      TaskPipelineTestPeer::adaptive_costs(*pipeline_)
-          .lookup(/*draft_graph_rows=*/28, /*max_kv_length=*/32);
+  EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_).lookup(4, 32));
+  ASSERT_TRUE(pipeline_->spec_calibration(
+      {SpecCalibrationAction::INSTALL_COSTS, table}));
+  const auto profile = TaskPipelineTestPeer::adaptive_costs(*pipeline_)
+                           .lookup(/*draft_requests=*/4, /*max_kv_length=*/32);
   ASSERT_TRUE(profile);
-  EXPECT_EQ(profile->cost_scope, DSparkCostScope::FULL_STEP);
+  EXPECT_EQ(profile->cost_scope, SpecCostScope::FULL_STEP);
   EXPECT_EQ(profile->max_kv_length, 32U);
   EXPECT_DOUBLE_EQ(profile->fixed_draft_time_ms, 0.0);
   EXPECT_DOUBLE_EQ(profile->commit_time_ms, 0.0);
@@ -3774,7 +3725,7 @@ TEST_F(SpeculativePipelineTest, AdaptiveDSparkUsesExternalFullStepCosts) {
   EXPECT_NEAR(profile->target_graph_costs.front().target_time_ms, 18.0, 1e-5);
   EXPECT_NEAR(profile->target_graph_costs.back().target_time_ms, 46.0, 1e-5);
   EXPECT_FALSE(TaskPipelineTestPeer::adaptive_costs(*pipeline_)
-                   .lookup(/*draft_graph_rows=*/28, /*max_kv_length=*/65));
+                   .lookup(/*draft_requests=*/4, /*max_kv_length=*/65));
 }
 
 TEST_F(SpeculativePipelineTest,
@@ -4165,8 +4116,8 @@ TEST_F(SpeculativePipelineTest,
   auto warmup = input(true);
   warmup.input_params.meta.is_graph_warmup = true;
   execute(warmup);
-  const auto geometry = pipeline_->dspark_calibration(
-      {DSparkCalibrationAction::CAPABILITIES, {}});
+  const auto geometry =
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}});
   ASSERT_TRUE(geometry);
   const auto data = nlohmann::json::parse(*geometry);
   EXPECT_EQ(data.at("algorithm"), "mtp");

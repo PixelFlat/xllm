@@ -23,7 +23,7 @@ limitations under the License.
 
 namespace xllm {
 
-struct DSparkWindowConfig {
+struct SpecWindowConfig {
   uint32_t target_graph_rows = 0;
   uint32_t min_kv_length = 1;
   uint32_t max_kv_length = 0;
@@ -37,7 +37,7 @@ struct DSparkWindowConfig {
 };
 
 // Borrowed Host snapshots of a retired Task; no Device reads or timing Events.
-struct DSparkSteadyStep {
+struct SpecSteadyStep {
   uint64_t generation = 0;
   uint64_t completed_ns = 0;
   uint32_t logical_requests = 0;
@@ -49,7 +49,7 @@ struct DSparkSteadyStep {
   std::span<const std::string> request_ids;
 };
 
-struct DSparkSteadyWindow {
+struct SpecSteadyWindow {
   uint64_t first_generation = 0;
   uint64_t last_generation = 0;
   uint32_t logical_requests = 0;
@@ -64,18 +64,18 @@ struct DSparkSteadyWindow {
 };
 
 // Startup-only in-memory collection. No files, writer thread or serving mode.
-class DSparkSteadyWindowCollector final {
+class SpecSteadyWindowCollector final {
  public:
-  explicit DSparkSteadyWindowCollector(DSparkWindowConfig config);
+  explicit SpecSteadyWindowCollector(SpecWindowConfig config);
   // Gaps, prefill, membership/shape changes and KV gaps reset the window.
-  std::optional<DSparkSteadyWindow> observe(const DSparkSteadyStep& step);
+  std::optional<SpecSteadyWindow> observe(const SpecSteadyStep& step);
   void reset();
   bool finished() const;
 
  private:
-  DSparkWindowConfig config_;
+  SpecWindowConfig config_;
   std::vector<std::string> request_ids_;
-  DSparkSteadyWindow window_;
+  SpecSteadyWindow window_;
   uint64_t last_generation_ = 0;
   uint64_t last_ns_ = 0;
   uint64_t window_start_ns_ = 0;

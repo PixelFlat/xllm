@@ -1,16 +1,6 @@
 include(cc_test)
 
-add_subdirectory(dspark)
-
-cc_test(
-  NAME
-    draft_step_selector_test
-  SRCS
-    draft_step_selector_test.cpp
-  DEPS
-    :speculative
-    GTest::gtest_main
-)
+add_subdirectory(adaptive)
 
 cc_test(
   NAME

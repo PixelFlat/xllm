@@ -90,10 +90,10 @@ DECLARE_bool(enable_adaptive_target_verify);
 DECLARE_bool(enable_adaptive_draft_step);
 DECLARE_string(adaptive_draft_step_config);
 
-DECLARE_double(adaptive_speculative_min_gain);
-DECLARE_string(adaptive_dspark_cost_table);
-DECLARE_string(adaptive_dspark_calibration);
-DECLARE_string(adaptive_dspark_cost_table_output);
+DECLARE_double(adaptive_target_verify_min_gain);
+DECLARE_string(adaptive_target_verify_cost_table);
+DECLARE_string(adaptive_target_verify_calibration);
+DECLARE_string(adaptive_target_verify_cost_table_output);
 
 DECLARE_int32(speculative_suffix_cache_max_depth);
 

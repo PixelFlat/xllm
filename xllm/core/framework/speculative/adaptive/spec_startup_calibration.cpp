@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -97,9 +97,9 @@ struct CellSamples {
   uint32_t max_kv_length = 0;
 };
 
-DSparkWindowConfig session_config(const DSparkStartupCalibrationConfig& config,
-                                  const DSparkCalibrationPoint& point) {
-  DSparkWindowConfig result;
+SpecWindowConfig session_config(const SpecStartupCalibrationConfig& config,
+                                const SpecCalibrationPoint& point) {
+  SpecWindowConfig result;
   result.target_graph_rows = point.target_graph_rows;
   result.min_kv_length = point.context.min_kv_length;
   result.max_kv_length = point.context.max_kv_length;
@@ -112,7 +112,7 @@ DSparkWindowConfig session_config(const DSparkStartupCalibrationConfig& config,
 
 }  // namespace
 
-std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
+std::optional<SpecStartupCalibrationConfig> parse_spec_startup_calibration(
     std::string_view contents,
     uint32_t draft_width,
     bool autoregressive_draft) {
@@ -126,7 +126,7 @@ std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
       data["contexts"].empty()) {
     return std::nullopt;
   }
-  DSparkStartupCalibrationConfig config;
+  SpecStartupCalibrationConfig config;
   config.draft_width = draft_width;
   if (data.contains("draft_width") &&
       (!read_index(data["draft_width"], config.draft_width) ||
@@ -137,8 +137,8 @@ std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
   if (model != "sps" && model != "additive") {
     return std::nullopt;
   }
-  config.model = model == "sps" ? DSparkSpsCostModel::Kind::SPS
-                                : DSparkSpsCostModel::Kind::ADDITIVE;
+  config.model =
+      model == "sps" ? SpecCostModel::Kind::SPS : SpecCostModel::Kind::ADDITIVE;
   if (!read_axis(data["request_buckets"], config.request_buckets) ||
       config.request_buckets.back() > 128 ||
       (data.contains("target_graph_rows") &&
@@ -164,7 +164,7 @@ std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
   }
   config.contexts.reserve(data["contexts"].size());
   for (const auto& value : data["contexts"]) {
-    DSparkCalibrationContext context;
+    SpecCalibrationContext context;
     if (!value.is_object() || !value.contains("prefill_tokens") ||
         !value.contains("min_kv_length") || !value.contains("max_kv_length") ||
         !read_index(value["prefill_tokens"], context.prefill_tokens) ||
@@ -191,16 +191,16 @@ std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
   return config;
 }
 
-std::optional<DSparkStartupCalibrationConfig>
-default_dspark_startup_calibration(uint32_t max_positions,
-                                   uint32_t draft_width,
-                                   bool autoregressive_draft) {
+std::optional<SpecStartupCalibrationConfig> default_spec_startup_calibration(
+    uint32_t max_positions,
+    uint32_t draft_width,
+    bool autoregressive_draft) {
   if (!supported_calibration_width(draft_width, autoregressive_draft)) {
     return std::nullopt;
   }
-  DSparkStartupCalibrationConfig config;
+  SpecStartupCalibrationConfig config;
   config.draft_width = draft_width;
-  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+  config.model = SpecCostModel::Kind::ADDITIVE;
   const uint32_t max_kv_length = std::min(max_positions, uint32_t{4096});
   const uint64_t reserved_tokens =
       (static_cast<uint64_t>(config.warmup_steps) +
@@ -213,12 +213,12 @@ default_dspark_startup_calibration(uint32_t max_positions,
   const uint32_t prefill_tokens = std::min(
       uint32_t{2048}, max_kv_length - static_cast<uint32_t>(reserved_tokens));
   config.contexts.emplace_back(
-      DSparkCalibrationContext{prefill_tokens, 1, max_kv_length});
+      SpecCalibrationContext{prefill_tokens, 1, max_kv_length});
   return config;
 }
 
-std::string serialize_dspark_startup_calibration(
-    const DSparkStartupCalibrationConfig& config) {
+std::string serialize_spec_startup_calibration(
+    const SpecStartupCalibrationConfig& config) {
   nlohmann::json contexts = nlohmann::json::array();
   for (const auto& context : config.contexts) {
     contexts.emplace_back(
@@ -227,8 +227,7 @@ std::string serialize_dspark_startup_calibration(
                        {"max_kv_length", context.max_kv_length}});
   }
   nlohmann::json data{
-      {"model",
-       config.model == DSparkSpsCostModel::Kind::SPS ? "sps" : "additive"},
+      {"model", config.model == SpecCostModel::Kind::SPS ? "sps" : "additive"},
       {"request_buckets", config.request_buckets},
       {"contexts", std::move(contexts)},
       {"warmup_steps", config.warmup_steps},
@@ -242,7 +241,7 @@ std::string serialize_dspark_startup_calibration(
   return data.dump();
 }
 
-std::optional<uint32_t> dspark_calibration_warmup_length(
+std::optional<uint32_t> spec_calibration_warmup_length(
     uint32_t max_kv_length,
     uint32_t max_positions,
     uint32_t logical_block_size,
@@ -288,11 +287,11 @@ std::optional<uint32_t> dspark_calibration_warmup_length(
   return low;
 }
 
-std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
-    const DSparkStartupCalibrationConfig& config,
+std::optional<std::vector<SpecCalibrationPoint>> plan_spec_calibration(
+    const SpecStartupCalibrationConfig& config,
     std::span<const uint32_t> captured_requests,
     std::span<const uint32_t> captured_target_rows,
-    std::span<const DSparkCalibrationGraphCoverage> graph_coverage) {
+    std::span<const SpecCalibrationGraphCoverage> graph_coverage) {
   if ((config.draft_width != 5 && config.draft_width != 7) ||
       !sorted_axis(captured_requests) || !sorted_axis(captured_target_rows) ||
       !sorted_axis(config.request_buckets) || config.contexts.empty() ||
@@ -318,7 +317,7 @@ std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
       }
     }
   }
-  std::vector<DSparkCalibrationPoint> points;
+  std::vector<SpecCalibrationPoint> points;
   for (const auto& context : config.contexts) {
     for (const uint32_t requests : config.request_buckets) {
       const auto full = std::lower_bound(
@@ -352,7 +351,7 @@ std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
         if (!std::binary_search(available.begin(), available.end(), rows)) {
           return std::nullopt;
         }
-        points.emplace_back(DSparkCalibrationPoint{requests, rows, context});
+        points.emplace_back(SpecCalibrationPoint{requests, rows, context});
         has_full = has_full || rows == *full;
       }
       if (!has_full) {
@@ -360,7 +359,7 @@ std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
       }
     }
   }
-  if (config.model == DSparkSpsCostModel::Kind::ADDITIVE) {
+  if (config.model == SpecCostModel::Kind::ADDITIVE) {
     std::unordered_set<uint32_t> connected_requests{
         config.request_buckets.front()};
     std::unordered_set<uint32_t> connected_graphs;
@@ -391,8 +390,8 @@ std::optional<std::vector<DSparkCalibrationPoint>> plan_dspark_calibration(
 namespace {
 
 std::optional<std::string> fit_full_step_cost_table(
-    std::span<const DSparkSteadyWindow> windows,
-    DSparkSpsCostModel::Kind kind,
+    std::span<const SpecSteadyWindow> windows,
+    SpecCostModel::Kind kind,
     uint32_t min_kv_length,
     uint32_t max_kv_length,
     uint32_t draft_width,
@@ -453,7 +452,7 @@ std::optional<std::string> fit_full_step_cost_table(
   nlohmann::json table;
   std::vector<double> predictions;
   predictions.reserve(cells.size());
-  if (kind == DSparkSpsCostModel::Kind::SPS) {
+  if (kind == SpecCostModel::Kind::SPS) {
     std::map<uint32_t, double> medians;
     table["sample_batch_tokens"] = nlohmann::json::array();
     table["sample_steps_per_sec"] = nlohmann::json::array();
@@ -467,7 +466,7 @@ std::optional<std::string> fit_full_step_cost_table(
     for (const auto& cell : cells) {
       predictions.emplace_back(medians.at(cell.graph_rows));
     }
-  } else if (kind == DSparkSpsCostModel::Kind::ADDITIVE) {
+  } else if (kind == SpecCostModel::Kind::ADDITIVE) {
     std::map<uint32_t, size_t> row_columns;
     size_t column = 1;
     for (auto& [batch, index] : batches) {
@@ -552,7 +551,7 @@ std::optional<std::string> fit_full_step_cost_table(
   table["draft_width"] = draft_width;
   table["metadata"] = {
       {"measurement", "steady_full_step"},
-      {"model", kind == DSparkSpsCostModel::Kind::SPS ? "sps" : "additive"},
+      {"model", kind == SpecCostModel::Kind::SPS ? "sps" : "additive"},
       {"min_kv_length", min_kv_length},
       {"input_windows", windows.size()},
       {"sampled_cells", cells.size()},
@@ -562,15 +561,15 @@ std::optional<std::string> fit_full_step_cost_table(
         {"root_mean_square_ms", rms},
         {"max_relative_percent", relative}}}};
   const std::string serialized = table.dump();
-  return DSparkSpsCostModel::from_json(serialized) ? std::optional(serialized)
-                                                   : std::nullopt;
+  return SpecCostModel::from_json(serialized) ? std::optional(serialized)
+                                              : std::nullopt;
 }
 
 }  // namespace
 
-std::optional<std::string> fit_dspark_cost_table(
-    std::span<const DSparkSteadyWindow> windows,
-    DSparkSpsCostModel::Kind kind,
+std::optional<std::string> fit_spec_cost_table(
+    std::span<const SpecSteadyWindow> windows,
+    SpecCostModel::Kind kind,
     uint32_t min_kv_length,
     uint32_t max_kv_length,
     uint32_t draft_width) {
@@ -583,8 +582,8 @@ std::optional<std::string> fit_dspark_cost_table(
 }
 
 std::optional<std::string> fit_draft_step_cost_table(
-    std::span<const DSparkSteadyWindow> windows,
-    DSparkSpsCostModel::Kind kind,
+    std::span<const SpecSteadyWindow> windows,
+    SpecCostModel::Kind kind,
     uint32_t min_kv_length,
     uint32_t max_kv_length,
     uint32_t draft_width) {
@@ -596,14 +595,14 @@ std::optional<std::string> fit_draft_step_cost_table(
                                   /*autoregressive_draft=*/true);
 }
 
-DSparkCalibrationSession::DSparkCalibrationSession(
-    const DSparkStartupCalibrationConfig& config,
-    DSparkCalibrationPoint point)
+SpecCalibrationSession::SpecCalibrationSession(
+    const SpecStartupCalibrationConfig& config,
+    SpecCalibrationPoint point)
     : point_(point), collector_(session_config(config, point)) {
   windows_.reserve(config.windows_per_point);
 }
 
-void DSparkCalibrationSession::observe(const DSparkSteadyStep& step) {
+void SpecCalibrationSession::observe(const SpecSteadyStep& step) {
   if (step.logical_requests != point_.requests) {
     collector_.reset();
     return;
@@ -614,18 +613,16 @@ void DSparkCalibrationSession::observe(const DSparkSteadyStep& step) {
   }
 }
 
-bool DSparkCalibrationSession::finished() const {
-  return collector_.finished();
-}
+bool SpecCalibrationSession::finished() const { return collector_.finished(); }
 
-std::optional<DSparkCostTableBundle> DSparkCostTableBundle::from_json(
+std::optional<SpecCostTableBundle> SpecCostTableBundle::from_json(
     std::string_view contents,
     std::string_view expected_compatibility) {
   const auto data = nlohmann::json::parse(contents, nullptr, false);
   if (!data.is_object()) {
     return std::nullopt;
   }
-  DSparkCostTableBundle bundle;
+  SpecCostTableBundle bundle;
   if (!data.contains("schema_version")) {
     // Older unversioned tables predate Draft5 support and describe Draft7.
     // A newly fitted bare table records its width explicitly; never silently
@@ -645,12 +642,12 @@ std::optional<DSparkCostTableBundle> DSparkCostTableBundle::from_json(
         return std::nullopt;
       }
     }
-    auto model = DSparkSpsCostModel::from_json(contents);
+    auto model = SpecCostModel::from_json(contents);
     if (!model) {
       return std::nullopt;
     }
     bundle.entries_.emplace_back(
-        DSparkCostTableEntry{1, model->max_kv_length(), {}, std::move(*model)});
+        SpecCostTableEntry{1, model->max_kv_length(), {}, std::move(*model)});
     return bundle;
   }
   uint32_t version = 0;
@@ -683,17 +680,17 @@ std::optional<DSparkCostTableBundle> DSparkCostTableBundle::from_json(
          low <= bundle.entries_.back().max_kv_length)) {
       return std::nullopt;
     }
-    auto model = DSparkSpsCostModel::from_json(value["table"].dump());
+    auto model = SpecCostModel::from_json(value["table"].dump());
     if (!model || model->max_kv_length() != high) {
       return std::nullopt;
     }
-    bundle.entries_.emplace_back(DSparkCostTableEntry{
-        low, high, std::move(requests), std::move(*model)});
+    bundle.entries_.emplace_back(
+        SpecCostTableEntry{low, high, std::move(requests), std::move(*model)});
   }
   return bundle;
 }
 
-const DSparkCostTableEntry* DSparkCostTableBundle::lookup(
+const SpecCostTableEntry* SpecCostTableBundle::lookup(
     uint32_t requests,
     uint32_t max_kv_length) const {
   if (requests == 0 || max_kv_length == 0) {
@@ -703,7 +700,7 @@ const DSparkCostTableEntry* DSparkCostTableBundle::lookup(
       std::lower_bound(entries_.begin(),
                        entries_.end(),
                        max_kv_length,
-                       [](const DSparkCostTableEntry& item, uint32_t length) {
+                       [](const SpecCostTableEntry& item, uint32_t length) {
                          return item.max_kv_length < length;
                        });
   if (entry == entries_.end() || entry->min_kv_length > max_kv_length ||

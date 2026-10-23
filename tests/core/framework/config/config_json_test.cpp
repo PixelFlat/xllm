@@ -105,7 +105,11 @@ TEST(SpeculativeConfigTest, AdaptiveHelpRegistersOnlyCurrentNames) {
   const auto& names = SpeculativeConfig::option_category().option_names;
   for (const std::string& name : {"enable_adaptive_draft_step",
                                   "enable_adaptive_target_verify",
-                                  "adaptive_draft_step_config"}) {
+                                  "adaptive_draft_step_config",
+                                  "adaptive_target_verify_min_gain",
+                                  "adaptive_target_verify_calibration",
+                                  "adaptive_target_verify_cost_table",
+                                  "adaptive_target_verify_cost_table_output"}) {
     SCOPED_TRACE(name);
     EXPECT_TRUE(google::GetCommandLineFlagInfo(name.c_str(), &flag_info));
     EXPECT_NE(std::find(names.begin(), names.end(), name), names.end());
@@ -113,11 +117,36 @@ TEST(SpeculativeConfigTest, AdaptiveHelpRegistersOnlyCurrentNames) {
   for (const std::string& name : {"enable_adaptive_mtp",
                                   "enable_adaptive_spec_prune",
                                   "enable_adaptive_speculative_decode",
-                                  "adaptive_mtp_config"}) {
+                                  "adaptive_mtp_config",
+                                  "adaptive_speculative_min_gain",
+                                  "adaptive_dspark_calibration",
+                                  "adaptive_dspark_cost_table",
+                                  "adaptive_dspark_cost_table_output"}) {
     SCOPED_TRACE(name);
     EXPECT_FALSE(google::GetCommandLineFlagInfo(name.c_str(), &flag_info));
     EXPECT_EQ(std::find(names.begin(), names.end(), name), names.end());
   }
+}
+
+TEST(SpeculativeConfigTest,
+     RejectsRetiredTargetVerifySettingsWithMigrationHint) {
+  SpeculativeConfig config;
+  constexpr std::array<std::pair<const char*, const char*>, 3> retired{{
+      {"adaptive_dspark_calibration", "adaptive_target_verify_calibration"},
+      {"adaptive_dspark_cost_table", "adaptive_target_verify_cost_table"},
+      {"adaptive_dspark_cost_table_output",
+       "adaptive_target_verify_cost_table_output"},
+  }};
+  for (const auto& [old_name, new_name] : retired) {
+    const JsonReader json = config::parse_json_string(
+        nlohmann::json{{old_name, "costs.json"}}.dump());
+    EXPECT_DEATH(config.from_json(json),
+                 std::string("was renamed to ") + new_name);
+  }
+  const JsonReader json =
+      config::parse_json_string(R"({"adaptive_speculative_min_gain":0.1})");
+  EXPECT_DEATH(config.from_json(json),
+               "was renamed to adaptive_target_verify_min_gain");
 }
 
 TEST(SpeculativeConfigTest, AdaptiveCommandLineNamesReachConfiguration) {
@@ -174,22 +203,24 @@ TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
       "enable_adaptive_speculative_decode", &flag_info));
   SpeculativeConfig speculative_config;
   const JsonReader json = config::parse_json_string(R"json({
-    "adaptive_dspark_cost_table":"/tmp/dspark_sps.json",
+    "adaptive_target_verify_cost_table":"/tmp/dspark_sps.json",
     "speculative_algorithm":"DSpark",
     "num_speculative_tokens":7,
     "enable_adaptive_target_verify":true
   })json");
   speculative_config.from_json(json);
   speculative_config.validate();
-  EXPECT_EQ(speculative_config.adaptive_dspark_cost_table(),
+  EXPECT_EQ(speculative_config.adaptive_target_verify_cost_table(),
             "/tmp/dspark_sps.json");
   nlohmann::ordered_json serialized;
   speculative_config.append_config_json(serialized);
-  EXPECT_EQ(serialized.at("adaptive_dspark_cost_table"),
+  EXPECT_EQ(serialized.at("adaptive_target_verify_cost_table"),
             "/tmp/dspark_sps.json");
   const auto& names = SpeculativeConfig::option_category().option_names;
-  EXPECT_NE(std::find(names.begin(), names.end(), "adaptive_dspark_cost_table"),
-            names.end());
+  EXPECT_NE(
+      std::find(
+          names.begin(), names.end(), "adaptive_target_verify_cost_table"),
+      names.end());
   EXPECT_NE(
       std::find(names.begin(), names.end(), "enable_adaptive_target_verify"),
       names.end());
@@ -204,7 +235,7 @@ TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
 TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveDsparkDraft7) {
   google::FlagSaver flag_saver;
   SpeculativeConfig speculative_config;
-  speculative_config.adaptive_dspark_cost_table("/tmp/dspark_sps.json");
+  speculative_config.adaptive_target_verify_cost_table("/tmp/dspark_sps.json");
   EXPECT_DEATH(speculative_config.validate(),
                "requires adaptive DSpark Draft5/7");
   speculative_config.enable_adaptive_target_verify(true)
@@ -221,8 +252,8 @@ TEST(SpeculativeConfigTest,
   google::FlagSaver flag_saver;
   SpeculativeConfig config;
   config.from_json(config::parse_json_string(R"json({
-    "adaptive_dspark_calibration":"/tmp/calibration.json",
-    "adaptive_dspark_cost_table_output":"/tmp/new-costs.json",
+    "adaptive_target_verify_calibration":"/tmp/calibration.json",
+    "adaptive_target_verify_cost_table_output":"/tmp/new-costs.json",
     "speculative_algorithm":"DSpark",
     "num_speculative_tokens":7,
     "enable_adaptive_target_verify":true
@@ -230,30 +261,30 @@ TEST(SpeculativeConfigTest,
   config.validate();
   nlohmann::ordered_json serialized;
   config.append_config_json(serialized);
-  EXPECT_EQ(serialized.at("adaptive_dspark_calibration"),
+  EXPECT_EQ(serialized.at("adaptive_target_verify_calibration"),
             "/tmp/calibration.json");
-  EXPECT_EQ(serialized.at("adaptive_dspark_cost_table_output"),
+  EXPECT_EQ(serialized.at("adaptive_target_verify_cost_table_output"),
             "/tmp/new-costs.json");
   const auto& names = SpeculativeConfig::option_category().option_names;
-  for (const std::string& name :
-       {"adaptive_dspark_calibration", "adaptive_dspark_cost_table_output"}) {
+  for (const std::string& name : {"adaptive_target_verify_calibration",
+                                  "adaptive_target_verify_cost_table_output"}) {
     EXPECT_NE(std::find(names.begin(), names.end(), name), names.end());
   }
-  config.adaptive_dspark_cost_table("/tmp/costs.json");
+  config.adaptive_target_verify_cost_table("/tmp/costs.json");
   EXPECT_DEATH(config.validate(), "without a cost-table input");
 }
 
 TEST(SpeculativeConfigTest, StartupDsparkOutputAllowsDefaultCalibration) {
   google::FlagSaver flag_saver;
   SpeculativeConfig config;
-  config.adaptive_dspark_cost_table_output("/tmp/output.json");
+  config.adaptive_target_verify_cost_table_output("/tmp/output.json");
   EXPECT_DEATH(config.validate(), "requires startup calibration");
   config.enable_adaptive_target_verify(true)
       .speculative_algorithm("DSpark")
       .num_speculative_tokens(7);
   config.validate();
-  EXPECT_TRUE(config.adaptive_dspark_calibration().empty());
-  config.adaptive_dspark_cost_table("/tmp/saved.json");
+  EXPECT_TRUE(config.adaptive_target_verify_calibration().empty());
+  config.adaptive_target_verify_cost_table("/tmp/saved.json");
   EXPECT_DEATH(config.validate(), "requires startup calibration");
 }
 

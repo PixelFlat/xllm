@@ -20,9 +20,9 @@ limitations under the License.
 #include <unordered_set>
 
 #include "core/framework/sampling/rejection_sampler.h"
-#include "core/framework/speculative/dspark/dspark_adaptive_cost_cache.h"
-#include "core/framework/speculative/dspark/dspark_budget_planner.h"
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_cost_profile_store.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
+#include "core/framework/speculative/adaptive/verify_budget_planner.h"
 #include "core/runtime/task_execution_pipeline.h"
 
 namespace xllm {
@@ -88,10 +88,9 @@ struct MtpContextView {
 // streams or independently retiring execution object lives here.
 struct TaskExecutionPipeline::SpeculativeSlot {
   struct Adaptive {
-    DSparkBudgetPlan plan;
+    VerifyBudgetPlan plan;
     uint64_t generation = 0;
     uint32_t max_kv_length = 0;
-    uint32_t generated_draft_tokens = 0;
     uint32_t selected_draft_tokens = 0;
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
@@ -213,14 +212,14 @@ struct TaskExecutionPipeline::DSparkAdaptiveState {
     uint64_t generation = 0;
     std::vector<int32_t> embedding_ids;
     std::vector<std::string> request_ids;
-    DSparkBudgetPlan plan;
+    VerifyBudgetPlan plan;
   };
   uint64_t retired_generation = 0;
   std::vector<History> histories;
   std::array<RetiredPlan, 2> retired_plans;
-  std::shared_ptr<DSparkAdaptiveCostCache> owned_costs;
-  std::optional<DSparkCalibrationPoint> calibration_point;
-  std::unique_ptr<DSparkCalibrationSession> calibration_session;
+  std::shared_ptr<SpecCostProfileStore> owned_costs;
+  std::optional<SpecCalibrationPoint> calibration_point;
+  std::unique_ptr<SpecCalibrationSession> calibration_session;
   bool startup_calibration_complete = false;
 };
 

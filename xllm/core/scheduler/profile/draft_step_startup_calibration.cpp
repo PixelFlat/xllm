@@ -13,8 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/draft_step_startup_calibration.h"
-
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -23,12 +21,13 @@ limitations under the License.
 
 #include "core/distributed_runtime/distributed_worker_manager.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/speculative/adaptive/draft_step_controller.h"
 #include "core/scheduler/profile/profile_manager.h"
 
 namespace xllm {
 
 void ProfileManager::calibrate_draft_step_startup() {
-  auto* calibration = engine_->draft_step_startup_calibration();
+  auto* calibration = engine_->draft_step_controller();
   CHECK(calibration != nullptr && distributed_worker_manager_ != nullptr);
   CHECK(options_.enable_task_pipeline() && options_.enable_schedule_overlap());
   CHECK_EQ(options_.dp_size(), 1);
@@ -37,8 +36,8 @@ void ProfileManager::calibrate_draft_step_startup() {
   // Reuse the startup-only capability RPC. Unlike DSpark's Device-side
   // pruning, MTP depth selection lives in the engine, so costs need not be
   // installed in, or broadcast among, the workers.
-  const auto capabilities = distributed_worker_manager_->dspark_calibration(
-      {DSparkCalibrationAction::CAPABILITIES, {}});
+  const auto capabilities = distributed_worker_manager_->spec_calibration(
+      {SpecCalibrationAction::CAPABILITIES, {}});
   CHECK(capabilities && !capabilities->empty());
   CHECK(std::all_of(
       capabilities->begin(),
@@ -69,14 +68,14 @@ void ProfileManager::calibrate_draft_step_startup() {
   const auto points = calibration->points();
   CHECK(!points.empty());
   LOG(INFO) << "Draft-step effective startup calibration: configuration="
-            << serialize_dspark_startup_calibration(config)
+            << serialize_spec_startup_calibration(config)
             << ", captured_geometry=" << geometry.dump()
             << ", sample_points=" << points.size();
-  std::vector<std::vector<DSparkCostTableEntry>> costs(config.draft_width);
+  std::vector<std::vector<SpecCostTableEntry>> costs(config.draft_width);
   for (auto& profiles : costs) {
     profiles.reserve(config.contexts.size());
   }
-  std::vector<DSparkSteadyWindow> windows;
+  std::vector<SpecSteadyWindow> windows;
   for (size_t index = 0; index < points.size(); ++index) {
     const auto& point = points[index];
     run_startup_speculative_sample(
@@ -112,15 +111,16 @@ void ProfileManager::calibrate_draft_step_startup() {
     CHECK(fitted)
         << "Cannot fit an identifiable positive draft-step full-cycle model; "
            "check the sampled request/target axes and KV coverage.";
-    auto model = DSparkSpsCostModel::from_json(*fitted);
+    auto model = SpecCostModel::from_json(*fitted);
     CHECK(model);
     costs[point.draft_steps - 1].emplace_back(
-        DSparkCostTableEntry{context.min_kv_length,
-                             context.max_kv_length,
-                             config.request_buckets,
-                             std::move(*model)});
-    LOG(INFO) << "Draft-step measured full-cycle cost: depth="
-              << point.draft_steps << ", model=" << *fitted;
+        SpecCostTableEntry{context.min_kv_length,
+                           context.max_kv_length,
+                           config.request_buckets,
+                           std::move(*model)});
+    LOG(INFO) << "Draft-step full-cycle cost fitted: depth="
+              << point.draft_steps << ", KV=[" << context.min_kv_length << ", "
+              << context.max_kv_length << "]";
     windows.clear();
   }
   calibration->install_costs(std::move(costs));

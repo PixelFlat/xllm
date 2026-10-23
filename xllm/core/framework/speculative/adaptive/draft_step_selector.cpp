@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/draft_step_selector.h"
+#include "core/framework/speculative/adaptive/draft_step_selector.h"
 
 #include <glog/logging.h>
 
@@ -211,8 +211,6 @@ uint32_t DraftStepSelector::select(
                                 draft_requests, target_graph_rows[index]);
     if (!cost) {
       // Missing profile coverage is decided before any task is submitted.
-      VLOG(1) << "Adaptive draft-step cost coverage missing: B=" << batch_size
-              << ", KV=" << max_kv_length << "; using configured maximum.";
       return config_.max_steps;
     }
     costs.emplace_back(*cost);
@@ -225,19 +223,6 @@ uint32_t DraftStepSelector::select(
   if (!std::all_of(histories_.begin(), active_end, [&](const auto& history) {
         return history.size() == config_.window_size;
       })) {
-    if (VLOG_IS_ON(1)) {
-      std::vector<size_t> window_counts;
-      window_counts.reserve(histories_.size());
-      for (const auto& history : histories_) {
-        window_counts.emplace_back(history.size());
-      }
-      VLOG(1) << "Adaptive draft-step history warmup: "
-              << nlohmann::json{{"completed_batches", completed_batches_},
-                                {"current_steps", current_steps_},
-                                {"window_size", config_.window_size},
-                                {"position_window_counts", window_counts}}
-                     .dump();
-    }
     return current_steps_;
   }
   const auto rates = position_acceptance();
@@ -257,39 +242,6 @@ uint32_t DraftStepSelector::select(
       scores[current_steps_ - 1] * (1.0 + config_.switch_min_gain);
   const bool switch_steps =
       best != current_steps_ && scores[best - 1] > required_score;
-  if (VLOG_IS_ON(1)) {
-    auto candidates = nlohmann::json::array();
-    double expected_tokens = 1.0;
-    for (uint32_t position = 0; position < config_.max_steps; ++position) {
-      expected_tokens += rates[position];
-      candidates.emplace_back(
-          nlohmann::json{{"steps", position + 1},
-                         {"target_graph_rows", target_graph_rows[position]},
-                         {"cost_ms", costs[position]},
-                         {"expected_tokens_per_request", expected_tokens},
-                         {"score_tok_ms", scores[position]}});
-    }
-    VLOG(1) << "Adaptive draft-step decision: "
-            << nlohmann::json{{"batch_size", batch_size},
-                              {"max_kv_length", max_kv_length},
-                              {"draft_requests", draft_requests},
-                              {"completed_batches", completed_batches_},
-                              {"statistics_epoch", statistics_epoch_},
-                              {"current_steps", current_steps_},
-                              {"raw_best_steps", best},
-                              {"selected_steps",
-                               switch_steps ? best : current_steps_},
-                              {"switch_min_gain", config_.switch_min_gain},
-                              {"required_switch_score_tok_ms", required_score},
-                              {"prefix_acceptance", rates},
-                              {"candidates", std::move(candidates)},
-                              {"reason",
-                               switch_steps ? "switch"
-                               : best == current_steps_
-                                   ? "current_is_best"
-                                   : "below_switch_margin"}}
-                   .dump();
-  }
   if (switch_steps) {
     if (best < current_steps_) {
       clear_positions_above(best);

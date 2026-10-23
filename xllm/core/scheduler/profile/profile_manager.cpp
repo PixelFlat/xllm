@@ -197,10 +197,10 @@ ProfileManager::ProfileManager(
     }
   }
 #endif
-  if (options_.enable_adaptive_dspark() ||
-      !options_.adaptive_dspark_calibration().empty() ||
-      !options_.adaptive_dspark_cost_table().empty()) {
-    calibrate_dspark_startup();
+  if (options_.enable_adaptive_target_verify() ||
+      !options_.adaptive_target_verify_calibration().empty() ||
+      !options_.adaptive_target_verify_cost_table().empty()) {
+    calibrate_spec_startup();
   }
   if (options_.enable_adaptive_draft_step()) {
     calibrate_draft_step_startup();
@@ -1298,7 +1298,7 @@ void ProfileManager::warmup_decode_for_graph() {
             static_cast<uint32_t>(std::max<int32_t>(1, options_.dp_size()))));
   }
   const int32_t decode_seq_len =
-      dspark_calibration_warmup_seq_len(warmup_decode_seq_len(
+      adaptive_calibration_warmup_seq_len(warmup_decode_seq_len(
           Platform::is_npu() &&
               ::xllm::ExecutionConfig::get_instance().enable_fia_decode(),
           max_context_len));

@@ -55,8 +55,8 @@ class RemoteWorker : public WorkerClient {
 
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
 
-  std::optional<std::string> dspark_calibration(
-      const DSparkCalibrationCommand& command) override;
+  std::optional<std::string> spec_calibration(
+      const SpecCalibrationCommand& command) override;
 
   void get_cache_info(uint64_t& cluster_id,
                       std::string& addr,

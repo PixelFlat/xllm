@@ -77,12 +77,12 @@ DistributedWorkerManager::DistributedWorkerManager(
     : worker_clients_(std::move(worker_clients)) {}
 
 std::optional<std::vector<std::string>>
-DistributedWorkerManager::dspark_calibration(
-    const DSparkCalibrationCommand& command) {
+DistributedWorkerManager::spec_calibration(
+    const SpecCalibrationCommand& command) {
   std::vector<std::string> results;
   results.reserve(worker_clients_.size());
   for (const auto& worker : worker_clients_) {
-    auto result = worker->dspark_calibration(command);
+    auto result = worker->spec_calibration(command);
     if (!result) {
       return std::nullopt;
     }

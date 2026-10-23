@@ -125,10 +125,10 @@ class SpeculativeConfig final {
          "enable_adaptive_target_verify",
          "enable_adaptive_draft_step",
          "adaptive_draft_step_config",
-         "adaptive_speculative_min_gain",
-         "adaptive_dspark_cost_table",
-         "adaptive_dspark_calibration",
-         "adaptive_dspark_cost_table_output"}};
+         "adaptive_target_verify_min_gain",
+         "adaptive_target_verify_cost_table",
+         "adaptive_target_verify_calibration",
+         "adaptive_target_verify_cost_table_output"}};
     return kOptionCategory;
   }
 
@@ -160,11 +160,11 @@ class SpeculativeConfig final {
   PROPERTY(bool, enable_adaptive_draft_step) = false;
   PROPERTY(std::string, adaptive_draft_step_config);
 
-  PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+  PROPERTY(double, adaptive_target_verify_min_gain) = 0.0;
 
-  PROPERTY(std::string, adaptive_dspark_cost_table);
-  PROPERTY(std::string, adaptive_dspark_calibration);
-  PROPERTY(std::string, adaptive_dspark_cost_table_output);
+  PROPERTY(std::string, adaptive_target_verify_cost_table);
+  PROPERTY(std::string, adaptive_target_verify_calibration);
+  PROPERTY(std::string, adaptive_target_verify_cost_table_output);
 };
 
 }  // namespace xllm

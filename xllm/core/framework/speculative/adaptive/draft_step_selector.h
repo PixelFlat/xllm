@@ -21,7 +21,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 
 namespace xllm {
 
@@ -33,7 +33,7 @@ struct DraftStepSelectorConfig {
   // One SPS/additive full-cycle model per candidate depth, measured for the
   // current draft/target pair. Reuse the shared cost-table representation,
   // bounds and interpolation, not another strategy's measurements.
-  std::vector<std::vector<DSparkCostTableEntry>> costs;
+  std::vector<std::vector<SpecCostTableEntry>> costs;
 };
 
 struct DraftStepAcceptanceObservation {

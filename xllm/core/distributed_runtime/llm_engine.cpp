@@ -43,8 +43,8 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_controller.h"
 #include "core/framework/model_loader/model_loader.h"
+#include "core/framework/speculative/adaptive/draft_step_controller.h"
 #include "core/framework/speculative/draft_config.h"
-#include "core/framework/speculative/draft_step_startup_calibration.h"
 #include "core/kv_cache/block/block_utils.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/prefix/block_hasher.h"
@@ -134,7 +134,7 @@ LLMEngine::LLMEngine(
     CHECK(options_.enable_task_pipeline() && options_.dp_size() == 1 &&
           options_.cp_size() == 1 && options_.num_speculative_tokens() > 0 &&
           options_.num_speculative_tokens() <= 64);
-    draft_step_calibration_ = std::make_unique<DraftStepStartupCalibration>(
+    draft_step_controller_ = std::make_unique<DraftStepController>(
         options_.adaptive_draft_step_config(),
         static_cast<uint32_t>(options_.num_speculative_tokens()));
   }
@@ -525,7 +525,7 @@ bool LLMEngine::allocate_kv_cache(
 }
 
 void LLMEngine::select_draft_steps(std::vector<LlmForwardInput>& inputs) {
-  if (!draft_step_calibration_) {
+  if (!draft_step_controller_) {
     return;
   }
   CHECK_EQ(inputs.size(), 1U);
@@ -535,10 +535,10 @@ void LLMEngine::select_draft_steps(std::vector<LlmForwardInput>& inputs) {
       input.input_params.embedding.embedding_ids.empty()) {
     return;
   }
-  if (draft_step_calibration_->sampling()) {
-    meta.mtp_draft_steps = draft_step_calibration_->forced_steps();
-    meta.mtp_target_graph_rows = draft_step_calibration_->forced_graph_rows();
-    draft_step_calibration_->dispatched(
+  if (draft_step_controller_->sampling()) {
+    meta.mtp_draft_steps = draft_step_controller_->forced_steps();
+    meta.mtp_target_graph_rows = draft_step_controller_->forced_graph_rows();
+    draft_step_controller_->dispatched(
         input.input_params.embedding.request_ids);
     return;
   }
@@ -550,13 +550,13 @@ void LLMEngine::select_draft_steps(std::vector<LlmForwardInput>& inputs) {
   CHECK(!lengths.empty());
   const int32_t max_kv = *std::max_element(lengths.begin(), lengths.end());
   CHECK_GT(max_kv, 0);
-  meta.mtp_draft_steps = draft_step_calibration_->select(
+  meta.mtp_draft_steps = draft_step_controller_->select(
       rows, static_cast<uint32_t>(max_kv) + maximum);
-  draft_step_calibration_->dispatched(input.input_params.embedding.request_ids);
+  draft_step_controller_->dispatched(input.input_params.embedding.request_ids);
 }
 
 void LLMEngine::observe_draft_step_acceptance(const RawForwardOutput& output) {
-  if (!draft_step_calibration_) {
+  if (!draft_step_controller_) {
     return;
   }
   std::vector<DraftStepAcceptanceObservation> observations;
@@ -578,7 +578,7 @@ void LLMEngine::observe_draft_step_acceptance(const RawForwardOutput& output) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
-    draft_step_calibration_->observe(observations, completed_ns);
+    draft_step_controller_->observe(observations, completed_ns);
   }
 }
 

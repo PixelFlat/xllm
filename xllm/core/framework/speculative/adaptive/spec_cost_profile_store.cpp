@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_adaptive_cost_cache.h"
+#include "core/framework/speculative/adaptive/spec_cost_profile_store.h"
 
 #include <algorithm>
 #include <cmath>
@@ -21,16 +21,14 @@ limitations under the License.
 
 namespace xllm {
 
-bool DSparkAdaptiveCostCache::store(DSparkAdaptiveCostProfile profile) {
+bool SpecCostProfileStore::store(SpecCostProfile profile) {
   const uint32_t draft_width = profile.draft_width;
   const bool valid_scope =
-      (profile.cost_scope == DSparkCostScope::VERIFY_TAIL &&
+      (profile.cost_scope == SpecCostScope::VERIFY_TAIL &&
        profile.fixed_draft_time_ms > 0.0) ||
-      (profile.cost_scope == DSparkCostScope::FULL_STEP &&
+      (profile.cost_scope == SpecCostScope::FULL_STEP &&
        profile.fixed_draft_time_ms == 0.0 && profile.commit_time_ms == 0.0);
-  if ((draft_width != 5 && draft_width != 7) || profile.draft_graph_rows == 0 ||
-      profile.draft_graph_rows % draft_width != 0 ||
-      profile.draft_graph_rows / draft_width > 128 ||
+  if (draft_width == 0 || profile.draft_requests == 0 ||
       profile.min_kv_length == 0 ||
       profile.max_kv_length < profile.min_kv_length ||
       !std::isfinite(profile.fixed_draft_time_ms) || !valid_scope ||
@@ -43,7 +41,7 @@ bool DSparkAdaptiveCostCache::store(DSparkAdaptiveCostProfile profile) {
   if (std::any_of(
           costs.begin(),
           costs.end(),
-          [&](const DSparkGraphCost& cost) {
+          [&](const SpecGraphCost& cost) {
             return cost.graph_rows == 0 ||
                    cost.graph_rows > std::numeric_limits<int32_t>::max() ||
                    !std::isfinite(cost.target_time_ms) ||
@@ -54,30 +52,30 @@ bool DSparkAdaptiveCostCache::store(DSparkAdaptiveCostProfile profile) {
       std::adjacent_find(
           costs.begin(),
           costs.end(),
-          [](const DSparkGraphCost& lhs, const DSparkGraphCost& rhs) {
+          [](const SpecGraphCost& lhs, const SpecGraphCost& rhs) {
             return lhs.graph_rows >= rhs.graph_rows;
           }) != costs.end() ||
-      costs.back().graph_rows <
-          profile.draft_graph_rows / draft_width * (draft_width + 1)) {
+      costs.back().graph_rows < static_cast<uint64_t>(profile.draft_requests) *
+                                    (static_cast<uint64_t>(draft_width) + 1)) {
     return false;
   }
   const auto key = std::make_tuple(
-      draft_width, profile.draft_graph_rows, profile.max_kv_length);
+      draft_width, profile.draft_requests, profile.max_kv_length);
   profiles_.insert_or_assign(key, std::move(profile));
   return true;
 }
 
-std::optional<DSparkAdaptiveCostProfile> DSparkAdaptiveCostCache::lookup(
-    uint32_t draft_graph_rows,
+std::optional<SpecCostProfile> SpecCostProfileStore::lookup(
+    uint32_t draft_requests,
     uint32_t max_kv_length,
     uint32_t draft_width) const {
-  if (draft_graph_rows == 0 || max_kv_length == 0) {
+  if (draft_requests == 0 || max_kv_length == 0 || draft_width == 0) {
     return std::nullopt;
   }
   const auto found =
-      profiles_.lower_bound({draft_width, draft_graph_rows, max_kv_length});
+      profiles_.lower_bound({draft_width, draft_requests, max_kv_length});
   if (found == profiles_.end() || found->second.draft_width != draft_width ||
-      found->second.draft_graph_rows != draft_graph_rows ||
+      found->second.draft_requests != draft_requests ||
       found->second.min_kv_length > max_kv_length) {
     return std::nullopt;
   }

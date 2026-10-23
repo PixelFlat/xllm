@@ -43,9 +43,9 @@ bool WorkerClient::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache(kv_cache_shape);
 }
 
-std::optional<std::string> WorkerClient::dspark_calibration(
-    const DSparkCalibrationCommand& command) {
-  return worker_->dspark_calibration(command);
+std::optional<std::string> WorkerClient::spec_calibration(
+    const SpecCalibrationCommand& command) {
+  return worker_->spec_calibration(command);
 }
 
 void WorkerClient::get_cache_info(uint64_t& cluster_id,

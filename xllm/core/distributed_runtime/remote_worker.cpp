@@ -79,9 +79,9 @@ bool RemoteWorker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return channel_->allocate_kv_cache(kv_cache_shape);
 }
 
-std::optional<std::string> RemoteWorker::dspark_calibration(
-    const DSparkCalibrationCommand& command) {
-  return channel_->dspark_calibration(command);
+std::optional<std::string> RemoteWorker::spec_calibration(
+    const SpecCalibrationCommand& command) {
+  return channel_->spec_calibration(command);
 }
 
 void RemoteWorker::get_cache_info(uint64_t& cluster_id,

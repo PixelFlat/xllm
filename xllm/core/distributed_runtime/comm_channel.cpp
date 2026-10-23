@@ -23,7 +23,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/distributed_runtime/worker_model_codec.h"
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
 #include "runtime/rec_forward_params.h"
 #include "runtime/vlm_forward_params.h"
@@ -97,8 +97,8 @@ bool CommChannel::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return true;
 }
 
-std::optional<std::string> CommChannel::dspark_calibration(
-    const DSparkCalibrationCommand& command) {
+std::optional<std::string> CommChannel::spec_calibration(
+    const SpecCalibrationCommand& command) {
   proto::DSparkCalibrationRequest request;
   request.set_action(
       static_cast<proto::DSparkCalibrationRequest::Action>(command.action));

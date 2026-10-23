@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_sps_cost_model.h"
+#include "core/framework/speculative/adaptive/spec_cost_model.h"
 
 #include <gtest/gtest.h>
 
@@ -21,7 +21,7 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <vector>
 
-#include "core/framework/speculative/dspark/dspark_budget_planner.h"
+#include "core/framework/speculative/adaptive/verify_budget_planner.h"
 
 namespace xllm {
 namespace {
@@ -40,10 +40,10 @@ nlohmann::json additive_table() {
           {"theta_seconds", {0.0, 0.008}}};
 }
 
-TEST(DSparkSpsCostModelTest, SpsUsesFloorProbeAndMilliseconds) {
-  const auto model = DSparkSpsCostModel::from_json(sps_table().dump());
+TEST(SpecCostModelTest, SpsUsesFloorProbeAndMilliseconds) {
+  const auto model = SpecCostModel::from_json(sps_table().dump());
   ASSERT_TRUE(model);
-  EXPECT_EQ(model->kind(), DSparkSpsCostModel::Kind::SPS);
+  EXPECT_EQ(model->kind(), SpecCostModel::Kind::SPS);
   EXPECT_DOUBLE_EQ(*model->step_time_ms(1, 1), 10.0);
   EXPECT_DOUBLE_EQ(*model->step_time_ms(1, 2), 10.0);
   EXPECT_DOUBLE_EQ(*model->step_time_ms(1, 3), 10.0);
@@ -55,21 +55,21 @@ TEST(DSparkSpsCostModelTest, SpsUsesFloorProbeAndMilliseconds) {
   EXPECT_FALSE(model->step_time_ms(8, 4));
 }
 
-TEST(DSparkSpsCostModelTest, SpsSupportsSingleProbeAndContextBound) {
+TEST(SpecCostModelTest, SpsSupportsSingleProbeAndContextBound) {
   auto table = sps_table();
   table["sample_batch_tokens"] = {1};
   table["sample_steps_per_sec"] = {25.0};
   table["max_kv_length"] = 4096;
-  const auto model = DSparkSpsCostModel::from_json(table.dump());
+  const auto model = SpecCostModel::from_json(table.dump());
   ASSERT_TRUE(model);
   EXPECT_EQ(model->max_kv_length(), 4096U);
   EXPECT_DOUBLE_EQ(*model->step_time_ms(2, 8), 40.0);
 }
 
-TEST(DSparkSpsCostModelTest, AdditiveInterpolatesBothAxesAndClampsEdges) {
-  const auto model = DSparkSpsCostModel::from_json(additive_table().dump());
+TEST(SpecCostModelTest, AdditiveInterpolatesBothAxesAndClampsEdges) {
+  const auto model = SpecCostModel::from_json(additive_table().dump());
   ASSERT_TRUE(model);
-  EXPECT_EQ(model->kind(), DSparkSpsCostModel::Kind::ADDITIVE);
+  EXPECT_EQ(model->kind(), SpecCostModel::Kind::ADDITIVE);
   EXPECT_NEAR(*model->step_time_ms(2, 4), 16.0, 1e-12);
   EXPECT_NEAR(*model->step_time_ms(1, 1), 12.0, 1e-12);
   EXPECT_NEAR(*model->step_time_ms(3, 8), 21.0, 1e-12);
@@ -77,41 +77,41 @@ TEST(DSparkSpsCostModelTest, AdditiveInterpolatesBothAxesAndClampsEdges) {
   EXPECT_EQ(model->max_kv_length(), std::numeric_limits<uint32_t>::max());
 }
 
-TEST(DSparkSpsCostModelTest, AdditiveAcceptsNegativeOffsetsWithPositiveTotals) {
+TEST(SpecCostModelTest, AdditiveAcceptsNegativeOffsetsWithPositiveTotals) {
   auto table = additive_table();
   table["alpha_seconds"] = {-0.002, -0.001};
-  const auto model = DSparkSpsCostModel::from_json(table.dump());
+  const auto model = SpecCostModel::from_json(table.dump());
   ASSERT_TRUE(model);
   EXPECT_NEAR(*model->step_time_ms(1, 8), 16.0, 1e-12);
   table["alpha_seconds"] = {-0.020, -0.001};
-  EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump()));
+  EXPECT_FALSE(SpecCostModel::from_json(table.dump()));
 }
 
-TEST(DSparkSpsCostModelTest, AdditiveSupportsSinglePointAxes) {
+TEST(SpecCostModelTest, AdditiveSupportsSinglePointAxes) {
   auto table = additive_table();
   table["bs_probes"] = {1};
   table["alpha_seconds"] = {0.002};
   table["m_probes"] = {0};
   table["theta_seconds"] = {0.003};
-  const auto model = DSparkSpsCostModel::from_json(table.dump());
+  const auto model = SpecCostModel::from_json(table.dump());
   ASSERT_TRUE(model);
   EXPECT_NEAR(*model->step_time_ms(8, 64), 15.0, 1e-12);
 }
 
-TEST(DSparkSpsCostModelTest, RejectsMalformedAmbiguousOrIncompleteJson) {
+TEST(SpecCostModelTest, RejectsMalformedAmbiguousOrIncompleteJson) {
   for (const auto* text :
        {"{", "[]", "null", "{}", "{\"bias_seconds\":1e999}"}) {
-    EXPECT_FALSE(DSparkSpsCostModel::from_json(text)) << text;
+    EXPECT_FALSE(SpecCostModel::from_json(text)) << text;
   }
   auto table = sps_table();
   table["bias_seconds"] = 1.0;
-  EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump()));
+  EXPECT_FALSE(SpecCostModel::from_json(table.dump()));
   table = additive_table();
   table.erase("theta_seconds");
-  EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump()));
+  EXPECT_FALSE(SpecCostModel::from_json(table.dump()));
 }
 
-TEST(DSparkSpsCostModelTest, RejectsInvalidAxesAndValues) {
+TEST(SpecCostModelTest, RejectsInvalidAxesAndValues) {
   for (const auto& invalid : nlohmann::json{nlohmann::json::array(),
                                             {2, 2, 8},
                                             {8, 4, 2},
@@ -122,7 +122,7 @@ TEST(DSparkSpsCostModelTest, RejectsInvalidAxesAndValues) {
                                             {4294967296ULL, 4, 8}}) {
     auto table = sps_table();
     table["sample_batch_tokens"] = invalid;
-    EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump())) << table;
+    EXPECT_FALSE(SpecCostModel::from_json(table.dump())) << table;
   }
   for (const auto& invalid : nlohmann::json{nlohmann::json::array(),
                                             {100, 50},
@@ -133,40 +133,39 @@ TEST(DSparkSpsCostModelTest, RejectsInvalidAxesAndValues) {
                                             {1e-310, 50, 25}}) {
     auto table = sps_table();
     table["sample_steps_per_sec"] = invalid;
-    EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump())) << table;
+    EXPECT_FALSE(SpecCostModel::from_json(table.dump())) << table;
   }
 }
 
-TEST(DSparkSpsCostModelTest, RejectsInvalidBoundsAndOverflow) {
+TEST(SpecCostModelTest, RejectsInvalidBoundsAndOverflow) {
   for (const auto& invalid :
        nlohmann::json{0, -1, 7, 16.0, true, 4294967296ULL}) {
     auto table = sps_table();
     table["max_batch_tokens"] = invalid;
-    EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump())) << table;
+    EXPECT_FALSE(SpecCostModel::from_json(table.dump())) << table;
   }
   for (const auto& invalid : nlohmann::json{0, -1, 4096.0, true}) {
     auto table = additive_table();
     table["max_kv_length"] = invalid;
-    EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump())) << table;
+    EXPECT_FALSE(SpecCostModel::from_json(table.dump())) << table;
   }
   auto table = additive_table();
   table["bias_seconds"] = std::numeric_limits<double>::max();
-  EXPECT_FALSE(DSparkSpsCostModel::from_json(table.dump()));
+  EXPECT_FALSE(SpecCostModel::from_json(table.dump()));
 }
 
-TEST(DSparkSpsCostModelTest, BothModelsDrivePhysicalGraphPlanner) {
+TEST(SpecCostModelTest, BothModelsDrivePhysicalGraphPlanner) {
   for (const auto& table : {sps_table(), additive_table()}) {
-    const auto model = DSparkSpsCostModel::from_json(table.dump());
+    const auto model = SpecCostModel::from_json(table.dump());
     ASSERT_TRUE(model);
-    std::vector<DSparkGraphCost> costs;
+    std::vector<SpecGraphCost> costs;
     costs.reserve(3);
     for (const uint32_t graph : {2U, 4U, 8U}) {
-      costs.emplace_back(
-          DSparkGraphCost{graph, *model->step_time_ms(1, graph)});
+      costs.emplace_back(SpecGraphCost{graph, *model->step_time_ms(1, graph)});
     }
-    DSparkBudgetOptions options;
-    options.cost_scope = DSparkCostScope::FULL_STEP;
-    const auto plan = DSparkBudgetPlanner::plan(
+    VerifyBudgetOptions options;
+    options.cost_scope = SpecCostScope::FULL_STEP;
+    const auto plan = VerifyBudgetPlanner::plan(
         1, std::vector<double>(7, 0.01), costs, options);
     ASSERT_TRUE(plan);
     EXPECT_EQ(plan->graph_rows, 2U);

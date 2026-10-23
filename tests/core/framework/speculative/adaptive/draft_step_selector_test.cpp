@@ -17,61 +17,14 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <array>
-#include <mutex>
-#include <nlohmann/json.hpp>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
-#include "core/framework/speculative/draft_step_startup_calibration.h"
+#include "core/framework/speculative/adaptive/draft_step_controller.h"
 
 namespace xllm {
 namespace {
-
-class DraftStepDecisionTraceSink final : public google::LogSink {
- public:
-  DraftStepDecisionTraceSink()
-      : previous_level_(google::SetVLOGLevel("draft_step_selector", 1)) {
-    google::AddLogSink(this);
-  }
-
-  ~DraftStepDecisionTraceSink() override {
-    google::RemoveLogSink(this);
-    google::SetVLOGLevel("draft_step_selector", previous_level_);
-  }
-
-  void send(google::LogSeverity /*severity*/,
-            const char* /*full_filename*/,
-            const char* /*base_filename*/,
-            int /*line*/,
-            const google::LogMessageTime& /*time*/,
-            const char* message,
-            size_t message_length) override {
-    constexpr std::string_view prefix = "Adaptive draft-step decision: ";
-    const std::string_view text(message, message_length);
-    if (!text.starts_with(prefix)) {
-      return;
-    }
-    std::lock_guard lock(mutex_);
-    records_.emplace_back(text.substr(prefix.size()));
-  }
-
-  std::vector<nlohmann::json> snapshots() {
-    std::lock_guard lock(mutex_);
-    std::vector<nlohmann::json> result;
-    result.reserve(records_.size());
-    for (const auto& record : records_) {
-      result.emplace_back(nlohmann::json::parse(record));
-    }
-    return result;
-  }
-
- private:
-  int32_t previous_level_;
-  std::mutex mutex_;
-  std::vector<std::string> records_;
-};
 
 DraftStepSelectorConfig policy(std::vector<double> milliseconds) {
   DraftStepSelectorConfig config;
@@ -85,10 +38,10 @@ DraftStepSelectorConfig policy(std::vector<double> milliseconds) {
         "{\"sample_batch_tokens\":[1],\"sample_steps_per_sec\":[" +
         std::to_string(1000.0 / ms) +
         "],\"max_batch_tokens\":1024,\"max_kv_length\":4096}";
-    auto cost = DSparkSpsCostModel::from_json(text);
+    auto cost = SpecCostModel::from_json(text);
     CHECK(cost.has_value());
     config.costs.emplace_back(
-        std::vector<DSparkCostTableEntry>{{1, 4096, {}, std::move(*cost)}});
+        std::vector<SpecCostTableEntry>{{1, 4096, {}, std::move(*cost)}});
   }
   return config;
 }
@@ -121,43 +74,27 @@ TEST(DraftStepSelectorTest, DoesNotMultiplyPrefixProbabilitiesTwice) {
 }
 
 TEST(DraftStepSelectorTest, FiveStepPolicyKeepsGainBelowDefaultMargin) {
-  DraftStepDecisionTraceSink trace;
   auto config = policy({100.0, 200.0, 200.0, 200.0, 104.0});
   config.switch_min_gain = DraftStepSelectorConfig{}.switch_min_gain;
   DraftStepSelector selector(std::move(config));
   const std::array<DraftStepAcceptanceObservation, 1> history{{{5, 0}}};
   selector.observe(history, selector.statistics_epoch());
+  const uint64_t epoch = selector.statistics_epoch();
+  EXPECT_EQ(selector.position_acceptance(),
+            std::vector<double>({0.0, 0.0, 0.0, 0.0, 0.0}));
   EXPECT_EQ(selector.select(1, 128, 1, kFiveStepRows), 5U);
-  const auto records = trace.snapshots();
-  ASSERT_EQ(records.size(), 1U);
-  const auto& decision = records.front();
-  EXPECT_EQ(decision.at("reason"), "below_switch_margin");
-  EXPECT_EQ(decision.at("raw_best_steps"), 1);
-  EXPECT_EQ(decision.at("selected_steps"), 5);
-  EXPECT_EQ(decision.at("prefix_acceptance"),
-            nlohmann::json::array({0.0, 0.0, 0.0, 0.0, 0.0}));
-  const auto& candidates = decision.at("candidates");
-  ASSERT_EQ(candidates.size(), 5U);
-  EXPECT_DOUBLE_EQ(candidates.front().at("cost_ms").get<double>(), 100.0);
-  EXPECT_DOUBLE_EQ(
-      candidates.front().at("expected_tokens_per_request").get<double>(), 1.0);
-  EXPECT_DOUBLE_EQ(candidates.front().at("score_tok_ms").get<double>(), 0.01);
-  EXPECT_EQ(candidates.back().at("target_graph_rows"), 8);
+  EXPECT_EQ(selector.statistics_epoch(), epoch);
 }
 
 TEST(DraftStepSelectorTest, FiveStepPolicySwitchesAboveDefaultMargin) {
-  DraftStepDecisionTraceSink trace;
   auto config = policy({100.0, 200.0, 200.0, 200.0, 106.0});
   config.switch_min_gain = DraftStepSelectorConfig{}.switch_min_gain;
   DraftStepSelector selector(std::move(config));
   const std::array<DraftStepAcceptanceObservation, 1> history{{{5, 0}}};
   selector.observe(history, selector.statistics_epoch());
+  const uint64_t epoch = selector.statistics_epoch();
   EXPECT_EQ(selector.select(1, 128, 1, kFiveStepRows), 1U);
-  const auto records = trace.snapshots();
-  ASSERT_EQ(records.size(), 1U);
-  EXPECT_EQ(records.front().at("reason"), "switch");
-  EXPECT_EQ(records.front().at("current_steps"), 5);
-  EXPECT_EQ(records.front().at("selected_steps"), 1);
+  EXPECT_GT(selector.statistics_epoch(), epoch);
 }
 
 TEST(DraftStepSelectorTest, OneBatchContributesOnePrefixRatePerPosition) {
@@ -319,10 +256,10 @@ TEST(DraftStepSelectorTest, ReusesAdditivePhysicalBatchAndTokenAxes) {
       {R"({"bias_seconds":0.001,"bs_probes":[1,8],"alpha_seconds":[0,0.02],"m_probes":[1,64],"theta_seconds":[0,0]})",
        R"({"bias_seconds":0.003,"bs_probes":[1,8],"alpha_seconds":[0,0],"m_probes":[1,64],"theta_seconds":[0,0]})",
        R"({"bias_seconds":0.1,"bs_probes":[1,8],"alpha_seconds":[0,0],"m_probes":[1,64],"theta_seconds":[0,0]})"}) {
-    auto cost = DSparkSpsCostModel::from_json(text);
+    auto cost = SpecCostModel::from_json(text);
     ASSERT_TRUE(cost.has_value());
     config.costs.emplace_back(
-        std::vector<DSparkCostTableEntry>{{1, 4096, {}, std::move(*cost)}});
+        std::vector<SpecCostTableEntry>{{1, 4096, {}, std::move(*cost)}});
   }
   DraftStepSelector selector(std::move(config));
   const std::array<DraftStepAcceptanceObservation, 1> history{{{3, 0}}};
@@ -341,17 +278,16 @@ TEST(DraftStepSelectorTest, RejectsMixingDifferentDepthsIntoOneBatchSample) {
       selector.observe(mixed, selector.statistics_epoch()), "one verify batch");
 }
 
-TEST(DraftStepStartupCalibrationTest,
-     DefaultsMeasureCyclesRatherThanLoadCostJson) {
+TEST(DraftStepControllerTest, DefaultsMeasureCyclesRatherThanLoadCostJson) {
   const auto config = load_draft_step_selector_config("", /*max_steps=*/3);
   EXPECT_TRUE(config.costs.empty());
   EXPECT_EQ(config.window_size, 20U);
   EXPECT_EQ(config.update_interval, 5U);
   EXPECT_DOUBLE_EQ(config.switch_min_gain, 0.05);
-  DraftStepStartupCalibration calibration("", /*max_steps=*/3);
+  DraftStepController calibration("", /*max_steps=*/3);
   const auto& sampling = calibration.configuration(/*max_positions=*/8192);
   EXPECT_EQ(sampling.draft_width, 3U);
-  EXPECT_EQ(sampling.model, DSparkSpsCostModel::Kind::ADDITIVE);
+  EXPECT_EQ(sampling.model, SpecCostModel::Kind::ADDITIVE);
   calibration.set_geometry({1, 2}, {2, 4, 8});
   const auto points = calibration.points();
   ASSERT_EQ(points.size(), 11U);
@@ -362,9 +298,8 @@ TEST(DraftStepStartupCalibrationTest,
   EXPECT_EQ(calibration.select(1, 128), 0U);
 }
 
-TEST(DraftStepStartupCalibrationTest,
-     MeasuresActualDepthThroughOrdinaryResultFences) {
-  DraftStepStartupCalibration calibration("", /*max_steps=*/3);
+TEST(DraftStepControllerTest, MeasuresActualDepthThroughOrdinaryResultFences) {
+  DraftStepController calibration("", /*max_steps=*/3);
   const auto& config = calibration.configuration(/*max_positions=*/8192);
   calibration.set_geometry({1, 2}, {2, 4, 8});
   const auto point = calibration.points().front();
@@ -386,26 +321,25 @@ TEST(DraftStepStartupCalibrationTest,
   EXPECT_FALSE(calibration.sampling());
   const auto fitted =
       fit_draft_step_cost_table(windows,
-                                DSparkSpsCostModel::Kind::ADDITIVE,
+                                SpecCostModel::Kind::ADDITIVE,
                                 point.batch.context.min_kv_length,
                                 point.batch.context.max_kv_length,
                                 /*draft_width=*/1);
   ASSERT_TRUE(fitted);
-  const auto model = DSparkSpsCostModel::from_json(*fitted);
+  const auto model = SpecCostModel::from_json(*fitted);
   ASSERT_TRUE(model);
   ASSERT_TRUE(model->step_time_ms(/*draft_requests=*/1, /*target_rows=*/2));
   EXPECT_DOUBLE_EQ(*model->step_time_ms(1, 2), 1.0);
   // Reusing the collector/fitter does not relax the DSpark Draft5/7 guard.
-  EXPECT_FALSE(fit_dspark_cost_table(windows,
-                                     DSparkSpsCostModel::Kind::ADDITIVE,
-                                     point.batch.context.min_kv_length,
-                                     point.batch.context.max_kv_length,
-                                     /*draft_width=*/1));
+  EXPECT_FALSE(fit_spec_cost_table(windows,
+                                   SpecCostModel::Kind::ADDITIVE,
+                                   point.batch.context.min_kv_length,
+                                   point.batch.context.max_kv_length,
+                                   /*draft_width=*/1));
 }
 
-TEST(DraftStepStartupCalibrationTest,
-     ServingStartsOnlyAfterMeasuredModelsInstalled) {
-  DraftStepStartupCalibration calibration("", /*max_steps=*/3);
+TEST(DraftStepControllerTest, ServingStartsOnlyAfterMeasuredModelsInstalled) {
+  DraftStepController calibration("", /*max_steps=*/3);
   calibration.configuration(/*max_positions=*/8192);
   calibration.set_geometry({1, 2}, {2, 4, 8});
   auto config = policy({1.0, 2.0, 4.0});
@@ -419,9 +353,8 @@ TEST(DraftStepStartupCalibrationTest,
   EXPECT_EQ(calibration.select(3, 128), 0U);
 }
 
-TEST(DraftStepStartupCalibrationTest,
-     RetiredBatchesKeepTheirDispatchStatisticsEpoch) {
-  DraftStepStartupCalibration calibration("", /*max_steps=*/3);
+TEST(DraftStepControllerTest, RetiredBatchesKeepTheirDispatchStatisticsEpoch) {
+  DraftStepController calibration("", /*max_steps=*/3);
   calibration.configuration(/*max_positions=*/8192);
   calibration.set_geometry({1, 2}, {2, 4, 8});
   auto config = policy({1.6, 1.7, 2.0});

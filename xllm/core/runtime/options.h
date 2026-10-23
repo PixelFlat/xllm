@@ -93,10 +93,10 @@ struct Options {
   PROPERTY(bool, enable_adaptive_draft_step) = false;
   PROPERTY(std::string, adaptive_draft_step_config);
 
-  PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
+  PROPERTY(double, adaptive_target_verify_min_gain) = 0.0;
 
-  PROPERTY(std::string, adaptive_dspark_cost_table);
-  PROPERTY(std::string, adaptive_dspark_calibration);
+  PROPERTY(std::string, adaptive_target_verify_cost_table);
+  PROPERTY(std::string, adaptive_target_verify_calibration);
 
   // enable speculative decode
   PROPERTY(bool, enable_speculative_decode) = false;

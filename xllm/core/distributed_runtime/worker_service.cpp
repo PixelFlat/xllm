@@ -36,7 +36,7 @@ limitations under the License.
 #include "core/distributed_runtime/comm_channel.h"
 #include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/config/eplb_config.h"
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
@@ -1134,10 +1134,10 @@ void WorkerService::DSparkCalibration(
       response->set_ok(false);
       return;
     }
-    const DSparkCalibrationCommand command{
-        static_cast<DSparkCalibrationAction>(request->action()),
+    const SpecCalibrationCommand command{
+        static_cast<SpecCalibrationAction>(request->action()),
         request->payload()};
-    const auto result = worker_->dspark_calibration(command);
+    const auto result = worker_->spec_calibration(command);
     response->set_ok(result.has_value());
     if (result) {
       response->set_payload(*result);

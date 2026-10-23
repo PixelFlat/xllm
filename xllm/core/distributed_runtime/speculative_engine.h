@@ -71,8 +71,8 @@ class SpeculativeEngineBase : public Engine {
 
   bool stop_profile() override { return engine_->stop_profile(); }
 
-  DraftStepStartupCalibration* draft_step_startup_calibration() override {
-    return engine_->draft_step_startup_calibration();
+  DraftStepController* draft_step_controller() override {
+    return engine_->draft_step_controller();
   }
 
   void update_last_step_result(BatchGroup& batch);

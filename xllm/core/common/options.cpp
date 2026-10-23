@@ -54,11 +54,14 @@ std::string Options::to_string() const {
      << ", enable_adaptive_target_verify: " << enable_adaptive_target_verify()
      << ", enable_adaptive_draft_step: " << enable_adaptive_draft_step()
      << ", adaptive_draft_step_config: " << adaptive_draft_step_config()
-     << ", adaptive_speculative_min_gain: " << adaptive_speculative_min_gain()
-     << ", adaptive_dspark_cost_table: " << adaptive_dspark_cost_table()
-     << ", adaptive_dspark_calibration: " << adaptive_dspark_calibration()
-     << ", adaptive_dspark_cost_table_output: "
-     << adaptive_dspark_cost_table_output()
+     << ", adaptive_target_verify_min_gain: "
+     << adaptive_target_verify_min_gain()
+     << ", adaptive_target_verify_cost_table: "
+     << adaptive_target_verify_cost_table()
+     << ", adaptive_target_verify_calibration: "
+     << adaptive_target_verify_calibration()
+     << ", adaptive_target_verify_cost_table_output: "
+     << adaptive_target_verify_cost_table_output()
      << ", num_request_handling_threads: " << num_request_handling_threads()
      << ", communication_backend: " << communication_backend().value_or("null")
      << ", rank_tablefile: " << rank_tablefile().value_or("null")

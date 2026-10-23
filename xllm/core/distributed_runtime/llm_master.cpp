@@ -212,9 +212,12 @@ LLMMaster::LLMMaster(const Options& options)
         .enable_adaptive_target_verify(options_.enable_adaptive_target_verify())
         .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
         .adaptive_draft_step_config(options_.adaptive_draft_step_config())
-        .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
-        .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
-        .adaptive_dspark_calibration(options_.adaptive_dspark_calibration());
+        .adaptive_target_verify_min_gain(
+            options_.adaptive_target_verify_min_gain())
+        .adaptive_target_verify_cost_table(
+            options_.adaptive_target_verify_cost_table())
+        .adaptive_target_verify_calibration(
+            options_.adaptive_target_verify_calibration());
     if (use_suffix_spec) {
       suffix_engine_ =
           std::make_unique<SuffixSpeculativeEngine>(engine_options);
@@ -323,23 +326,26 @@ LLMMaster::LLMMaster(const Options& options)
       [this, &scheduler_options, &response_options](auto* engine) {
         scheduler_options
             .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
-            .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())
-            .enable_adaptive_dspark(options_.enable_task_pipeline() &&
-                                    options_.enable_adaptive_target_verify() &&
-                                    SpeculativeConfig::is_dspark_algorithm(
-                                        options_.speculative_algorithm()))
-            .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
-            .adaptive_dspark_cost_table_output(
-                options_.adaptive_dspark_cost_table_output());
-        CHECK(options_.adaptive_dspark_cost_table_output().empty() ||
-              scheduler_options.enable_adaptive_dspark())
+            .adaptive_target_verify_calibration(
+                options_.adaptive_target_verify_calibration())
+            .enable_adaptive_target_verify(
+                options_.enable_task_pipeline() &&
+                options_.enable_adaptive_target_verify() &&
+                SpeculativeConfig::is_dspark_algorithm(
+                    options_.speculative_algorithm()))
+            .adaptive_target_verify_cost_table(
+                options_.adaptive_target_verify_cost_table())
+            .adaptive_target_verify_cost_table_output(
+                options_.adaptive_target_verify_cost_table_output());
+        CHECK(options_.adaptive_target_verify_cost_table_output().empty() ||
+              scheduler_options.enable_adaptive_target_verify())
             << "DSpark cost-table output requires an adaptive DSpark task "
                "pipeline.";
-        if (scheduler_options.enable_adaptive_dspark() ||
-            !options_.adaptive_dspark_calibration().empty() ||
-            !options_.adaptive_dspark_cost_table().empty()) {
-          scheduler_options.dspark_calibration_compatibility(
-              dspark_calibration_compatibility(engine->options()));
+        if (scheduler_options.enable_adaptive_target_verify() ||
+            !options_.adaptive_target_verify_calibration().empty() ||
+            !options_.adaptive_target_verify_cost_table().empty()) {
+          scheduler_options.spec_calibration_compatibility(
+              spec_calibration_compatibility(engine->options()));
         }
         scheduler_ = create_continuous_scheduler(
             engine,

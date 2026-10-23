@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_budget_planner.h"
+#include "core/framework/speculative/adaptive/verify_budget_planner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,15 +24,16 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool valid_options(const DSparkBudgetOptions& options) {
-  if (options.draft_width != 5 && options.draft_width != 7) {
+bool valid_options(const VerifyBudgetOptions& options) {
+  if (options.draft_width == 0 ||
+      options.draft_width == std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-  if (options.cost_scope != DSparkCostScope::VERIFY_TAIL &&
-      options.cost_scope != DSparkCostScope::FULL_STEP) {
+  if (options.cost_scope != SpecCostScope::VERIFY_TAIL &&
+      options.cost_scope != SpecCostScope::FULL_STEP) {
     return false;
   }
-  if (options.cost_scope == DSparkCostScope::FULL_STEP &&
+  if (options.cost_scope == SpecCostScope::FULL_STEP &&
       (options.fixed_draft_time_ms != 0.0 || options.commit_time_ms != 0.0)) {
     return false;
   }
@@ -45,7 +46,7 @@ bool valid_options(const DSparkBudgetOptions& options) {
          options.exploration_interval != 0;
 }
 
-bool valid_costs(std::span<const DSparkGraphCost> costs, double fixed_time_ms) {
+bool valid_costs(std::span<const SpecGraphCost> costs, double fixed_time_ms) {
   return !costs.empty() &&
          std::all_of(
              costs.begin(),
@@ -64,16 +65,16 @@ bool valid_costs(std::span<const DSparkGraphCost> costs, double fixed_time_ms) {
 
 }  // namespace
 
-std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
+std::optional<VerifyBudgetPlan> VerifyBudgetPlanner::calibration_plan(
     uint32_t logical_requests,
     uint32_t physical_requests,
     uint32_t requested_graph_rows,
-    std::span<const DSparkGraphCost> prewarmed_graphs,
+    std::span<const SpecGraphCost> prewarmed_graphs,
     uint32_t draft_width,
-    std::span<const DSparkGraphCost> actual_batch_graphs,
+    std::span<const SpecGraphCost> actual_batch_graphs,
     std::optional<uint32_t> calibration_requests) {
-  if ((draft_width != 5 && draft_width != 7) || logical_requests == 0 ||
-      logical_requests > physical_requests ||
+  if (draft_width == 0 || draft_width == std::numeric_limits<uint32_t>::max() ||
+      logical_requests == 0 || logical_requests > physical_requests ||
       physical_requests >
           std::numeric_limits<uint32_t>::max() / (draft_width + 1) ||
       !valid_costs(prewarmed_graphs, /*fixed_time_ms=*/0.0) ||
@@ -83,13 +84,12 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
     return std::nullopt;
   }
   const auto find_rows = [&](uint32_t rows) {
-    return std::lower_bound(
-        prewarmed_graphs.begin(),
-        prewarmed_graphs.end(),
-        rows,
-        [](const DSparkGraphCost& graph, uint32_t requested) {
-          return graph.graph_rows < requested;
-        });
+    return std::lower_bound(prewarmed_graphs.begin(),
+                            prewarmed_graphs.end(),
+                            rows,
+                            [](const SpecGraphCost& graph, uint32_t requested) {
+                              return graph.graph_rows < requested;
+                            });
   };
   const auto requested = find_rows(requested_graph_rows);
   const auto full = find_rows(physical_requests * (draft_width + 1));
@@ -100,7 +100,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
   }
   if (std::any_of(actual_batch_graphs.begin(),
                   actual_batch_graphs.end(),
-                  [&](const DSparkGraphCost& graph) {
+                  [&](const SpecGraphCost& graph) {
                     const auto known = find_rows(graph.graph_rows);
                     return graph.graph_rows < logical_requests ||
                            graph.graph_rows > full->graph_rows ||
@@ -121,7 +121,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
         std::lower_bound(actual_batch_graphs.begin(),
                          actual_batch_graphs.end(),
                          graph_rows,
-                         [](const DSparkGraphCost& graph, uint32_t rows) {
+                         [](const SpecGraphCost& graph, uint32_t rows) {
                            return graph.graph_rows < rows;
                          });
     if (actual == actual_batch_graphs.end() ||
@@ -140,7 +140,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
           std::lower_bound(actual_batch_graphs.begin(),
                            actual_batch_graphs.end(),
                            logical_requests * (draft_width + 1),
-                           [](const DSparkGraphCost& graph, uint32_t rows) {
+                           [](const SpecGraphCost& graph, uint32_t rows) {
                              return graph.graph_rows < rows;
                            });
       if (actual_full == actual_batch_graphs.end()) {
@@ -149,17 +149,17 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::calibration_plan(
       graph_rows = actual_full->graph_rows;
     }
   }
-  return DSparkBudgetPlan{
+  return VerifyBudgetPlan{
       std::min(logical_requests * draft_width, graph_rows - logical_requests),
       graph_rows};
 }
 
-std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
+std::optional<VerifyBudgetPlan> VerifyBudgetPlanner::plan(
     uint32_t batch_size,
     std::span<const double> lagged_conditional_confidence,
-    std::span<const DSparkGraphCost> prewarmed_costs,
-    const DSparkBudgetOptions& options,
-    std::optional<DSparkBudgetPlan> previous,
+    std::span<const SpecGraphCost> prewarmed_costs,
+    const VerifyBudgetOptions& options,
+    std::optional<VerifyBudgetPlan> previous,
     uint64_t rounds_since_full_width) {
   const uint32_t draft_width = options.draft_width;
   if (batch_size == 0 || !valid_options(options) ||
@@ -187,20 +187,20 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
       std::lower_bound(prewarmed_costs.begin(),
                        prewarmed_costs.end(),
                        full_rows,
-                       [](const DSparkGraphCost& cost, uint32_t rows) {
+                       [](const SpecGraphCost& cost, uint32_t rows) {
                          return cost.graph_rows < rows;
                        });
   if (full_cost == prewarmed_costs.end()) {
     return std::nullopt;
   }
-  const DSparkBudgetPlan full_plan{max_budget, full_cost->graph_rows};
+  const VerifyBudgetPlan full_plan{max_budget, full_cost->graph_rows};
 
   const auto previous_cost =
       previous.has_value()
           ? std::lower_bound(prewarmed_costs.begin(),
                              prewarmed_costs.end(),
                              previous->graph_rows,
-                             [](const DSparkGraphCost& cost, uint32_t rows) {
+                             [](const SpecGraphCost& cost, uint32_t rows) {
                                return cost.graph_rows < rows;
                              })
           : prewarmed_costs.end();
@@ -215,7 +215,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
   // This explicit admission policy is not an execution fallback: no Task has
   // been accepted yet, and only a supplied, prewarmed graph can be selected.
   if (lagged_conditional_confidence.empty() ||
-      (options.cost_scope == DSparkCostScope::VERIFY_TAIL &&
+      (options.cost_scope == SpecCostScope::VERIFY_TAIL &&
        options.fixed_draft_time_ms == 0.0) ||
       full_cost->target_time_ms == 0.0 ||
       rounds_since_full_width >= options.exploration_interval) {
@@ -244,22 +244,22 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
   for (double probability : path_probabilities) {
     expected_progress.emplace_back(expected_progress.back() + probability);
   }
-  const auto score = [&](const DSparkBudgetPlan& candidate,
-                         const DSparkGraphCost& cost) {
+  const auto score = [&](const VerifyBudgetPlan& candidate,
+                         const SpecGraphCost& cost) {
     return expected_progress[candidate.draft_budget] /
            (fixed_time_ms + cost.target_time_ms);
   };
 
-  DSparkBudgetPlan best = full_plan;
+  VerifyBudgetPlan best = full_plan;
   double best_score = -1.0;
-  for (const DSparkGraphCost& cost : prewarmed_costs) {
+  for (const SpecGraphCost& cost : prewarmed_costs) {
     if (cost.graph_rows < batch_size || cost.target_time_ms == 0.0) {
       continue;
     }
     // Within the same physical graph, additional prefix rows have no target
     // cost. Spend all available capacity, bounded by the configured draft
     // block.
-    const DSparkBudgetPlan candidate{
+    const VerifyBudgetPlan candidate{
         std::min(max_budget, cost.graph_rows - batch_size), cost.graph_rows};
     const double candidate_score = score(candidate, cost);
     if (candidate_score > best_score) {
@@ -268,7 +268,7 @@ std::optional<DSparkBudgetPlan> DSparkBudgetPlanner::plan(
     }
   }
   if (previous.has_value() && previous_cost->target_time_ms > 0.0) {
-    const DSparkBudgetPlan previous_filled{
+    const VerifyBudgetPlan previous_filled{
         std::min(max_budget, previous->graph_rows - batch_size),
         previous->graph_rows};
     const double previous_score = score(previous_filled, *previous_cost);

@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/draft_step_startup_calibration.h"
+#include "core/framework/speculative/adaptive/draft_step_controller.h"
 
 #include <glog/logging.h>
 
@@ -25,9 +25,8 @@ limitations under the License.
 
 namespace xllm {
 
-DraftStepStartupCalibration::DraftStepStartupCalibration(
-    std::string configuration_path,
-    uint32_t max_steps)
+DraftStepController::DraftStepController(std::string configuration_path,
+                                         uint32_t max_steps)
     : configuration_path_(std::move(configuration_path)),
       max_steps_(max_steps),
       policy_(load_draft_step_selector_config(configuration_path_, max_steps)) {
@@ -35,13 +34,13 @@ DraftStepStartupCalibration::DraftStepStartupCalibration(
   CHECK_LE(max_steps, 64U);
 }
 
-const DSparkStartupCalibrationConfig&
-DraftStepStartupCalibration::configuration(uint32_t max_positions) {
+const SpecStartupCalibrationConfig& DraftStepController::configuration(
+    uint32_t max_positions) {
   if (configuration_) {
     return *configuration_;
   }
   if (configuration_path_.empty()) {
-    configuration_ = default_dspark_startup_calibration(
+    configuration_ = default_spec_startup_calibration(
         max_positions, policy_.max_steps, /*autoregressive_draft=*/true);
   } else {
     std::ifstream stream(configuration_path_);
@@ -50,12 +49,12 @@ DraftStepStartupCalibration::configuration(uint32_t max_positions) {
     CHECK(json.is_object());
     configuration_ =
         json.contains("calibration")
-            ? parse_dspark_startup_calibration(json.at("calibration").dump(),
+            ? parse_spec_startup_calibration(json.at("calibration").dump(),
+                                             max_steps_,
+                                             /*autoregressive_draft=*/true)
+            : default_spec_startup_calibration(max_positions,
                                                max_steps_,
-                                               /*autoregressive_draft=*/true)
-            : default_dspark_startup_calibration(max_positions,
-                                                 max_steps_,
-                                                 /*autoregressive_draft=*/true);
+                                               /*autoregressive_draft=*/true);
   }
   CHECK(configuration_) << "Invalid draft-step calibration settings; provide "
                            "sampling settings with sufficient KV headroom.";
@@ -63,7 +62,7 @@ DraftStepStartupCalibration::configuration(uint32_t max_positions) {
             << (configuration_path_.empty() ? "built-in defaults"
                                             : configuration_path_)
             << ", calibration="
-            << serialize_dspark_startup_calibration(*configuration_)
+            << serialize_spec_startup_calibration(*configuration_)
             << ", policy="
             << nlohmann::json{{"window_size", policy_.window_size},
                               {"update_interval", policy_.update_interval},
@@ -72,8 +71,8 @@ DraftStepStartupCalibration::configuration(uint32_t max_positions) {
   return *configuration_;
 }
 
-void DraftStepStartupCalibration::set_geometry(std::vector<uint32_t> requests,
-                                               std::vector<uint32_t> graphs) {
+void DraftStepController::set_geometry(std::vector<uint32_t> requests,
+                                       std::vector<uint32_t> graphs) {
   CHECK(configuration_ && !sampling() && !selector_);
   CHECK(!requests.empty() && !graphs.empty());
   CHECK(std::is_sorted(requests.begin(), requests.end()));
@@ -102,8 +101,7 @@ void DraftStepStartupCalibration::set_geometry(std::vector<uint32_t> requests,
                (max_steps_ + 1));
 }
 
-std::vector<DraftStepCalibrationPoint> DraftStepStartupCalibration::points()
-    const {
+std::vector<DraftStepCalibrationPoint> DraftStepController::points() const {
   CHECK(configuration_ && !captured_requests_.empty());
   const auto& config = *configuration_;
   const auto& graphs = config.target_graph_rows.empty()
@@ -125,7 +123,7 @@ std::vector<DraftStepCalibrationPoint> DraftStepStartupCalibration::points()
             continue;
           }
           points.emplace_back(DraftStepCalibrationPoint{
-              depth, DSparkCalibrationPoint{requests, rows, context}});
+              depth, SpecCalibrationPoint{requests, rows, context}});
         }
       }
     }
@@ -133,8 +131,7 @@ std::vector<DraftStepCalibrationPoint> DraftStepStartupCalibration::points()
   return points;
 }
 
-void DraftStepStartupCalibration::begin_sample(
-    DraftStepCalibrationPoint point) {
+void DraftStepController::begin_sample(DraftStepCalibrationPoint point) {
   CHECK(configuration_ && !sampling() && !selector_ && pending_.empty());
   CHECK_GE(point.draft_steps, 1U);
   CHECK_LE(point.draft_steps, policy_.max_steps);
@@ -145,7 +142,7 @@ void DraftStepStartupCalibration::begin_sample(
   point_ = point;
   kv_lengths_.assign(point.batch.requests,
                      point.batch.context.prefill_tokens + 1);
-  DSparkWindowConfig config;
+  SpecWindowConfig config;
   config.target_graph_rows = point.batch.target_graph_rows;
   config.min_kv_length = point.batch.context.min_kv_length;
   config.max_kv_length = point.batch.context.max_kv_length;
@@ -154,13 +151,12 @@ void DraftStepStartupCalibration::begin_sample(
   config.max_windows = configuration_->windows_per_point;
   config.draft_width = point.draft_steps;
   config.autoregressive_draft = true;
-  collector_ = std::make_unique<DSparkSteadyWindowCollector>(config);
+  collector_ = std::make_unique<SpecSteadyWindowCollector>(config);
   windows_.clear();
   windows_.reserve(config.max_windows);
 }
 
-void DraftStepStartupCalibration::dispatched(
-    std::span<const std::string> request_ids) {
+void DraftStepController::dispatched(std::span<const std::string> request_ids) {
   CHECK(point_ || selector_);
   Pending pending;
   if (point_) {
@@ -173,7 +169,7 @@ void DraftStepStartupCalibration::dispatched(
   pending_.emplace_back(std::move(pending));
 }
 
-void DraftStepStartupCalibration::observe(
+void DraftStepController::observe(
     std::span<const DraftStepAcceptanceObservation> observations,
     uint64_t completed_ns) {
   if (!sampling()) {
@@ -186,7 +182,7 @@ void DraftStepStartupCalibration::observe(
   }
   CHECK(!pending_.empty() && observations.size() == kv_lengths_.size());
   const auto& pending = pending_.front();
-  DSparkSteadyStep step;
+  SpecSteadyStep step;
   step.generation = pending.generation;
   step.completed_ns = completed_ns;
   step.logical_requests = point_->batch.requests;
@@ -211,7 +207,7 @@ void DraftStepStartupCalibration::observe(
   pending_.pop_front();
 }
 
-std::vector<DSparkSteadyWindow> DraftStepStartupCalibration::finish_sample() {
+std::vector<SpecSteadyWindow> DraftStepController::finish_sample() {
   CHECK(point_ && pending_.empty() && collector_->finished());
   CHECK_EQ(windows_.size(), configuration_->windows_per_point);
   point_.reset();
@@ -219,16 +215,16 @@ std::vector<DSparkSteadyWindow> DraftStepStartupCalibration::finish_sample() {
   return std::exchange(windows_, {});
 }
 
-void DraftStepStartupCalibration::install_costs(
-    std::vector<std::vector<DSparkCostTableEntry>> costs) {
+void DraftStepController::install_costs(
+    std::vector<std::vector<SpecCostTableEntry>> costs) {
   CHECK(!sampling() && pending_.empty() && !selector_);
   CHECK_EQ(costs.size(), policy_.max_steps);
   policy_.costs = std::move(costs);
   selector_ = std::make_unique<DraftStepSelector>(std::move(policy_));
 }
 
-uint32_t DraftStepStartupCalibration::select(uint32_t requests,
-                                             uint32_t max_kv_length) {
+uint32_t DraftStepController::select(uint32_t requests,
+                                     uint32_t max_kv_length) {
   if (!selector_) {
     return 0;
   }

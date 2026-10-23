@@ -23,8 +23,8 @@ limitations under the License.
 
 namespace xllm {
 
-std::optional<std::string> TaskExecutionPipeline::dspark_calibration(
-    DSparkCalibrationCommand command) {
+std::optional<std::string> TaskExecutionPipeline::spec_calibration(
+    SpecCalibrationCommand command) {
   check_external_thread();
   folly::Promise<std::optional<std::string>> promise;
   auto future = promise.getFuture();
@@ -32,9 +32,9 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration(
                             command = std::move(command),
                             promise = std::move(promise)]() mutable {
     if (speculative_capacity_ && speculative_capacity_->adaptive_draft_step &&
-        command.action == DSparkCalibrationAction::CAPABILITIES &&
+        command.action == SpecCalibrationAction::CAPABILITIES &&
         accepted_.empty() && completed_.empty()) {
-      promise.setValue(draft_step_calibration_geometry());
+      promise.setValue(draft_step_calibration_capabilities());
       return;
     }
     if (!speculative_capacity_ || !speculative_capacity_->startup_calibration ||
@@ -44,13 +44,13 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration(
       return;
     }
     CHECK(completed_.empty());
-    promise.setValue(dspark_calibration_impl(command));
+    promise.setValue(spec_calibration_impl(command));
   });
   return std::move(future).get();
 }
 
 std::optional<std::string>
-TaskExecutionPipeline::draft_step_calibration_geometry() const {
+TaskExecutionPipeline::draft_step_calibration_capabilities() const {
   if (slots_.empty() || captured_graph_batch_sizes_.empty()) {
     return std::nullopt;
   }
@@ -121,8 +121,8 @@ TaskExecutionPipeline::draft_step_calibration_geometry() const {
       .dump();
 }
 
-std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
-    const DSparkCalibrationCommand& command) {
+std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
+    const SpecCalibrationCommand& command) {
   std::vector<uint32_t> requests;
   std::vector<uint32_t> graphs;
   const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
@@ -166,7 +166,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
     return static_cast<uint32_t>(bound);
   };
   switch (command.action) {
-    case DSparkCalibrationAction::CAPABILITIES: {
+    case SpecCalibrationAction::CAPABILITIES: {
       nlohmann::json bounds = nlohmann::json::array();
       for (const uint32_t batch : requests) {
         bounds.emplace_back(nlohmann::json{{"requests", batch},
@@ -186,7 +186,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
                             {"slot_count", capacity_.slot_count}}
           .dump();
     }
-    case DSparkCalibrationAction::BEGIN_SAMPLE: {
+    case SpecCalibrationAction::BEGIN_SAMPLE: {
       if (dspark_adaptive_->calibration_point) {
         return std::nullopt;
       }
@@ -195,13 +195,13 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
           !data.contains("point") || !data["point"].is_number_unsigned()) {
         return std::nullopt;
       }
-      const auto config = parse_dspark_startup_calibration(
+      const auto config = parse_spec_startup_calibration(
           data["configuration"].dump(), draft_width);
       if (!config) {
         return std::nullopt;
       }
       const auto points =
-          plan_dspark_calibration(*config, requests, graphs, graph_coverage);
+          plan_spec_calibration(*config, requests, graphs, graph_coverage);
       const uint64_t index = data["point"].get<uint64_t>();
       if (!points || index >= points->size()) {
         return std::nullopt;
@@ -213,11 +213,11 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
       dspark_adaptive_->calibration_point = point;
       if (speculative_capacity_->calibration_leader) {
         dspark_adaptive_->calibration_session =
-            std::make_unique<DSparkCalibrationSession>(*config, point);
+            std::make_unique<SpecCalibrationSession>(*config, point);
       }
       return std::string("sample_started");
     }
-    case DSparkCalibrationAction::FINISH_SAMPLE: {
+    case SpecCalibrationAction::FINISH_SAMPLE: {
       if (!dspark_adaptive_->calibration_point) {
         return std::nullopt;
       }
@@ -246,15 +246,15 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
       dspark_adaptive_->calibration_point.reset();
       return result.dump();
     }
-    case DSparkCalibrationAction::INSTALL_COSTS: {
+    case SpecCalibrationAction::INSTALL_COSTS: {
       if (dspark_adaptive_->calibration_point) {
         return std::nullopt;
       }
-      const auto bundle = DSparkCostTableBundle::from_json(command.payload);
+      const auto bundle = SpecCostTableBundle::from_json(command.payload);
       if (!bundle) {
         return std::nullopt;
       }
-      auto costs = std::make_shared<DSparkAdaptiveCostCache>();
+      auto costs = std::make_shared<SpecCostProfileStore>();
       size_t installed_profiles = 0;
       for (const auto& entry : bundle->entries()) {
         const auto& covered_requests =
@@ -272,13 +272,13 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
               !entry.model.step_time_ms(batch, *full)) {
             continue;
           }
-          DSparkAdaptiveCostProfile profile;
+          SpecCostProfile profile;
           profile.draft_width = draft_width;
-          profile.draft_graph_rows = batch * draft_width;
+          profile.draft_requests = batch;
           profile.min_kv_length = entry.min_kv_length;
           profile.max_kv_length =
               std::min(entry.max_kv_length, kv_bound(batch));
-          profile.cost_scope = DSparkCostScope::FULL_STEP;
+          profile.cost_scope = SpecCostScope::FULL_STEP;
           for (const uint32_t rows : graphs) {
             if (rows < batch || rows > *full) {
               continue;
@@ -287,8 +287,7 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(
             if (!cost) {
               return std::nullopt;
             }
-            profile.target_graph_costs.emplace_back(
-                DSparkGraphCost{rows, *cost});
+            profile.target_graph_costs.emplace_back(SpecGraphCost{rows, *cost});
           }
           if (!costs->store(std::move(profile))) {
             return std::nullopt;

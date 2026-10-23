@@ -335,8 +335,8 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             return std::make_unique<LLMWorkerImpl>(
                 parallel_args, device, draft_options(options));
           }) {
-  CHECK((options.adaptive_dspark_cost_table().empty() &&
-         options.adaptive_dspark_calibration().empty()) ||
+  CHECK((options.adaptive_target_verify_cost_table().empty() &&
+         options.adaptive_target_verify_calibration().empty()) ||
         (options.enable_task_pipeline() &&
          options.enable_adaptive_target_verify() &&
          SpeculativeConfig::is_dspark_algorithm(
@@ -404,14 +404,14 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
   capacity.adaptive_dspark = options_.enable_adaptive_target_verify();
-  capacity.adaptive_min_gain = options_.adaptive_speculative_min_gain();
+  capacity.adaptive_min_gain = options_.adaptive_target_verify_min_gain();
   capacity.startup_calibration = capacity.adaptive_dspark;
   capacity.calibration_leader = parallel_args_.rank() == 0;
   if (capacity.startup_calibration &&
       (!options_.enable_graph() || !options_.enable_schedule_overlap() ||
        ExecutionConfig::get_instance().disable_graph_warmup() ||
-       (!options_.adaptive_dspark_calibration().empty() &&
-        !options_.adaptive_dspark_cost_table().empty()))) {
+       (!options_.adaptive_target_verify_calibration().empty() &&
+        !options_.adaptive_target_verify_cost_table().empty()))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Adaptive DSpark calibration requires graph warmup, schedule overlap "

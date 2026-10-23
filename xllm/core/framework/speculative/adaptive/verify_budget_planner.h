@@ -19,36 +19,29 @@ limitations under the License.
 #include <optional>
 #include <span>
 
+#include "core/framework/speculative/adaptive/spec_cost_model.h"
+
 namespace xllm {
-
-enum class DSparkCostScope : uint8_t { VERIFY_TAIL, FULL_STEP };
-
-struct DSparkGraphCost {
-  uint32_t graph_rows = 0;
-  // VERIFY_TAIL or FULL_STEP, as selected by DSparkBudgetOptions::cost_scope.
-  // Zero denotes a warmed graph without a usable latency measurement.
-  double target_time_ms = 0.0;
-};
 
 // Copy this plan into a Task at admission; feedback must not alter queued
 // Tasks. The Device allocator distributes exactly draft_budget proposals among
 // the requests. Neither the allocation nor its per-request widths are read
 // here.
-struct DSparkBudgetPlan {
+struct VerifyBudgetPlan {
   uint32_t draft_budget = 0;
   uint32_t graph_rows = 0;
 };
 
-struct DSparkBudgetOptions {
+struct VerifyBudgetOptions {
   double fixed_draft_time_ms = 0.0;
   double commit_time_ms = 0.0;
   double min_gain = 0.0;
   uint32_t exploration_interval = 32;
-  DSparkCostScope cost_scope = DSparkCostScope::VERIFY_TAIL;
+  SpecCostScope cost_scope = SpecCostScope::VERIFY_TAIL;
   uint32_t draft_width = 7;
 };
 
-class DSparkBudgetPlanner final {
+class VerifyBudgetPlanner final {
  public:
   // Dedicated calibration admission, independent of confidence/cost scoring.
   // A known G is used only within this physical draft bucket's warmed range.
@@ -60,13 +53,13 @@ class DSparkBudgetPlanner final {
   // stable unsupported B/G pairs remain errors, not calibration samples.
   // Internal startup sampling supplies its intended B to identify transitions
   // even when the transient logical and physical request counts are equal.
-  static std::optional<DSparkBudgetPlan> calibration_plan(
+  static std::optional<VerifyBudgetPlan> calibration_plan(
       uint32_t logical_requests,
       uint32_t physical_requests,
       uint32_t requested_graph_rows,
-      std::span<const DSparkGraphCost> prewarmed_graphs,
+      std::span<const SpecGraphCost> prewarmed_graphs,
       uint32_t draft_width = 7,
-      std::span<const DSparkGraphCost> actual_batch_graphs = {},
+      std::span<const SpecGraphCost> actual_batch_graphs = {},
       std::optional<uint32_t> calibration_requests = std::nullopt);
 
   // Lagged confidence is retired Host feedback, flattened [batch, draft_width],
@@ -77,12 +70,12 @@ class DSparkBudgetPlanner final {
   // by the caller. Invalid input or missing full-width graph capacity returns
   // std::nullopt before any execution state is mutated. This API never reads
   // Device tensors.
-  static std::optional<DSparkBudgetPlan> plan(
+  static std::optional<VerifyBudgetPlan> plan(
       uint32_t batch_size,
       std::span<const double> lagged_conditional_confidence,
-      std::span<const DSparkGraphCost> prewarmed_costs,
-      const DSparkBudgetOptions& options,
-      std::optional<DSparkBudgetPlan> previous = std::nullopt,
+      std::span<const SpecGraphCost> prewarmed_costs,
+      const VerifyBudgetOptions& options,
+      std::optional<VerifyBudgetPlan> previous = std::nullopt,
       uint64_t rounds_since_full_width = 0);
 };
 

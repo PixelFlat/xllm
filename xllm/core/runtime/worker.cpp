@@ -33,7 +33,7 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/speculative_config.h"
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 #include "core/platform/platform.h"
 #include "core/runtime/task_execution_pipeline.h"
 #if defined(USE_NPU)
@@ -273,12 +273,12 @@ bool Worker::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return impl_->allocate_kv_cache(kv_cache_shape);
 }
 
-std::optional<std::string> Worker::dspark_calibration(
-    const DSparkCalibrationCommand& command) {
+std::optional<std::string> Worker::spec_calibration(
+    const SpecCalibrationCommand& command) {
   if (!task_pipeline_) {
     return std::nullopt;
   }
-  return task_pipeline_->dspark_calibration(command);
+  return task_pipeline_->spec_calibration(command);
 }
 
 void Worker::get_cache_info(uint64_t& cluster_id,

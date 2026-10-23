@@ -102,14 +102,15 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
       .decode_graph_warmup_config(options.decode_graph_warmup_config())
       .enable_schedule_overlap(options.enable_schedule_overlap())
       .enable_task_pipeline(options.enable_task_pipeline())
-      .adaptive_dspark_calibration(options.adaptive_dspark_calibration())
-      .enable_adaptive_dspark(options.enable_adaptive_dspark())
+      .adaptive_target_verify_calibration(
+          options.adaptive_target_verify_calibration())
+      .enable_adaptive_target_verify(options.enable_adaptive_target_verify())
       .enable_adaptive_draft_step(options.enable_adaptive_draft_step())
-      .adaptive_dspark_cost_table(options.adaptive_dspark_cost_table())
-      .adaptive_dspark_cost_table_output(
-          options.adaptive_dspark_cost_table_output())
-      .dspark_calibration_compatibility(
-          options.dspark_calibration_compatibility())
+      .adaptive_target_verify_cost_table(
+          options.adaptive_target_verify_cost_table())
+      .adaptive_target_verify_cost_table_output(
+          options.adaptive_target_verify_cost_table_output())
+      .spec_calibration_compatibility(options.spec_calibration_compatibility())
       .enable_profile_step_time(options.enable_profile_step_time())
       .profile_max_prompt_length(options.profile_max_prompt_length())
       .enable_profile_kv_blocks(options.enable_profile_kv_blocks())

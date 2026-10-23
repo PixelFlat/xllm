@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/dspark/dspark_startup_calibration.h"
+#include "core/framework/speculative/adaptive/spec_startup_calibration.h"
 
 #include <gtest/gtest.h>
 
@@ -34,8 +34,8 @@ nlohmann::json configuration() {
              {"max_kv_length", 4096}}}}};
 }
 
-DSparkSteadyWindow window(uint32_t requests, uint32_t rows, double cost) {
-  DSparkSteadyWindow result;
+SpecSteadyWindow window(uint32_t requests, uint32_t rows, double cost) {
+  SpecSteadyWindow result;
   result.first_generation = 1;
   result.last_generation = 33;
   result.logical_requests = requests;
@@ -69,10 +69,10 @@ nlohmann::json bundle() {
              {"table", sps_table()}}}}};
 }
 
-TEST(DSparkStartupCalibrationTest, DefaultsUseAdditiveCostsAndBoundedContext) {
-  const auto config = default_dspark_startup_calibration(202752);
+TEST(SpecStartupCalibrationTest, DefaultsUseAdditiveCostsAndBoundedContext) {
+  const auto config = default_spec_startup_calibration(202752);
   ASSERT_TRUE(config);
-  EXPECT_EQ(config->model, DSparkSpsCostModel::Kind::ADDITIVE);
+  EXPECT_EQ(config->model, SpecCostModel::Kind::ADDITIVE);
   EXPECT_TRUE(config->request_buckets.empty());
   EXPECT_TRUE(config->target_graph_rows.empty());
   ASSERT_EQ(config->contexts.size(), 1U);
@@ -85,100 +85,98 @@ TEST(DSparkStartupCalibrationTest, DefaultsUseAdditiveCostsAndBoundedContext) {
   EXPECT_EQ(config->token_seed, 1U);
 }
 
-TEST(DSparkStartupCalibrationTest, DraftFiveUsesItsOwnCapacityAndGeometry) {
-  const auto config =
-      parse_dspark_startup_calibration(configuration().dump(), 5);
+TEST(SpecStartupCalibrationTest, DraftFiveUsesItsOwnCapacityAndGeometry) {
+  const auto config = parse_spec_startup_calibration(configuration().dump(), 5);
   ASSERT_TRUE(config);
   EXPECT_EQ(config->draft_width, 5U);
-  const std::string serialized = serialize_dspark_startup_calibration(*config);
-  EXPECT_TRUE(parse_dspark_startup_calibration(serialized, 5));
-  EXPECT_FALSE(parse_dspark_startup_calibration(serialized, 7));
-  EXPECT_FALSE(parse_dspark_startup_calibration(serialized, 0));
+  const std::string serialized = serialize_spec_startup_calibration(*config);
+  EXPECT_TRUE(parse_spec_startup_calibration(serialized, 5));
+  EXPECT_FALSE(parse_spec_startup_calibration(serialized, 7));
+  EXPECT_FALSE(parse_spec_startup_calibration(serialized, 0));
   const std::array<uint32_t, 2> requests{1, 4};
   const std::array<uint32_t, 8> graphs{1, 2, 4, 6, 8, 16, 24, 32};
-  const auto points = plan_dspark_calibration(*config, requests, graphs);
+  const auto points = plan_spec_calibration(*config, requests, graphs);
   ASSERT_TRUE(points);
   EXPECT_EQ(points->back().target_graph_rows, 24U);
   EXPECT_EQ(points->back().requests, 4U);
-  EXPECT_TRUE(default_dspark_startup_calibration(864, 5));
-  EXPECT_FALSE(default_dspark_startup_calibration(864, 7));
-  EXPECT_FALSE(default_dspark_startup_calibration(4096, 6));
-  EXPECT_EQ(dspark_calibration_warmup_length(8192, 32768, 128, 2048, 5), 4093U);
+  EXPECT_TRUE(default_spec_startup_calibration(864, 5));
+  EXPECT_FALSE(default_spec_startup_calibration(864, 7));
+  EXPECT_FALSE(default_spec_startup_calibration(4096, 6));
+  EXPECT_EQ(spec_calibration_warmup_length(8192, 32768, 128, 2048, 5), 4093U);
 }
 
-TEST(DSparkStartupCalibrationTest, DraftFiveFitsMatchingGeneratedTokenCounts) {
+TEST(SpecStartupCalibrationTest, DraftFiveFitsMatchingGeneratedTokenCounts) {
   auto sample = window(1, 8, 10.0);
   sample.draft_tokens = sample.steps * 5;
-  const std::array<DSparkSteadyWindow, 1> samples{sample};
-  const auto fitted = fit_dspark_cost_table(
-      samples, DSparkSpsCostModel::Kind::SPS, 1800, 4096, 5);
+  const std::array<SpecSteadyWindow, 1> samples{sample};
+  const auto fitted =
+      fit_spec_cost_table(samples, SpecCostModel::Kind::SPS, 1800, 4096, 5);
   ASSERT_TRUE(fitted);
   const auto data = nlohmann::json::parse(*fitted);
   EXPECT_EQ(data["draft_width"], 5);
   EXPECT_EQ(data["metadata"]["cells"][0]["generated_draft_tokens"], 160);
-  EXPECT_FALSE(fit_dspark_cost_table(
-      samples, DSparkSpsCostModel::Kind::SPS, 1800, 4096, 7));
+  EXPECT_FALSE(
+      fit_spec_cost_table(samples, SpecCostModel::Kind::SPS, 1800, 4096, 7));
 }
 
-TEST(DSparkStartupCalibrationTest, UnversionedCostsCannotCrossDraftWidths) {
+TEST(SpecStartupCalibrationTest, UnversionedCostsCannotCrossDraftWidths) {
   auto table = sps_table();
   const std::string five = nlohmann::json{{"num_speculative_tokens", 5}}.dump();
   const std::string seven =
       nlohmann::json{{"num_speculative_tokens", 7}}.dump();
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump(), five));
-  EXPECT_TRUE(DSparkCostTableBundle::from_json(table.dump(), seven));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(table.dump(), five));
+  EXPECT_TRUE(SpecCostTableBundle::from_json(table.dump(), seven));
   table["draft_width"] = 5;
-  EXPECT_TRUE(DSparkCostTableBundle::from_json(table.dump(), five));
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump(), seven));
+  EXPECT_TRUE(SpecCostTableBundle::from_json(table.dump(), five));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(table.dump(), seven));
   table["draft_width"] = 6;
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(table.dump()));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(table.dump()));
 }
 
-TEST(DSparkStartupCalibrationTest, DefaultsRespectShortModelContexts) {
-  auto config = default_dspark_startup_calibration(1024);
+TEST(SpecStartupCalibrationTest, DefaultsRespectShortModelContexts) {
+  auto config = default_spec_startup_calibration(1024);
   ASSERT_TRUE(config);
   EXPECT_EQ(config->contexts.front().max_kv_length, 1024U);
   EXPECT_LT(config->contexts.front().prefill_tokens, 2048U);
   config->request_buckets = {1};
-  EXPECT_TRUE(parse_dspark_startup_calibration(
-      serialize_dspark_startup_calibration(*config)));
-  EXPECT_FALSE(default_dspark_startup_calibration(864));
+  EXPECT_TRUE(parse_spec_startup_calibration(
+      serialize_spec_startup_calibration(*config)));
+  EXPECT_FALSE(default_spec_startup_calibration(864));
 }
 
-TEST(DSparkStartupCalibrationTest,
+TEST(SpecStartupCalibrationTest,
      EffectiveJsonIncludesOmittedDefaultsAndResolvedBuckets) {
-  auto config = parse_dspark_startup_calibration(configuration().dump());
+  auto config = parse_spec_startup_calibration(configuration().dump());
   ASSERT_TRUE(config);
   const auto data =
-      nlohmann::json::parse(serialize_dspark_startup_calibration(*config));
+      nlohmann::json::parse(serialize_spec_startup_calibration(*config));
   EXPECT_EQ(data.at("warmup_steps"), 8);
   EXPECT_EQ(data.at("window_steps"), 32);
   EXPECT_EQ(data.at("windows_per_point"), 3);
   EXPECT_EQ(data.at("token_seed"), 1);
   EXPECT_EQ(data.at("request_buckets"), nlohmann::json({1, 4}));
   EXPECT_EQ(data.at("contexts")[0].at("prefill_tokens"), 1868);
-  EXPECT_TRUE(parse_dspark_startup_calibration(data.dump()));
+  EXPECT_TRUE(parse_spec_startup_calibration(data.dump()));
   config->target_graph_rows = {1, 4, 8, 16, 32};
-  EXPECT_EQ(nlohmann::json::parse(serialize_dspark_startup_calibration(*config))
+  EXPECT_EQ(nlohmann::json::parse(serialize_spec_startup_calibration(*config))
                 .at("target_graph_rows"),
             nlohmann::json({1, 4, 8, 16, 32}));
 }
 
-TEST(DSparkStartupCalibrationTest, ParsesConfigurationAndZeroSettling) {
+TEST(SpecStartupCalibrationTest, ParsesConfigurationAndZeroSettling) {
   auto data = configuration();
   data["warmup_steps"] = 0;
   data["token_seed"] = 0;
-  const auto config = parse_dspark_startup_calibration(data.dump());
+  const auto config = parse_spec_startup_calibration(data.dump());
   ASSERT_TRUE(config);
-  EXPECT_EQ(config->model, DSparkSpsCostModel::Kind::SPS);
+  EXPECT_EQ(config->model, SpecCostModel::Kind::SPS);
   EXPECT_EQ(config->warmup_steps, 0U);
   EXPECT_EQ(config->window_steps, 32U);
   EXPECT_EQ(config->windows_per_point, 3U);
   EXPECT_EQ(config->contexts.front().prefill_tokens, 1868U);
 }
 
-TEST(DSparkStartupCalibrationTest,
-     RejectsInvalidConfigurationAndInsufficientKv) {
+TEST(SpecStartupCalibrationTest, RejectsInvalidConfigurationAndInsufficientKv) {
   for (const auto& patch :
        std::vector<nlohmann::json>{{{"model", "events"}},
                                    {{"request_buckets", {4, 1}}},
@@ -191,56 +189,55 @@ TEST(DSparkStartupCalibrationTest,
                                    {{"contexts", nlohmann::json::array()}}}) {
     auto data = configuration();
     data.update(patch);
-    EXPECT_FALSE(parse_dspark_startup_calibration(data.dump())) << data;
+    EXPECT_FALSE(parse_spec_startup_calibration(data.dump())) << data;
   }
   auto data = configuration();
   data["contexts"][0]["max_kv_length"] = 1900;
-  EXPECT_FALSE(parse_dspark_startup_calibration(data.dump()));
+  EXPECT_FALSE(parse_spec_startup_calibration(data.dump()));
   data = configuration();
   data["contexts"].emplace_back(data["contexts"][0]);
-  EXPECT_FALSE(parse_dspark_startup_calibration(data.dump()));
+  EXPECT_FALSE(parse_spec_startup_calibration(data.dump()));
 }
 
-TEST(DSparkStartupCalibrationTest,
-     PlansActualCapturedFullWidthRatherThanEightB) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, PlansActualCapturedFullWidthRatherThanEightB) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.request_buckets = {1};
   const std::array<uint32_t, 2> requests{1, 4};
   const std::array<uint32_t, 6> graphs{1, 2, 4, 10, 16, 32};
-  const auto points = plan_dspark_calibration(config, requests, graphs);
+  const auto points = plan_spec_calibration(config, requests, graphs);
   ASSERT_TRUE(points);
   ASSERT_EQ(points->size(), 4U);
   EXPECT_EQ(points->back().target_graph_rows, 10U);
   EXPECT_EQ(points->back().requests, 1U);
 }
 
-TEST(DSparkStartupCalibrationTest, PlansKvCoverageBeforeFirstCapture) {
-  EXPECT_EQ(dspark_calibration_warmup_length(4096, 32768, 128, 2048), 2048U);
-  EXPECT_EQ(dspark_calibration_warmup_length(4097, 32768, 128, 2048), 2048U);
-  EXPECT_EQ(dspark_calibration_warmup_length(4098, 32768, 128, 2048), 4091U);
-  EXPECT_EQ(dspark_calibration_warmup_length(8192, 32768, 128, 2048), 4091U);
-  EXPECT_EQ(dspark_calibration_warmup_length(32768, 32768, 128, 2048), 16379U);
-  EXPECT_EQ(dspark_calibration_warmup_length(8192, 32768, 256, 16), 16U);
-  EXPECT_EQ(dspark_calibration_warmup_length(8, 32, 1, 32), 16U);
-  EXPECT_FALSE(dspark_calibration_warmup_length(0, 32768, 128, 2048));
-  EXPECT_FALSE(dspark_calibration_warmup_length(32769, 32768, 128, 2048));
-  EXPECT_FALSE(dspark_calibration_warmup_length(8200, 8200, 128, 2048));
-  EXPECT_FALSE(dspark_calibration_warmup_length(8, 16, 1, 16));
-  EXPECT_FALSE(dspark_calibration_warmup_length(4096, 32768, 0, 2048));
-  EXPECT_FALSE(dspark_calibration_warmup_length(4096, 32768, 128, 0));
+TEST(SpecStartupCalibrationTest, PlansKvCoverageBeforeFirstCapture) {
+  EXPECT_EQ(spec_calibration_warmup_length(4096, 32768, 128, 2048), 2048U);
+  EXPECT_EQ(spec_calibration_warmup_length(4097, 32768, 128, 2048), 2048U);
+  EXPECT_EQ(spec_calibration_warmup_length(4098, 32768, 128, 2048), 4091U);
+  EXPECT_EQ(spec_calibration_warmup_length(8192, 32768, 128, 2048), 4091U);
+  EXPECT_EQ(spec_calibration_warmup_length(32768, 32768, 128, 2048), 16379U);
+  EXPECT_EQ(spec_calibration_warmup_length(8192, 32768, 256, 16), 16U);
+  EXPECT_EQ(spec_calibration_warmup_length(8, 32, 1, 32), 16U);
+  EXPECT_FALSE(spec_calibration_warmup_length(0, 32768, 128, 2048));
+  EXPECT_FALSE(spec_calibration_warmup_length(32769, 32768, 128, 2048));
+  EXPECT_FALSE(spec_calibration_warmup_length(8200, 8200, 128, 2048));
+  EXPECT_FALSE(spec_calibration_warmup_length(8, 16, 1, 16));
+  EXPECT_FALSE(spec_calibration_warmup_length(4096, 32768, 0, 2048));
+  EXPECT_FALSE(spec_calibration_warmup_length(4096, 32768, 128, 0));
 }
 
-TEST(DSparkStartupCalibrationTest, PlansOnlyCapturedWholeRoundBindings) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, PlansOnlyCapturedWholeRoundBindings) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.request_buckets = {1, 8};
-  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+  config.model = SpecCostModel::Kind::ADDITIVE;
   const std::array<uint32_t, 2> requests{1, 8};
   const std::array<uint32_t, 8> graphs{1, 2, 4, 8, 16, 32, 48, 64};
-  const std::vector<DSparkCalibrationGraphCoverage> coverage{
+  const std::vector<SpecCalibrationGraphCoverage> coverage{
       {1, {1, 2, 4, 8}}, {8, {8, 16, 32, 64}}};
-  const auto split = plan_dspark_calibration(config, requests, graphs);
+  const auto split = plan_spec_calibration(config, requests, graphs);
   const auto unified =
-      plan_dspark_calibration(config, requests, graphs, coverage);
+      plan_spec_calibration(config, requests, graphs, coverage);
   ASSERT_TRUE(split);
   ASSERT_TRUE(unified);
   EXPECT_EQ(split->size(), 9U);
@@ -252,25 +249,25 @@ TEST(DSparkStartupCalibrationTest, PlansOnlyCapturedWholeRoundBindings) {
   EXPECT_EQ(unified->back().target_graph_rows, 64U);
 }
 
-TEST(DSparkStartupCalibrationTest, RejectsExplicitUncapturedWholeRoundPoint) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, RejectsExplicitUncapturedWholeRoundPoint) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.request_buckets = {8};
   config.target_graph_rows = {8, 16, 32, 48, 64};
   const std::array<uint32_t, 1> requests{8};
   const std::array<uint32_t, 5> graphs{8, 16, 32, 48, 64};
-  const std::vector<DSparkCalibrationGraphCoverage> coverage{
+  const std::vector<SpecCalibrationGraphCoverage> coverage{
       {8, {8, 16, 32, 64}}};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs, coverage));
   config.target_graph_rows = {8, 32, 64};
-  EXPECT_TRUE(plan_dspark_calibration(config, requests, graphs, coverage));
+  EXPECT_TRUE(plan_spec_calibration(config, requests, graphs, coverage));
 }
 
-TEST(DSparkStartupCalibrationTest, RejectsIncompleteWholeRoundCoverage) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, RejectsIncompleteWholeRoundCoverage) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.request_buckets = {1, 8};
   const std::array<uint32_t, 2> requests{1, 8};
   const std::array<uint32_t, 8> graphs{1, 2, 4, 8, 16, 32, 48, 64};
-  const std::vector<std::vector<DSparkCalibrationGraphCoverage>> invalid{
+  const std::vector<std::vector<SpecCalibrationGraphCoverage>> invalid{
       {{1, {1, 2, 4, 8}}},
       {{1, {1, 2, 4, 8}}, {8, {8, 16, 32, 48}}},
       {{1, {1, 2, 4, 8}}, {8, {8, 16, 16, 64}}},
@@ -278,44 +275,44 @@ TEST(DSparkStartupCalibrationTest, RejectsIncompleteWholeRoundCoverage) {
       {{8, {8, 16, 32, 64}}, {1, {1, 2, 4, 8}}},
       {{1, {1, 2, 4, 8}}, {2, {2, 4, 8, 16}}, {8, {8, 16, 32, 64}}}};
   for (const auto& coverage : invalid) {
-    EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
+    EXPECT_FALSE(plan_spec_calibration(config, requests, graphs, coverage));
   }
 }
 
-TEST(DSparkStartupCalibrationTest, ChecksConnectivityAfterWholeRoundFiltering) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, ChecksConnectivityAfterWholeRoundFiltering) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.request_buckets = {1, 8};
-  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+  config.model = SpecCostModel::Kind::ADDITIVE;
   const std::array<uint32_t, 2> requests{1, 8};
   const std::array<uint32_t, 7> graphs{1, 2, 4, 8, 16, 32, 64};
-  const std::vector<DSparkCalibrationGraphCoverage> coverage{{1, {1, 2, 4, 8}},
-                                                             {8, {16, 32, 64}}};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs, coverage));
-  config.model = DSparkSpsCostModel::Kind::SPS;
-  EXPECT_TRUE(plan_dspark_calibration(config, requests, graphs, coverage));
+  const std::vector<SpecCalibrationGraphCoverage> coverage{{1, {1, 2, 4, 8}},
+                                                           {8, {16, 32, 64}}};
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs, coverage));
+  config.model = SpecCostModel::Kind::SPS;
+  EXPECT_TRUE(plan_spec_calibration(config, requests, graphs, coverage));
 }
 
-TEST(DSparkStartupCalibrationTest, RejectsUncapturedAndMissingFullWidthPoints) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, RejectsUncapturedAndMissingFullWidthPoints) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   const std::array<uint32_t, 2> requests{1, 4};
   const std::array<uint32_t, 6> graphs{1, 2, 4, 8, 16, 32};
   config.target_graph_rows = {1, 3, 8, 32};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs));
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs));
   config.target_graph_rows = {1, 2, 4, 8};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs));
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs));
   config.target_graph_rows.clear();
   config.request_buckets = {2};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs));
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs));
 }
 
-TEST(DSparkStartupCalibrationTest, SpsCellMediansMatchReferenceValues) {
-  const std::vector<DSparkSteadyWindow> windows{window(1, 4, 10),
-                                                window(1, 4, 12),
-                                                window(1, 4, 100),
-                                                window(2, 4, 20),
-                                                window(1, 8, 30)};
+TEST(SpecStartupCalibrationTest, SpsCellMediansMatchReferenceValues) {
+  const std::vector<SpecSteadyWindow> windows{window(1, 4, 10),
+                                              window(1, 4, 12),
+                                              window(1, 4, 100),
+                                              window(2, 4, 20),
+                                              window(1, 8, 30)};
   const auto fitted =
-      fit_dspark_cost_table(windows, DSparkSpsCostModel::Kind::SPS, 1800, 4096);
+      fit_spec_cost_table(windows, SpecCostModel::Kind::SPS, 1800, 4096);
   ASSERT_TRUE(fitted);
   const auto table = nlohmann::json::parse(*fitted);
   EXPECT_EQ(table["sample_batch_tokens"], nlohmann::json({4, 8}));
@@ -330,11 +327,11 @@ TEST(DSparkStartupCalibrationTest, SpsCellMediansMatchReferenceValues) {
   EXPECT_EQ(table["metadata"]["cells"][0]["sample_max_kv_length"], 2100);
 }
 
-TEST(DSparkStartupCalibrationTest, SpsProjectionWeightsCellsNotWindowCounts) {
-  const std::vector<DSparkSteadyWindow> windows{
+TEST(SpecStartupCalibrationTest, SpsProjectionWeightsCellsNotWindowCounts) {
+  const std::vector<SpecSteadyWindow> windows{
       window(1, 4, 10), window(1, 4, 12), window(1, 4, 100), window(2, 4, 200)};
   const auto fitted =
-      fit_dspark_cost_table(windows, DSparkSpsCostModel::Kind::SPS, 1800, 4096);
+      fit_spec_cost_table(windows, SpecCostModel::Kind::SPS, 1800, 4096);
   ASSERT_TRUE(fitted);
   const auto table = nlohmann::json::parse(*fitted);
   // Match the offline fitter: median(12, 200), not median(10, 12, 100, 200).
@@ -342,32 +339,32 @@ TEST(DSparkStartupCalibrationTest, SpsProjectionWeightsCellsNotWindowCounts) {
                    1000.0 / 106.0);
 }
 
-TEST(DSparkStartupCalibrationTest, RejectsDisconnectedGridBeforeExecution) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
-  config.model = DSparkSpsCostModel::Kind::ADDITIVE;
+TEST(SpecStartupCalibrationTest, RejectsDisconnectedGridBeforeExecution) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
+  config.model = SpecCostModel::Kind::ADDITIVE;
   const std::array<uint32_t, 3> requests{1, 4, 16};
   const std::array<uint32_t, 8> graphs{1, 2, 4, 8, 16, 32, 64, 128};
   config.request_buckets = {1, 16};
-  EXPECT_FALSE(plan_dspark_calibration(config, requests, graphs));
+  EXPECT_FALSE(plan_spec_calibration(config, requests, graphs));
   config.request_buckets = {1, 4, 16};
-  EXPECT_TRUE(plan_dspark_calibration(config, requests, graphs));
+  EXPECT_TRUE(plan_spec_calibration(config, requests, graphs));
 }
 
-TEST(DSparkStartupCalibrationTest, AdditiveRecoversConnectedAxesInSeconds) {
-  const std::vector<DSparkSteadyWindow> windows{window(1, 1, 10),
-                                                window(1, 2, 11),
-                                                window(1, 4, 13),
-                                                window(1, 8, 18),
-                                                window(2, 2, 14),
-                                                window(2, 4, 16),
-                                                window(2, 8, 21),
-                                                window(2, 16, 25),
-                                                window(8, 8, 24),
-                                                window(8, 16, 28),
-                                                window(8, 32, 36),
-                                                window(8, 64, 41)};
-  const auto fitted = fit_dspark_cost_table(
-      windows, DSparkSpsCostModel::Kind::ADDITIVE, 1800, 4096);
+TEST(SpecStartupCalibrationTest, AdditiveRecoversConnectedAxesInSeconds) {
+  const std::vector<SpecSteadyWindow> windows{window(1, 1, 10),
+                                              window(1, 2, 11),
+                                              window(1, 4, 13),
+                                              window(1, 8, 18),
+                                              window(2, 2, 14),
+                                              window(2, 4, 16),
+                                              window(2, 8, 21),
+                                              window(2, 16, 25),
+                                              window(8, 8, 24),
+                                              window(8, 16, 28),
+                                              window(8, 32, 36),
+                                              window(8, 64, 41)};
+  const auto fitted =
+      fit_spec_cost_table(windows, SpecCostModel::Kind::ADDITIVE, 1800, 4096);
   ASSERT_TRUE(fitted);
   const auto table = nlohmann::json::parse(*fitted);
   EXPECT_NEAR(table["bias_seconds"].get<double>(), 0.010, 1e-12);
@@ -378,17 +375,17 @@ TEST(DSparkStartupCalibrationTest, AdditiveRecoversConnectedAxesInSeconds) {
       1e-10);
 }
 
-TEST(DSparkStartupCalibrationTest,
+TEST(SpecStartupCalibrationTest,
      AdditiveRejectsDisconnectedAndNonpositiveGrid) {
-  for (const auto& windows : std::vector<std::vector<DSparkSteadyWindow>>{
+  for (const auto& windows : std::vector<std::vector<SpecSteadyWindow>>{
            {window(1, 1, 10), window(2, 2, 20)},
            {window(1, 1, 10), window(1, 4, 30), window(4, 4, 1)}}) {
-    EXPECT_FALSE(fit_dspark_cost_table(
-        windows, DSparkSpsCostModel::Kind::ADDITIVE, 1800, 4096));
+    EXPECT_FALSE(fit_spec_cost_table(
+        windows, SpecCostModel::Kind::ADDITIVE, 1800, 4096));
   }
 }
 
-TEST(DSparkStartupCalibrationTest, FitRejectsIncompleteAndOutOfBucketWindows) {
+TEST(SpecStartupCalibrationTest, FitRejectsIncompleteAndOutOfBucketWindows) {
   for (uint32_t fault = 0; fault < 5; ++fault) {
     auto sample = window(1, 8, 10);
     if (fault == 0) {
@@ -402,20 +399,20 @@ TEST(DSparkStartupCalibrationTest, FitRejectsIncompleteAndOutOfBucketWindows) {
     } else {
       sample.elapsed_ms = std::numeric_limits<double>::infinity();
     }
-    EXPECT_FALSE(fit_dspark_cost_table(
-        std::span(&sample, 1), DSparkSpsCostModel::Kind::SPS, 1800, 4096));
+    EXPECT_FALSE(fit_spec_cost_table(
+        std::span(&sample, 1), SpecCostModel::Kind::SPS, 1800, 4096));
   }
 }
 
-TEST(DSparkStartupCalibrationTest,
+TEST(SpecStartupCalibrationTest,
      BundleSelectsContextWithoutCrossingCoverageGaps) {
   auto data = bundle();
   data["profiles"].emplace_back(nlohmann::json{{"min_kv_length", 5000},
                                                {"max_kv_length", 8192},
                                                {"request_buckets", {1}},
                                                {"table", sps_table(8192)}});
-  const auto model = DSparkCostTableBundle::from_json(
-      data.dump(), data["compatibility"].dump());
+  const auto model =
+      SpecCostTableBundle::from_json(data.dump(), data["compatibility"].dump());
   ASSERT_TRUE(model);
   ASSERT_NE(model->lookup(4, 4096), nullptr);
   EXPECT_EQ(model->lookup(4, 4096)->max_kv_length, 4096U);
@@ -426,10 +423,10 @@ TEST(DSparkStartupCalibrationTest,
   EXPECT_EQ(model->lookup(0, 1000), nullptr);
 }
 
-TEST(DSparkStartupCalibrationTest, BundleRejectsIncompatibleOrCorruptTables) {
+TEST(SpecStartupCalibrationTest, BundleRejectsIncompatibleOrCorruptTables) {
   auto data = bundle();
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(data.dump(),
-                                                R"({"model":"different"})"));
+  EXPECT_FALSE(
+      SpecCostTableBundle::from_json(data.dump(), R"({"model":"different"})"));
   for (const auto& patch :
        std::vector<nlohmann::json>{{{"schema_version", 2}},
                                    {{"schema_version", true}},
@@ -438,28 +435,27 @@ TEST(DSparkStartupCalibrationTest, BundleRejectsIncompatibleOrCorruptTables) {
                                    {{"profiles", nlohmann::json::array()}}}) {
     auto invalid = data;
     invalid.update(patch);
-    EXPECT_FALSE(DSparkCostTableBundle::from_json(invalid.dump())) << invalid;
+    EXPECT_FALSE(SpecCostTableBundle::from_json(invalid.dump())) << invalid;
   }
   data["profiles"].emplace_back(data["profiles"][0]);
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(data.dump()));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(data.dump()));
   data = bundle();
   data["profiles"][0]["table"]["max_kv_length"] = 8192;
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(data.dump()));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(data.dump()));
   data = bundle();
   data["profiles"][0]["request_buckets"] = {1, 129};
-  EXPECT_FALSE(DSparkCostTableBundle::from_json(data.dump()));
+  EXPECT_FALSE(SpecCostTableBundle::from_json(data.dump()));
 }
 
-TEST(DSparkStartupCalibrationTest,
-     SessionCollectsIntervalsRatherThanEndpoints) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, SessionCollectsIntervalsRatherThanEndpoints) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.warmup_steps = 0;
   config.window_steps = 2;
   config.windows_per_point = 2;
-  const DSparkCalibrationPoint point{1, 8, config.contexts.front()};
-  DSparkCalibrationSession session(config, point);
+  const SpecCalibrationPoint point{1, 8, config.contexts.front()};
+  SpecCalibrationSession session(config, point);
   const std::vector<std::string> ids{"calibration-request"};
-  DSparkSteadyStep step;
+  SpecSteadyStep step;
   step.logical_requests = 1;
   step.draft_requests = 1;
   step.target_graph_rows = 8;
@@ -481,14 +477,14 @@ TEST(DSparkStartupCalibrationTest,
   EXPECT_EQ(session.windows()[1].last_generation, 5U);
 }
 
-TEST(DSparkStartupCalibrationTest, SessionDiscardsTransientMembershipWindow) {
-  auto config = *parse_dspark_startup_calibration(configuration().dump());
+TEST(SpecStartupCalibrationTest, SessionDiscardsTransientMembershipWindow) {
+  auto config = *parse_spec_startup_calibration(configuration().dump());
   config.warmup_steps = 0;
   config.window_steps = 2;
   config.windows_per_point = 1;
-  DSparkCalibrationSession session(config, {1, 8, config.contexts.front()});
+  SpecCalibrationSession session(config, {1, 8, config.contexts.front()});
   const std::vector<std::string> ids{"calibration-request"};
-  DSparkSteadyStep step;
+  SpecSteadyStep step;
   step.logical_requests = 1;
   step.draft_requests = 1;
   step.target_graph_rows = 8;
@@ -507,8 +503,8 @@ TEST(DSparkStartupCalibrationTest, SessionDiscardsTransientMembershipWindow) {
   EXPECT_EQ(session.windows()[0].last_generation, 6U);
 }
 
-TEST(DSparkStartupCalibrationTest, LegacySingleTableRemainsLoadable) {
-  const auto model = DSparkCostTableBundle::from_json(sps_table().dump());
+TEST(SpecStartupCalibrationTest, LegacySingleTableRemainsLoadable) {
+  const auto model = SpecCostTableBundle::from_json(sps_table().dump());
   ASSERT_TRUE(model);
   ASSERT_NE(model->lookup(16, 2000), nullptr);
   EXPECT_EQ(model->lookup(1, 4097), nullptr);

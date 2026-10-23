@@ -34,7 +34,7 @@ limitations under the License.
 
 namespace xllm {
 class VlmForwardInput;
-struct DSparkCalibrationCommand;
+struct SpecCalibrationCommand;
 
 class Worker {
  public:
@@ -73,8 +73,8 @@ class Worker {
   // allocate kv cache. blocking call
   bool allocate_kv_cache(const KVCacheShape& kv_cache_shape);
 
-  std::optional<std::string> dspark_calibration(
-      const DSparkCalibrationCommand& command);
+  std::optional<std::string> spec_calibration(
+      const SpecCalibrationCommand& command);
 
   void get_cache_info(uint64_t& cluster_id, std::string& addr, uint16_t& port);
 

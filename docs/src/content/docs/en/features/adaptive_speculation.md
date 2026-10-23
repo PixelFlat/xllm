@@ -1,5 +1,5 @@
 ---
-title: "Adaptive DSpark"
+title: "Adaptive Speculation"
 sidebar:
   order: 85
 ---
@@ -19,15 +19,109 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-Adaptive DSpark uses confidence feedback and calibrated full-step costs to
-select a verification budget. Parameter types and defaults are listed in the
+Adaptive speculation adjusts draft generation or target verification to improve
+predicted output throughput. The two switches describe different execution
+controls, rather than naming a speculative algorithm:
+
+| Control | Meaning | Current implementation and rationale |
+|:--------|:--------|:-------------------------------------|
+| `enable_adaptive_draft_step` | Change how many sequential draft forward steps are executed before verification. | MTP generates candidates sequentially, so a shorter depth avoids draft forward work as well as shortening verification. |
+| `enable_adaptive_target_verify` | Change how many already-generated candidates the target verifies. | DSpark generates a candidate block in one forward; pruning its low-confidence suffix reduces verification work without changing draft generation width. |
+
+Both controls default to `false` and cannot currently be enabled together.
+An algorithm not listed above is not implicitly supported by the generic name.
+Parameter types and defaults are listed in the
 [CLI reference](/en/cli_reference/#speculativeconfig).
+
+## Adaptive draft steps (MTP)
+
+`num_speculative_tokens` sets the maximum depth. Before submitting a decode
+batch, the engine selects one depth for that whole batch, using prefix
+acceptance probabilities from completed verification results and a calibrated
+full-cycle cost for each candidate depth. The objective is
+`B * (1 + sum(prefix_acceptance[:depth])) / cost_ms`.
+
+Startup measures the current MTP service, including its draft forwards, target
+verification, sampling, prefix refresh and result retirement. It shares the SPS
+and additive fitting implementation with target verification, but does not reuse
+DSpark's measured costs. Predictions use physical draft request capacity and
+padded target graph rows. Online feedback comes from ordinary result retirement,
+without additional confidence D2H or a TP decision broadcast.
+
+Current support requires an NPU GLM DSA Python model, ordinary prewarmed ACL
+graphs, asynchronous scheduling, task pipeline, and DP=CP=1. Unified MTP graphs
+and PD disaggregation are not supported. Apply the settings to every rank of an
+MTP launch. This example starts rank zero of a 16-rank service; start the other
+ranks with their own `node_rank` and listening port:
+
+```bash
+export HCCL_OP_EXPANSION_MODE=AIV
+xllm --model=/models/target --draft_model=/models/mtp \
+  --backend=llm --model_impl=python --npu_kernel_backend=TORCH \
+  --nnodes=16 --node_rank=0 --host=127.0.0.1 --port=8000 \
+  --master_node_addr=127.0.0.1:27000 \
+  --speculative_algorithm=MTP --num_speculative_tokens=5 \
+  --enable_adaptive_draft_step=true --enable_graph=true \
+  --python_graph_backend=aclgraph --disable_graph_warmup=false \
+  --enable_unified_mtp_graph=false --enable_schedule_overlap=true \
+  --enable_task_pipeline=true --dp_size=1 --cp_size=1 \
+  --max_seqs_per_batch=16 --acl_graph_decode_batch_size_limit=16
+```
+
+### Optional draft-step configuration
+
+`adaptive_draft_step_config` is the **path to a JSON configuration file**, not
+an enable switch or a precomputed cost table. Omit it to use built-in defaults;
+the service still calibrates costs at startup and logs all effective settings.
+The file has two independent sections:
+
+| Section | Purpose | Defaults |
+|:--------|:--------|:---------|
+| `policy.window_size` | Completed-batch window for per-position prefix acceptance rates. | `20` batches |
+| `policy.update_interval` | Rescore candidate depths after this many completed batches. | `5` batches |
+| `policy.switch_min_gain` | Minimum predicted relative throughput gain for changing depth. | `0.05` (strictly more than 5%) |
+| `calibration` | Startup sampling grid, context/KV coverage, warmup and measurement windows, and SPS/additive fitting choice. | Additive model, actual captured request buckets up to 128, prefill up to 2048 and KV coverage up to 4096, subject to model/cache capacity. |
+
+For example, pass `--adaptive_draft_step_config=/configs/draft-steps.json` with:
+
+```json
+{
+  "version": 1,
+  "policy": {
+    "window_size": 20,
+    "update_interval": 5,
+    "switch_min_gain": 0.05
+  },
+  "calibration": {
+    "model": "additive",
+    "request_buckets": [1, 2, 4, 8, 16],
+    "contexts": [
+      {"prefill_tokens": 2048, "min_kv_length": 1, "max_kv_length": 4096}
+    ],
+    "warmup_steps": 8,
+    "window_steps": 32,
+    "windows_per_point": 3,
+    "token_seed": 1
+  }
+}
+```
+
+Either section may be omitted to keep its defaults. Explicit sampling must fit
+the actual prewarmed graphs and KV capacity; it changes startup coverage/time,
+not the client's prompt or sampling parameters. Each depth gets its own measured
+costs, and loading precomputed `step_cost_models` is not supported by this option.
+
+## Adaptive target verification (DSpark)
+
+The current DSpark implementation uses lagged confidence feedback and calibrated
+full-step costs to select a verification budget, keeping draft generation width
+fixed at startup.
 
 The adaptive-pruning flag and JSON key are now `enable_adaptive_target_verify`
 instead of `enable_adaptive_spec_prune` or `enable_adaptive_speculative_decode`. Update existing launch
 scripts and JSON configurations; the old name is not an alias.
 
-## Supported configuration
+### Supported configuration
 
 The supported adaptive task pipeline uses an NPU GLM DSA Python target, a DSpark
 draft with a confidence head, `num_speculative_tokens=5` or `7`, greedy draft sampling,
@@ -40,7 +134,7 @@ rejected before execution when unified graphs are enabled, never silently
 decoded greedily. Fixed-width DSpark and other algorithms retain their own
 execution contracts.
 
-## Launch example
+### Launch example
 
 Add the following settings to **every rank** of an existing multi-rank launch.
 This command illustrates rank zero of a 16-rank service; start the remaining
@@ -61,7 +155,7 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --enable_task_pipeline=true --enable_unified_mtp_graph=false \
   --dp_size=1 --cp_size=1 --max_seqs_per_batch=16 \
   --acl_graph_decode_batch_size_limit=16 \
-  --adaptive_dspark_cost_table_output=/results/dspark-costs.json
+  --adaptive_target_verify_cost_table_output=/results/dspark-costs.json
 ```
 
 Send requests with an explicit temperature: `temperature=0` selects greedy
@@ -100,7 +194,7 @@ and cannot change between replays. Draft5 and Draft7 costs must not be mixed.
 Unversioned legacy tables without a `draft_width` field are treated as Draft7;
 newly fitted bare tables record their width explicitly.
 
-## Startup calibration
+### Startup calibration
 
 No HTTP calibration client, external fitting command or second service launch
 is needed. Startup first warms the graphs, drives the real asynchronous
@@ -110,7 +204,7 @@ does not add per-round timing Events, profiling D2H copies or file writes to
 normal serving. Existing result-readiness Events and asynchronous
 result/confidence feedback remain necessary.
 
-### Built-in defaults
+#### Built-in defaults
 
 With no calibration file or saved table, the built-in settings are:
 
@@ -132,9 +226,9 @@ in-flight slots. If the default sampling steps still do not fit, startup fails
 with a request for a smaller explicit configuration. Sampling every captured
 bucket can increase startup time; use a JSON file to restrict the grid.
 
-### Custom configuration
+#### Custom configuration
 
-To override the defaults, add `--adaptive_dspark_calibration=/configs/dspark.json`.
+To override the defaults, add `--adaptive_target_verify_calibration=/configs/dspark.json`.
 The width is inferred from the launch configuration; an optional `draft_width`
 field in the JSON must match it. For example:
 
@@ -152,7 +246,7 @@ field in the JSON must match it. For example:
 }
 ```
 
-### Cost models and coverage
+#### Cost models and coverage
 
 `model` accepts `sps` or `additive`. The SPS model is a one-dimensional
 steps-per-second table over physical target graph rows `G`; cost is
@@ -179,10 +273,10 @@ captured geometry. No serving request causes profiling, fitting or graph
 recapture. A KV range or request bucket without a calibrated profile uses the
 already-prewarmed full-width admission policy, not an eager retry.
 
-## Reuse a saved cost table
+### Reuse a saved cost table
 
 To reuse a saved bundle on a later compatible launch, replace the calibration
-and output flags with `--adaptive_dspark_cost_table=/results/dspark-costs.json`.
+and output flags with `--adaptive_target_verify_cost_table=/results/dspark-costs.json`.
 The source, saved calibration settings and effective coverage are logged.
 Checkpoint/configuration and parallelism/execution compatibility are checked;
 saved-table loading skips sampling/fitting, not graph warmup. Random-token
