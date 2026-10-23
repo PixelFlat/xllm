@@ -27,6 +27,7 @@ limitations under the License.
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,7 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/distributed_runtime/disagg_pd_service_impl.h"
+#include "core/framework/batch/sampling_input_builder.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "core/util/scope_guard.h"
@@ -207,6 +209,12 @@ class FakeEngine final : public Engine {
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<PrefetchBlockManagerPool> block_manager_;
   ModelArgs model_args_;
+};
+
+class TestDisaggPDServiceImpl final : public DisaggPDServiceImpl {
+ public:
+  using DisaggPDServiceImpl::DisaggPDServiceImpl;
+  using DisaggPDServiceImpl::generate_request;
 };
 
 class TestDisaggPDScheduler final : public DisaggPDScheduler {
@@ -991,6 +999,58 @@ TEST(DisaggPDSchedulerTest, MissingServiceMetadataFailsBeforeDecodeLookup) {
     scheduler.wait_for_responses();
     auto next = make_request({3, 4}, "next");
     EXPECT_TRUE(scheduler.add_request(next));
+  }
+}
+
+TEST(DisaggPDSchedulerTest, DecodeBuildsMinTokenInputsFromLocalExecutionMode) {
+  const bool initialized = XServiceClientTestPeer::set_initialized(true);
+  ScopeGuard restore_client(
+      [initialized] { XServiceClientTestPeer::set_initialized(initialized); });
+  for (const bool enable_task_pipeline : {false, true}) {
+    FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+    DisaggPDScheduler::Options options = make_decode_options();
+    options.enable_task_pipeline(enable_task_pipeline);
+    TestDisaggPDScheduler scheduler(&engine, options);
+    TestDisaggPDServiceImpl service(
+        &scheduler, &engine, /*kv_cache_block_tokens=*/2);
+    for (const uint32_t minimum : {0u, 3u}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "task_pipeline=" << enable_task_pipeline
+                   << ", min_tokens=" << minimum);
+      proto::DisaggRequest wire_request;
+      wire_request.set_req_id("decode-min-tokens");
+      wire_request.add_prompt_tokens(1);
+      wire_request.set_seq_capacity(16);
+      wire_request.set_n(1);
+      wire_request.set_best_of(1);
+      wire_request.set_max_tokens(8);
+      wire_request.set_max_context_len(16);
+      wire_request.set_vocab_size(8);
+      wire_request.set_min_tokens(minimum);
+      wire_request.set_repetition_penalty(1.0f);
+      wire_request.set_eos_token_id(7);
+      wire_request.add_all_stop_token_ids(7);
+      auto request = service.generate_request(wire_request);
+      ASSERT_NE(request, nullptr);
+      EXPECT_EQ(request->state().sampling_param.min_tokens, minimum);
+
+      SamplingInputBuilder builder;
+      builder.append(&request->state().sampling_param, /*token_index=*/0);
+      const SamplingParameters input = builder.build();
+      const bool device_min_tokens = enable_task_pipeline && minimum > 0;
+      EXPECT_EQ(input.min_token_ids.defined(), device_min_tokens);
+      EXPECT_EQ(input.min_tokens_remaining.defined(), device_min_tokens);
+      EXPECT_EQ(input.logits_bias.defined(),
+                !enable_task_pipeline && minimum > 0);
+      if (input.min_tokens_remaining.defined()) {
+        EXPECT_EQ(input.min_tokens_remaining.item<int64_t>(), minimum);
+        EXPECT_EQ(input.min_token_ids[0][0].item<int64_t>(), 7);
+      }
+      if (input.logits_bias.defined()) {
+        EXPECT_EQ(input.logits_bias[0][7].item<float>(),
+                  -std::numeric_limits<float>::infinity());
+      }
+    }
   }
 }
 

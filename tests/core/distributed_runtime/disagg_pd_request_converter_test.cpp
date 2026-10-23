@@ -66,7 +66,6 @@ TEST(DisaggPDRequestConverterTest, PreservesSamplingValuesAndTokenOrder) {
   ASSERT_TRUE(param.seed.has_value());
   EXPECT_EQ(param.seed.value(), -23);
   EXPECT_EQ(param.min_tokens, 3u);
-  EXPECT_FALSE(param.device_min_tokens);
   EXPECT_EQ(param.vocab_size, 1000);
   EXPECT_EQ(param.top_k, 16);
   EXPECT_TRUE(param.logprobs);

@@ -33,9 +33,8 @@ class Request;
 class Sequence;
 class DisaggPDScheduler;
 
-// Immutable execution and response settings for the receiving PD RPC service.
+// Immutable response configuration supplied when the PD RPC service starts.
 struct DisaggPDServiceOptions {
-  bool enable_task_pipeline = false;
   bool enable_response_formatting = false;
   std::string tool_parser_format;
   std::string reasoning_parser_format;

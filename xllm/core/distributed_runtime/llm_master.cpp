@@ -299,7 +299,6 @@ LLMMaster::LLMMaster(const Options& options)
       .server_idx(options_.server_idx())
       .rec_worker_max_concurrency(options_.rec_worker_max_concurrency());
   DisaggPDServiceOptions response_options;
-  response_options.enable_task_pipeline = options_.enable_task_pipeline();
   if (options_.enable_disagg_pd()) {
     response_options.enable_response_formatting = true;
     response_options.tool_parser_format =
