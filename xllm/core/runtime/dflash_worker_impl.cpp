@@ -338,7 +338,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
   CHECK((options.adaptive_dspark_cost_table().empty() &&
          options.adaptive_dspark_calibration().empty()) ||
         (options.enable_task_pipeline() &&
-         options.enable_adaptive_spec_prune() &&
+         options.enable_adaptive_target_verify() &&
          SpeculativeConfig::is_dspark_algorithm(
              options.speculative_algorithm()) &&
          (options.num_speculative_tokens() == 5 ||
@@ -352,7 +352,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      (options_.enable_adaptive_spec_prune() &&
+      (options_.enable_adaptive_target_verify() &&
        !SpeculativeConfig::is_dspark_algorithm(
            options_.speculative_algorithm())) ||
       options_.num_speculative_tokens() <= 0 || target_is_hybrid_recurrent_) {
@@ -403,7 +403,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
        draft_args.model_type() == "DSparkDraftModel") &&
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
-  capacity.adaptive_dspark = options_.enable_adaptive_spec_prune();
+  capacity.adaptive_dspark = options_.enable_adaptive_target_verify();
   capacity.adaptive_min_gain = options_.adaptive_speculative_min_gain();
   capacity.startup_calibration = capacity.adaptive_dspark;
   capacity.calibration_leader = parallel_args_.rank() == 0;

@@ -4123,6 +4123,70 @@ INSTANTIATE_TEST_SUITE_P(AcceptedLengths,
                          TargetPrefixLengthSpeculativePipelineTest,
                          ::testing::Values(1, 2, 3, 4));
 
+TEST_F(SpeculativePipelineTest, AdaptiveMtpSnapshotsDepthIndependentlyPerSlot) {
+  capacity_.num_speculative_tokens = 3;
+  capacity_.adaptive_draft_step = true;
+  capacity_.refresh_target_prefix = true;
+  capacity_.common.slot_count = 2;
+  create();
+  execute(input(false));
+  auto first = input(true);
+  first.input_params.meta.mtp_draft_steps = 1;
+  auto second = input(true, /*token=*/-1, /*position=*/3);
+  second.input_params.meta.mtp_draft_steps = 3;
+  const auto a = pipeline_->submit(first);
+  const auto b = pipeline_->submit(second);
+  ASSERT_TRUE(a.status.ok()) << a.status.message();
+  ASSERT_TRUE(b.status.ok()) << b.status.message();
+  const auto ar = pipeline_->take_result_async(a.task_id).get();
+  const auto br = pipeline_->take_result_async(b.task_id).get();
+  ASSERT_TRUE(ar.status.ok()) << ar.status.message();
+  ASSERT_TRUE(br.status.ok()) << br.status.message();
+  EXPECT_TRUE(torch::equal(ar.output.sample_output.next_tokens,
+                           torch::tensor({{4, 5}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(br.output.sample_output.next_tokens,
+                           torch::tensor({{6, 7, 8, 9}}, torch::kInt64)));
+  EXPECT_EQ(draft_->logits_calls.load(), 4);
+  ASSERT_EQ(ar.output.spec_verify_layouts.size(), 1U);
+  ASSERT_EQ(br.output.spec_verify_layouts.size(), 1U);
+  EXPECT_EQ(ar.output.spec_verify_layouts.front().verify_len, 1);
+  EXPECT_EQ(br.output.spec_verify_layouts.front().verify_len, 3);
+}
+
+TEST_F(SpeculativePipelineTest,
+       MtpCalibrationPadsVerifierWithoutIncreasingLogicalDepth) {
+  capacity_.num_speculative_tokens = 3;
+  capacity_.adaptive_draft_step = true;
+  capacity_.refresh_target_prefix = true;
+  capacity_.common.slot_count = 2;
+  capacity_.common.max_graph_batch_size = 8;
+  create();
+  execute(input(false));
+  auto warmup = input(true);
+  warmup.input_params.meta.is_graph_warmup = true;
+  execute(warmup);
+  const auto geometry = pipeline_->dspark_calibration(
+      {DSparkCalibrationAction::CAPABILITIES, {}});
+  ASSERT_TRUE(geometry);
+  const auto data = nlohmann::json::parse(*geometry);
+  EXPECT_EQ(data.at("algorithm"), "mtp");
+  EXPECT_EQ(data.at("request_buckets"), nlohmann::json::array({1}));
+  EXPECT_EQ(data.at("target_graph_rows"), nlohmann::json::array({2, 4}));
+  const size_t captured = target_->graph_warmup_bindings.size();
+  execute(input(false));
+  auto decode = input(true);
+  decode.input_params.meta.mtp_draft_steps = 1;
+  decode.input_params.meta.mtp_target_graph_rows = 4;
+  const auto result = execute(decode);
+  EXPECT_TRUE(torch::equal(result.sample_output.next_tokens,
+                           torch::tensor({{4, 5}}, torch::kInt64)));
+  ASSERT_EQ(result.spec_verify_layouts.size(), 1U);
+  EXPECT_EQ(result.spec_verify_layouts.front().verify_len, 1);
+  EXPECT_EQ(target_->graph_warmup_bindings.size(), captured);
+  decode.input_params.meta.mtp_target_graph_rows = 8;
+  EXPECT_FALSE(pipeline_->submit(decode).status.ok());
+}
+
 TEST_F(SpeculativePipelineTest,
        PrefixRefreshPreservesContextBeforeAnotherBodyReusesThePool) {
   capacity_.num_speculative_tokens = 3;

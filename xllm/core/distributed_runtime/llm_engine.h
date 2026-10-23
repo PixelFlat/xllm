@@ -44,6 +44,7 @@ namespace xllm {
 class EplbController;
 class KVCacheTransferCoordinatorBase;
 class ModelLoader;
+class DraftStepStartupCalibration;
 
 class LLMEngine : public Engine {
  public:
@@ -84,8 +85,14 @@ class LLMEngine : public Engine {
 
   bool stop_profile() override;
 
+  DraftStepStartupCalibration* draft_step_startup_calibration() override {
+    return draft_step_calibration_.get();
+  }
+
  private:
   bool profile_workers(bool is_start);
+  void select_draft_steps(std::vector<LlmForwardInput>& inputs);
+  void observe_draft_step_acceptance(const RawForwardOutput& output);
   std::mutex profile_mutex_;
 
   template <typename TargetEngine>
@@ -131,6 +138,7 @@ class LLMEngine : public Engine {
       nullptr;
 
   std::unique_ptr<EplbController> eplb_controller_;
+  std::unique_ptr<DraftStepStartupCalibration> draft_step_calibration_;
 };
 
 }  // namespace xllm

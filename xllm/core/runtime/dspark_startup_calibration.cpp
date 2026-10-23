@@ -31,6 +31,12 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration(
   state_executor_.schedule([this,
                             command = std::move(command),
                             promise = std::move(promise)]() mutable {
+    if (speculative_capacity_ && speculative_capacity_->adaptive_draft_step &&
+        command.action == DSparkCalibrationAction::CAPABILITIES &&
+        accepted_.empty() && completed_.empty()) {
+      promise.setValue(draft_step_calibration_geometry());
+      return;
+    }
     if (!speculative_capacity_ || !speculative_capacity_->startup_calibration ||
         !dspark_adaptive_ || dspark_adaptive_->startup_calibration_complete ||
         !accepted_.empty()) {
@@ -41,6 +47,78 @@ std::optional<std::string> TaskExecutionPipeline::dspark_calibration(
     promise.setValue(dspark_calibration_impl(command));
   });
   return std::move(future).get();
+}
+
+std::optional<std::string>
+TaskExecutionPipeline::draft_step_calibration_geometry() const {
+  if (slots_.empty() || captured_graph_batch_sizes_.empty()) {
+    return std::nullopt;
+  }
+  std::vector<uint32_t> requests;
+  std::vector<uint32_t> graphs;
+  const auto& first = *slots_.front()->speculative->drafts.front();
+  requests.reserve(first.captured_graph_batch_sizes.size());
+  graphs.reserve(captured_graph_batch_sizes_.size());
+  uint64_t max_kv = std::min(capacity_.max_kv_seq_len, capacity_.max_positions);
+  for (const auto& task_slot : slots_) {
+    const auto& slot = *task_slot->speculative;
+    const auto bound = [&](const auto& input) {
+      const auto& tables = input.model_params().attention.device.block_tables;
+      CHECK(tables.defined() && tables.dim() == 2);
+      max_kv = std::min(
+          max_kv,
+          static_cast<uint64_t>(tables.size(1)) * capacity_.logical_block_size);
+    };
+    bound(*slot.validate_input);
+    for (const auto& draft : slot.drafts) {
+      bound(*draft->input);
+    }
+    if (slot.prefix_refresh) {
+      bound(*slot.prefix_refresh->input);
+    }
+  }
+  for (const int64_t rows : first.captured_graph_batch_sizes) {
+    if (rows <= 0 || rows % 2 != 0) {
+      continue;
+    }
+    const bool common =
+        std::all_of(slots_.begin(), slots_.end(), [&](const auto& task_slot) {
+          const auto& drafts = task_slot->speculative->drafts;
+          for (size_t step = 0; step < drafts.size(); ++step) {
+            const auto& captured = drafts[step]->captured_graph_batch_sizes;
+            const int64_t required = step == 0 ? rows : rows / 2;
+            if (!std::binary_search(
+                    captured.begin(), captured.end(), required)) {
+              return false;
+            }
+          }
+          return true;
+        });
+    if (common) {
+      requests.emplace_back(static_cast<uint32_t>(rows / 2));
+    }
+  }
+  for (const int64_t rows : captured_graph_batch_sizes_) {
+    const bool common =
+        std::all_of(slots_.begin(), slots_.end(), [&](const auto& task_slot) {
+          const auto& refresh = task_slot->speculative->prefix_refresh;
+          return !refresh ||
+                 std::binary_search(refresh->captured_graph_batch_sizes.begin(),
+                                    refresh->captured_graph_batch_sizes.end(),
+                                    rows);
+        });
+    if (common) {
+      graphs.emplace_back(static_cast<uint32_t>(rows));
+    }
+  }
+  return nlohmann::json{
+      {"algorithm", "mtp"},
+      {"request_buckets", requests},
+      {"target_graph_rows", graphs},
+      {"max_kv_length", max_kv},
+      {"draft_width", speculative_capacity_->num_speculative_tokens},
+      {"slot_count", capacity_.slot_count}}
+      .dump();
 }
 
 std::optional<std::string> TaskExecutionPipeline::dspark_calibration_impl(

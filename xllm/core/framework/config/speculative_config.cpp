@@ -69,11 +69,25 @@ DEFINE_bool(enable_atb_spec_kernel,
             false,
             "Whether to use ATB speculative kernel.");
 
-DEFINE_bool(enable_adaptive_spec_prune,
+DEFINE_bool(enable_adaptive_target_verify,
             false,
-            "Enable asynchronous adaptive DSpark Draft5/7 with Python ACL "
-            "graphs and task pipeline. Full-step costs are calibrated at "
+            "Adapt target verification length by pruning DSpark Draft5/7 "
+            "proposals with Python ACL graphs and task pipeline. Full-step "
+            "costs are calibrated at "
             "startup unless a saved cost table is supplied.");
+
+DEFINE_bool(enable_adaptive_draft_step,
+            false,
+            "Select draft step count by predicted throughput using completed "
+            "prefix acceptance and full-cycle costs measured at startup. "
+            "Currently supports MTP and requires "
+            "Python GLM, ordinary ACL graphs, async task pipeline, DP=CP=1.");
+DEFINE_string(adaptive_draft_step_config,
+              "",
+              "Optional JSON draft-step policy and startup sampling settings. "
+              "Empty uses logged defaults. Reuses DSpark SPS/additive fitting "
+              "but profiles the actual MTP draft, verify and prefix refresh "
+              "for each depth; no precomputed DSpark costs are used.");
 
 DEFINE_double(
     adaptive_speculative_min_gain,
@@ -119,7 +133,9 @@ void SpeculativeConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_atb_spec_kernel);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_spec_prune);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_target_verify);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_adaptive_draft_step);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_draft_step_config);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_speculative_min_gain);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(adaptive_dspark_calibration);
@@ -129,7 +145,16 @@ void SpeculativeConfig::from_flags() {
 void SpeculativeConfig::from_json(const JsonReader& json) {
   CHECK(!json.contains("enable_adaptive_speculative_decode"))
       << "enable_adaptive_speculative_decode was renamed to "
-         "enable_adaptive_spec_prune; update the JSON configuration.";
+         "enable_adaptive_target_verify; update the JSON configuration.";
+  CHECK(!json.contains("enable_adaptive_spec_prune"))
+      << "enable_adaptive_spec_prune was renamed to "
+         "enable_adaptive_target_verify; update the JSON configuration.";
+  CHECK(!json.contains("enable_adaptive_mtp"))
+      << "enable_adaptive_mtp was renamed to "
+         "enable_adaptive_draft_step; update the JSON configuration.";
+  CHECK(!json.contains("adaptive_mtp_config"))
+      << "adaptive_mtp_config was renamed to adaptive_draft_step_config; "
+         "update the JSON configuration.";
   XLLM_CONFIG_ASSIGN_FROM_JSON(draft_model);
   XLLM_CONFIG_ASSIGN_FROM_JSON(num_speculative_tokens);
   XLLM_CONFIG_ASSIGN_FROM_JSON(speculative_algorithm);
@@ -142,7 +167,9 @@ void SpeculativeConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(draft_sampling_mode);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mtp_draft_body_tp1);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_atb_spec_kernel);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_spec_prune);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_target_verify);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_adaptive_draft_step);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_draft_step_config);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_speculative_min_gain);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_cost_table);
   XLLM_CONFIG_ASSIGN_FROM_JSON(adaptive_dspark_calibration);
@@ -177,7 +204,11 @@ void SpeculativeConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_atb_spec_kernel);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_adaptive_spec_prune);
+      config_json, default_config, enable_adaptive_target_verify);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_adaptive_draft_step);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, adaptive_draft_step_config);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, adaptive_speculative_min_gain);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
@@ -202,28 +233,38 @@ void SpeculativeConfig::initialize() {
 }
 
 void SpeculativeConfig::validate() const {
+  CHECK(!enable_adaptive_draft_step() ||
+        (is_mtp_algorithm(speculative_algorithm()) &&
+         num_speculative_tokens() >= 1 && num_speculative_tokens() <= 64 &&
+         !enable_adaptive_target_verify()))
+      << "Adaptive draft-step selection currently requires MTP, maximum "
+         "depth 1..64, and disabled adaptive target verification.";
+  CHECK(adaptive_draft_step_config().empty() || enable_adaptive_draft_step())
+      << "adaptive_draft_step_config requires enable_adaptive_draft_step.";
   CHECK(adaptive_dspark_calibration().empty() ||
-        (adaptive_dspark_cost_table().empty() && enable_adaptive_spec_prune() &&
+        (adaptive_dspark_cost_table().empty() &&
+         enable_adaptive_target_verify() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_calibration requires adaptive DSpark Draft5/7 "
          "without "
          "a cost-table input.";
   CHECK(adaptive_dspark_cost_table_output().empty() ||
-        (adaptive_dspark_cost_table().empty() && enable_adaptive_spec_prune() &&
+        (adaptive_dspark_cost_table().empty() &&
+         enable_adaptive_target_verify() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_cost_table_output requires startup calibration.";
   CHECK(adaptive_dspark_cost_table().empty() ||
-        (enable_adaptive_spec_prune() &&
+        (enable_adaptive_target_verify() &&
          is_dspark_algorithm(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_dspark_cost_table requires adaptive DSpark Draft5/7.";
-  CHECK(!enable_adaptive_spec_prune() ||
-        (supports_adaptive_speculative_decode(speculative_algorithm()) &&
+  CHECK(!enable_adaptive_target_verify() ||
+        (supports_adaptive_target_verify(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
-      << "Adaptive speculative decoding supports only DSpark Draft5/7; "
-         "MTP, DFlash and DFlash2 require fixed-width decoding.";
+      << "Adaptive target verification supports only DSpark Draft5/7; "
+         "MTP, DFlash and DFlash2 do not support target verification pruning.";
   const DraftSamplingMode mode =
       parse_draft_sampling_mode(draft_sampling_mode());
   const std::string& algorithm = speculative_algorithm();

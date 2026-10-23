@@ -26,9 +26,15 @@ limitations under the License.
 #include "runtime/options.h"
 
 namespace xllm {
+class DraftStepStartupCalibration;
+
 class Engine {
  public:
   virtual ~Engine() = default;
+
+  virtual DraftStepStartupCalibration* draft_step_startup_calibration() {
+    return nullptr;
+  }
 
   virtual bool init() { return true; };
 

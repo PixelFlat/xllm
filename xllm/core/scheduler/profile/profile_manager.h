@@ -60,6 +60,7 @@ class ProfileManager {
 
     PROPERTY(bool, enable_task_pipeline) = false;
     PROPERTY(bool, enable_adaptive_dspark) = false;
+    PROPERTY(bool, enable_adaptive_draft_step) = false;
     PROPERTY(std::string, adaptive_dspark_calibration);
     PROPERTY(std::string, adaptive_dspark_cost_table);
     PROPERTY(std::string, adaptive_dspark_cost_table_output);
@@ -261,6 +262,13 @@ class ProfileManager {
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager);
 
   void calibrate_dspark_startup();
+  void calibrate_draft_step_startup();
+  void run_startup_speculative_sample(
+      const DSparkStartupCalibrationConfig& config,
+      const DSparkCalibrationPoint& point,
+      uint64_t sample_id,
+      const std::function<void()>& after_prefill,
+      const std::function<void()>& after_drain);
 
   const DSparkStartupCalibrationConfig& dspark_calibration_config();
   int32_t dspark_calibration_warmup_seq_len(int32_t default_length);

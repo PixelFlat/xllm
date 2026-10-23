@@ -188,6 +188,7 @@ class SlotBuffer final {
   static Status plan_mtp_decode(SlotBuffer& input,
                                 const ModelInputHostView& base,
                                 const ModelInputBatch& batch);
+  static Status set_mtp_validate_width(SlotBuffer& input, uint32_t draft_steps);
   static Status prepare_mtp_decode(SlotBuffer& input,
                                    const ModelInputHostView& base,
                                    const ModelInputBatch& batch,
@@ -259,6 +260,7 @@ class SlotBuffer final {
     ModelInputHostView planned_;
 
     torch::Tensor offsets_;
+    torch::Tensor active_offsets_;
     torch::Tensor cache_positions_storage_;
     torch::Tensor block_indices_storage_;
     torch::Tensor block_ids_storage_;

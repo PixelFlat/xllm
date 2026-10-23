@@ -15,6 +15,8 @@ cc_library(
     mtp_async_state.h
     mtp_json_object_state.h
     mtp_utils.h
+    draft_step_selector.h
+    draft_step_startup_calibration.h
     draft_extend_input.h
     embedding_cache.h
     metrics.h
@@ -30,6 +32,8 @@ cc_library(
     spec_input_builder.cpp
     mtp_async_input_builder.cpp
     mtp_async_state.cpp
+    draft_step_selector.cpp
+    draft_step_startup_calibration.cpp
     draft_extend_input.cpp
     embedding_cache.cpp
     metrics.cpp

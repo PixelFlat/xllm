@@ -103,7 +103,7 @@ constexpr PackedInputDomain packed_input_domain() {
   return PackedInputDomain::LLM;
 }
 constexpr uint64_t kPackedInputMagic = 0x584c4c4d494e5032;
-constexpr uint16_t kPackedInputSchemaVersion = 7;
+constexpr uint16_t kPackedInputSchemaVersion = 8;
 constexpr uint32_t kPackedInputHeaderBytes = 40;
 
 struct RawInputLayoutHeader final {
@@ -2617,6 +2617,8 @@ inline void deserialize_forward_input_payload(
   read_data(context, input_params.meta.q_max_seq_len);
   read_data(context, input_params.meta.batch_id);
   read_data(context, input_params.meta.is_graph_warmup);
+  read_data(context, input_params.meta.mtp_draft_steps);
+  read_data(context, input_params.meta.mtp_target_graph_rows);
   read_tensor_and_vector(context,
                          input_params.attention.device.q_seq_lens,
                          input_params.attention.host.q_seq_lens,
@@ -2954,6 +2956,8 @@ inline void serialize_forward_input_sections(
   write_data(context.descriptor, input_params.meta.q_max_seq_len);
   write_data(context.descriptor, input_params.meta.batch_id);
   write_data(context.descriptor, input_params.meta.is_graph_warmup);
+  write_data(context.descriptor, input_params.meta.mtp_draft_steps);
+  write_data(context.descriptor, input_params.meta.mtp_target_graph_rows);
 
   write_host_vector_or_tensor(context,
                               input_params.attention.host.q_seq_lens,

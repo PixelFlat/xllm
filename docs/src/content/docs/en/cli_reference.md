@@ -235,11 +235,102 @@ Current support covers ordinary non-PD text inference with prefix caching enable
 | `speculative_suffix_use_tree_spec` | `bool` | `false` | Whether to use tree-based suffix speculation instead of path speculation. |
 | `draft_sampling_mode` | `string` | `"greedy"` | How the draft model samples proposal tokens: `greedy`, `probabilistic`. Only `MTP`, `DSpark`, `Eagle3` accept `probabilistic`. |
 | `enable_atb_spec_kernel` | `bool` | `false` | Whether to use the ATB speculative kernel. |
-| `enable_adaptive_spec_prune` | `bool` | `false` | Enable asynchronous adaptive DSpark pruning with Python ACL graphs, task pipeline and greedy Draft5/7 proposals. Ordinary graphs support greedy or random target sampling; unified graphs require greedy targets. MTP, DFlash and DFlash2 use fixed-width decoding; their legacy synchronous adaptive path is no longer supported. Greedy full-step costs are calibrated before serving unless a saved table is supplied. See [Adaptive DSpark](/en/features/adaptive_dspark/) for requirements, sampling restrictions and examples. |
+| `enable_adaptive_target_verify` | `bool` | `false` | Enable asynchronous adaptive DSpark pruning with Python ACL graphs, task pipeline and greedy Draft5/7 proposals. Ordinary graphs support greedy or random target sampling; unified graphs require greedy targets. Does not enable adaptive MTP (see `enable_adaptive_draft_step`). The legacy synchronous adaptive workers are not supported. See [Adaptive DSpark](/en/features/adaptive_dspark/). |
+| `enable_adaptive_draft_step` | `bool` | `false` | Select a uniform MTP depth for each decode batch by maximizing predicted output tokens per full-cycle millisecond. `num_speculative_tokens` is the maximum (1–64), not the current depth. Requires Python GLM DSA, ordinary prewarmed ACL graphs, async task pipeline and DP=CP=1; unified MTP and PD disaggregation are not supported in this initial implementation. |
+| `adaptive_draft_step_config` | `string` | `""` | Optional policy and startup-sampling JSON. Empty uses logged defaults. The current MTP service measures full-cycle costs for every candidate depth before becoming ready, reusing DSpark's SPS/additive fitting and prediction code, not DSpark's measured values. See below. |
 | `adaptive_speculative_min_gain` | `double` | `0.0` | Minimum predicted relative throughput gain for changing the DSpark verification budget from the previous eligible plan. |
 | `adaptive_dspark_calibration` | `string` | `""` | Optional startup-calibration JSON file. Empty selects built-in defaults; the effective settings are always logged. Cannot be combined with a saved-table input. |
 | `adaptive_dspark_cost_table` | `string` | `""` | Load compatible saved full-step costs instead of sampling and fitting. Supports one-dimensional SPS and two-dimensional additive models. Graph warmup still runs. |
 | `adaptive_dspark_cost_table_output` | `string` | `""` | Optionally save startup-calibrated costs as a versioned bundle. Empty keeps costs in memory. An existing output file is never overwritten. Not valid when loading a saved table. |
+
+### Throughput-aware draft-step configuration
+
+`enable_adaptive_draft_step` changes the number of draft forward steps;
+`enable_adaptive_target_verify` prunes proposals before target verification.
+They are separate controls: currently the former supports MTP and the latter
+supports DSpark Draft5/7. They cannot be enabled together.
+
+The previous names `enable_adaptive_mtp`, `adaptive_mtp_config`, and
+`enable_adaptive_spec_prune` are replaced by `enable_adaptive_draft_step`,
+`adaptive_draft_step_config`, and `enable_adaptive_target_verify`, respectively.
+Update both CLI arguments and JSON configurations; old JSON keys are rejected
+with migration instructions instead of silently disabling the feature.
+
+Example launch arguments:
+
+```bash
+--model_impl=python --speculative_algorithm=MTP \
+--num_speculative_tokens=3 --enable_task_pipeline=true \
+--enable_graph=true --enable_unified_mtp_graph=false \
+--enable_schedule_overlap=true --enable_adaptive_draft_step=true \
+--adaptive_draft_step_config=mtp_profile.json
+```
+
+Supply the usual target/draft model paths and parallel arguments separately.
+The optional JSON controls sampling, not precomputed cost values. Omit
+`adaptive_draft_step_config` to use defaults for both sections; the effective settings
+are always logged. An example for graphs covering request buckets 1, 2, 4, 8:
+
+```json
+{
+  "version": 1,
+  "policy": {
+    "window_size": 20, "update_interval": 5,
+    "switch_min_gain": 0.05
+  },
+  "calibration": {
+    "model": "additive", "request_buckets": [1, 2, 4, 8],
+    "contexts": [{"prefill_tokens": 2048, "min_kv_length": 1, "max_kv_length": 4096}],
+    "warmup_steps": 8, "window_steps": 32,
+    "windows_per_point": 3, "token_seed": 1
+  }
+}
+```
+
+Startup reuses DSpark's internal request driver and steady result-fence windows,
+executing real MTP prefill/decode without restarting a service or sending HTTP
+requests. Each depth gets its own measured SPS (`model: "sps"`) or additive
+model. The additive axes are physical first-draft request capacity and padded
+target rows; valid larger padded target buckets make the two axes identifiable.
+Costs include sequential draft forwards, verification, sampling, prefix refresh
+and ordinary result retirement. Fitted models and diagnostics are logged and
+kept in engine memory; no cost JSON is required or taken from a DSpark run.
+Defaults use additive fitting, actual captured request buckets (up to 128),
+prefill up to 2048 and KV up to 4096 with worst-case decode headroom. Explicit
+sampling must fit the captured shapes and KV capacity; invalid coverage fails
+startup rather than silently using guessed costs. Sampling all depths and
+captured shapes adds startup time. No NPU timing Events are introduced.
+
+The engine learns `p[j] = P(accepted prefix length > j)` from completed result
+metadata and chooses the depth maximizing `B * (1 + sum(p[:depth])) / cost_ms`.
+Each retired verify batch contributes its fraction of requests accepting the
+whole prefix through `j`; batches have equal window weight regardless of size.
+The default window holds 20 completed batches, shared across batch sizes.
+Rescoring occurs every 5 completed batches once every active position has a
+full window, with a 5% minimum predicted gain for a switch. Positions beyond
+the verified depth are unobserved, not rejections. A depth decrease clears
+deeper windows; missing rates are geometrically extrapolated from the known
+prefix rates (a single known position supplies a flat tail). There is no
+periodic forced maximum-depth exploration. The former `min_observations` and
+`exploration_interval` policy keys are rejected; configure `window_size` and
+`update_interval` instead.
+
+No confidence D2H or additional TP decision broadcast is introduced. The
+normal async result harvest supplies historical feedback; an already-submitted
+task is never modified. CPU-side dispatch epochs prevent results from older
+in-flight batches from refilling windows cleared by a depth decrease. Cold
+start, missing cost coverage and requests outside warmed graph capacity use
+the configured maximum depth. The effective policy is logged at startup.
+For decision diagnostics, enable `--vmodule=draft_step_selector=1`. Every
+rescoring logs the per-position prefix acceptance probabilities, each
+candidate's padded target rows, full-cycle cost, expected output tokens and
+throughput score, plus the selected depth and whether the switch margin
+blocked a change. Window-warmup logs show the completed-batch history counts.
+Detailed decision logging is disabled by default; leave it off for performance
+measurements.
+Graphs warm all candidate depths using maximum-capacity Slot storage, so step
+selection does not deliberately trigger serving-time recapture. The enabling
+flag defaults to false and leaves fixed-width MTP unchanged when disabled.
 
 ## ProfileConfig
 

@@ -1468,6 +1468,7 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
             view.first_offset_ + static_cast<int32_t>(view.rows_per_sequence_),
             torch::TensorOptions().dtype(torch::kInt32))
             .to(device);
+    view.active_offsets_ = view.offsets_;
     view.cache_positions_storage_ =
         torch::empty({capacity.max_tokens}, options.dtype(torch::kInt64));
     view.block_indices_storage_ =
@@ -1496,6 +1497,25 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
   }
   input->input_scratch_ = std::move(scratch);
   output = std::move(input);
+  return Status();
+}
+
+Status SlotBuffer::set_mtp_validate_width(SlotBuffer& input,
+                                          uint32_t draft_steps) {
+  if (!input.input_scratch_ ||
+      input.input_scratch_->spec_.kind != MtpInvocationKind::VALIDATE ||
+      draft_steps == 0 ||
+      draft_steps > input.input_scratch_->spec_.num_speculative_tokens) {
+    return invalid("MTP validate depth exceeds its fixed storage capacity.");
+  }
+  // Keep allocations and graph binding addresses stable. Prepare recreates
+  // views over the selected prefix; the maximum offset storage is retained.
+  input.input_scratch_->rows_per_sequence_ = draft_steps + 1;
+  auto& view = *input.input_scratch_;
+  view.active_offsets_ =
+      view.rows_per_sequence_ == view.offsets_.numel()
+          ? view.offsets_
+          : view.offsets_.narrow(0, 0, view.rows_per_sequence_);
   return Status();
 }
 
@@ -1822,14 +1842,14 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
   const auto& state = binding.state_;
   torch::add_out(view.positions_view_,
                  state.positions.unsqueeze(/*dim=*/1),
-                 view.offsets_);
+                 view.active_offsets_);
   if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
     view.kv_lengths_view_.copy_(state.kv_seq_lens.unsqueeze(/*dim=*/1));
     view.kv_lengths_view_.add_(view.rows_per_sequence_ - 1);
   } else {
     torch::add_out(view.kv_lengths_view_,
                    state.kv_seq_lens.unsqueeze(/*dim=*/1),
-                   view.offsets_);
+                   view.active_offsets_);
   }
   const bool first_draft =
       view.spec_.kind == MtpInvocationKind::DRAFT && view.spec_.draft_step == 0;

@@ -73,13 +73,15 @@ struct DSparkCalibrationGraphCoverage {
 
 std::optional<DSparkStartupCalibrationConfig> parse_dspark_startup_calibration(
     std::string_view contents,
-    uint32_t draft_width = 7);
+    uint32_t draft_width = 7,
+    bool autoregressive_draft = false);
 
 // Default contexts are bounded by the model; request buckets are resolved from
 // the actual captured geometry after warmup, not guessed from HTTP concurrency.
 std::optional<DSparkStartupCalibrationConfig>
 default_dspark_startup_calibration(uint32_t max_positions,
-                                   uint32_t draft_width = 7);
+                                   uint32_t draft_width = 7,
+                                   bool autoregressive_draft = false);
 
 // Materialize numeric defaults; an omitted target axis selects legal captures.
 std::string serialize_dspark_startup_calibration(
@@ -93,7 +95,8 @@ std::optional<uint32_t> dspark_calibration_warmup_length(
     uint32_t max_positions,
     uint32_t logical_block_size,
     uint32_t default_length,
-    uint32_t draft_width = 7);
+    uint32_t draft_width = 7,
+    bool autoregressive_draft = false);
 
 // Only captured physical buckets are legal. Full width is the first captured
 // bucket covering (draft_width + 1)*Bcap, which need not be that exact size.
@@ -112,6 +115,15 @@ std::optional<std::string> fit_dspark_cost_table(
     uint32_t min_kv_length,
     uint32_t max_kv_length,
     uint32_t draft_width = 7);
+
+// Reuses the same median/SPS/additive fitter on complete autoregressive draft
+// cycles. Each candidate step count has its own measured full-cycle windows.
+std::optional<std::string> fit_draft_step_cost_table(
+    std::span<const DSparkSteadyWindow> windows,
+    DSparkSpsCostModel::Kind kind,
+    uint32_t min_kv_length,
+    uint32_t max_kv_length,
+    uint32_t draft_width);
 
 // The owner starts/replaces a sample only after draining the pipeline.
 // observe() runs on the existing result-retirement thread, without file I/O.

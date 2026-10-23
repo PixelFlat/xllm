@@ -42,13 +42,19 @@ std::optional<DSparkSteadyWindow> DSparkSteadyWindowCollector::observe(
   if (finished()) {
     return std::nullopt;
   }
-  if ((config_.draft_width != 5 && config_.draft_width != 7) ||
-      step.generation == 0 || step.completed_ns == 0 ||
+  const bool supported_width =
+      config_.autoregressive_draft
+          ? config_.draft_width >= 1 && config_.draft_width <= 64
+          : config_.draft_width == 5 || config_.draft_width == 7;
+  if (!supported_width || step.generation == 0 || step.completed_ns == 0 ||
       step.logical_requests == 0 ||
       step.logical_requests != step.draft_requests ||
       step.request_ids.size() != step.logical_requests ||
       step.target_graph_rows != config_.target_graph_rows ||
       step.target_graph_rows < step.draft_requests ||
+      (config_.autoregressive_draft &&
+       step.target_graph_rows < static_cast<uint64_t>(step.logical_requests) *
+                                    (config_.draft_width + 1)) ||
       step.max_kv_length < config_.min_kv_length ||
       step.max_kv_length > config_.max_kv_length ||
       step.draft_tokens !=

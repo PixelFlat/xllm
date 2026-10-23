@@ -56,7 +56,7 @@ class DSparkQwen3ForCausalLMImpl final
     // it is consumed solely by the adaptive pruning controller, so under static
     // decoding its weights would occupy device memory and never be read.
     if (model_args.enable_confidence_head() &&
-        SpeculativeConfig::get_instance().enable_adaptive_spec_prune()) {
+        SpeculativeConfig::get_instance().enable_adaptive_target_verify()) {
       confidence_head_.initialize(context.get_tensor_options(),
                                   model_args.hidden_size(),
                                   model_args.markov_rank(),

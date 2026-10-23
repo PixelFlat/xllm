@@ -70,7 +70,7 @@ TEST(MtpWorkerSelectionTest, RejectsLegacyAdaptiveExecutionBeforeModelSetup) {
   const torch::Device device(torch::kCPU);
   runtime::Options options;
   options.enable_speculative_decode(true)
-      .enable_adaptive_spec_prune(true)
+      .enable_adaptive_target_verify(true)
       .speculative_algorithm("DSpark")
       .num_speculative_tokens(7);
   EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),

@@ -82,12 +82,12 @@ class ScopedSpeculativeSamplingConfigSnapshot final {
  public:
   ScopedSpeculativeSamplingConfigSnapshot()
       : adaptive_(
-            SpeculativeConfig::get_instance().enable_adaptive_spec_prune()),
+            SpeculativeConfig::get_instance().enable_adaptive_target_verify()),
         algorithm_(SpeculativeConfig::get_instance().speculative_algorithm()) {}
 
   ~ScopedSpeculativeSamplingConfigSnapshot() {
     SpeculativeConfig::get_instance()
-        .enable_adaptive_spec_prune(adaptive_)
+        .enable_adaptive_target_verify(adaptive_)
         .speculative_algorithm(algorithm_);
   }
 
@@ -347,7 +347,7 @@ TEST(GraphWarmupTest, OnlyAdaptiveDsparkPipelineUsesGreedySyntheticRequests) {
         SCOPED_TRACE(adaptive);
         SCOPED_TRACE(pipeline);
         SpeculativeConfig::get_instance()
-            .enable_adaptive_spec_prune(adaptive)
+            .enable_adaptive_target_verify(adaptive)
             .speculative_algorithm(algorithm);
         RecordingProfileEngine engine;
         ProfileManager::Options options;

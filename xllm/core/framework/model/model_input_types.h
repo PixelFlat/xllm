@@ -310,6 +310,11 @@ struct BatchInputMeta {
   int32_t q_max_seq_len = 0;
   uint64_t batch_id = 0;
   bool is_graph_warmup = false;
+  // Engine-selected MTP depth for this task; zero keeps configured maximum.
+  // Transported with the input, never inferred independently on TP ranks.
+  uint32_t mtp_draft_steps = 0;
+  // Startup-only padded target shape for measuring the full MTP cost surface.
+  uint32_t mtp_target_graph_rows = 0;
 };
 
 class LlmEmbeddingInput final {

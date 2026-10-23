@@ -46,6 +46,10 @@ bool TaskExecutionPipeline::block_draft() const {
   return speculative_capacity_->kind != SpeculativeTaskKind::MTP;
 }
 
+uint32_t TaskExecutionPipeline::draft_calls(const SpeculativeSlot& slot) const {
+  return block_draft() ? 1U : slot.draft_steps;
+}
+
 uint32_t TaskExecutionPipeline::context_hidden_size() const {
   return block_draft() ? speculative_capacity_->context_hidden_size
                        : speculative_capacity_->common.hidden_size;
@@ -316,6 +320,13 @@ Status TaskExecutionPipeline::create(
         "Target graphs, a ConfidenceHead, greedy draft sampling and supported "
         "request/page capacity.");
   }
+  if (capacity.adaptive_draft_step &&
+      (!Platform::is_npu() || capacity.kind != SpeculativeTaskKind::MTP ||
+       common.dp_size != 1 || common.cp_sampling_group != nullptr ||
+       capacity.adaptive_dspark || capacity.unified_graph ||
+       capacity.num_speculative_tokens > 64)) {
+    return invalid("Adaptive MTP requires ordinary NPU MTP tasks and DP=CP=1.");
+  }
   if (capacity.adaptive_dspark &&
       (rows * common.model.max_blocks_per_sequence >
            std::numeric_limits<int32_t>::max() ||
@@ -435,6 +446,7 @@ Status TaskExecutionPipeline::initialize_speculative() {
   for (uint32_t slot_id = 0; slot_id < c.slot_count; ++slot_id) {
     auto task_slot = std::make_unique<Slot>();
     auto slot = std::make_unique<SpeculativeSlot>();
+    slot->draft_steps = width - 1;
     if (!block_draft()) {
       slot->dummy_hidden = torch::zeros({1, c.hidden_size}, options);
     }
@@ -739,6 +751,29 @@ Status TaskExecutionPipeline::validate_bootstrap(
 
 Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
                                              const LlmForwardInput& input) {
+  const uint32_t requested_steps = input.input_params.meta.mtp_draft_steps;
+  if (requested_steps != 0 &&
+      (!speculative_capacity_->adaptive_draft_step ||
+       requested_steps > speculative_capacity_->num_speculative_tokens)) {
+    return invalid("Task MTP depth is unsupported or exceeds maximum depth.");
+  }
+  slot.draft_steps = requested_steps == 0
+                         ? speculative_capacity_->num_speculative_tokens
+                         : requested_steps;
+  if (speculative_capacity_->adaptive_draft_step) {
+    Status width_status = SlotBuffer::set_mtp_validate_width(
+        *slot.validate_input, slot.draft_steps);
+    if (!width_status.ok()) {
+      return width_status;
+    }
+    if (slot.prefix_refresh) {
+      width_status = SlotBuffer::set_mtp_validate_width(
+          *slot.prefix_refresh->input, slot.draft_steps);
+      if (!width_status.ok()) {
+        return width_status;
+      }
+    }
+  }
   const auto host = SlotBuffer::model_input_view(input);
   const auto batch = model_batch(input);
   Status status = slot.target_prefill->validate(host, batch);
@@ -786,7 +821,7 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!status.ok()) {
     return status;
   }
-  const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
+  const uint32_t width = slot.draft_steps + 1;
   for (const int32_t tokens : base_parallel.dp_global_token_nums) {
     if (static_cast<uint64_t>(tokens) * width >
         std::numeric_limits<int32_t>::max()) {
@@ -799,7 +834,7 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     slot.prefix_refresh->input->model_params().parallel =
         slot.validate_input->model_params().parallel;
   }
-  for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
+  for (uint32_t step = 0; step < draft_calls(slot); ++step) {
     const uint32_t scale = !slot.decode ? 1
                            : block_draft()
                                ? width - (speculative_capacity_->kind ==
@@ -825,10 +860,45 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
         task_graph_batch_size(refresh.input->model_params().parallel,
                               refresh.captured_graph_batch_sizes);
   }
-  for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
+  for (uint32_t step = 0; step < draft_calls(slot); ++step) {
     auto& draft = *slot.drafts[step];
     draft.padded_batch_size = task_graph_batch_size(
         draft.input->model_params().parallel, draft.captured_graph_batch_sizes);
+  }
+  const uint32_t calibration_rows =
+      input.input_params.meta.mtp_target_graph_rows;
+  if (calibration_rows != 0) {
+    if (!speculative_capacity_->adaptive_draft_step || !slot.decode ||
+        requested_steps == 0 || calibration_rows < count * width ||
+        !std::binary_search(captured_graph_batch_sizes_.begin(),
+                            captured_graph_batch_sizes_.end(),
+                            calibration_rows) ||
+        (slot.prefix_refresh &&
+         !std::binary_search(
+             slot.prefix_refresh->captured_graph_batch_sizes.begin(),
+             slot.prefix_refresh->captured_graph_batch_sizes.end(),
+             calibration_rows))) {
+      return invalid(
+          "MTP calibration requires a captured padded verification shape.");
+    }
+    slot.target_padded_batch_size = calibration_rows;
+    if (slot.prefix_refresh) {
+      slot.prefix_refresh->padded_batch_size = calibration_rows;
+    }
+  }
+  if (speculative_capacity_->adaptive_draft_step && requested_steps != 0 &&
+      capacity_.max_graph_batch_size != 0 && slot.decode && count != 0 &&
+      count <= capacity_.max_graph_batch_size /
+                   (speculative_capacity_->num_speculative_tokens + 1) &&
+      !input.input_params.meta.is_graph_warmup &&
+      (slot.target_padded_batch_size == 0 ||
+       (slot.prefix_refresh && slot.prefix_refresh->padded_batch_size == 0) ||
+       std::any_of(
+           slot.drafts.begin(),
+           slot.drafts.begin() + draft_calls(slot),
+           [](const auto& draft) { return draft->padded_batch_size == 0; }))) {
+    return invalid(
+        "Adaptive MTP requires prewarmed target/draft graph buckets.");
   }
   if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
       capacity_.max_graph_batch_size != 0 && slot.decode && count != 0 &&
@@ -948,7 +1018,7 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!status.ok()) {
     return status;
   }
-  for (auto& invocation : slot.drafts) {
+  for (auto& invocation : std::span(slot.drafts).first(draft_calls(slot))) {
     status =
         SlotBuffer::plan_mtp_decode(*invocation->input, conservative, batch);
     if (!status.ok()) {
@@ -1201,7 +1271,7 @@ Status TaskExecutionPipeline::plan_sampling(SpeculativeSlot& slot,
     return slot.validate_input->validate_sampling(slot.host_validate_sampling,
                                                   graph_rows);
   }
-  const int64_t width = speculative_capacity_->num_speculative_tokens + 1;
+  const int64_t width = slot.draft_steps + 1;
   slot.host_validate_sampling = base;
   expand_sampling_params_for_verify(slot.host_validate_sampling,
                                     width,
@@ -1282,6 +1352,24 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   const auto batch = model_batch(input);
   CHECK(input.input_params.meta.is_graph_warmup);
   if (graph_batch_sizes_.empty()) {
+    return Status();
+  }
+  if (speculative_capacity_->adaptive_draft_step &&
+      input.input_params.meta.mtp_draft_steps == 0 &&
+      batch.forward_type.is_decode()) {
+    // Warm every reachable depth while startup owns the drained pipeline.
+    // Smaller depths reuse the same maximum-capacity Slot storage, not another
+    // model or independent pipeline. Ordinary serving never triggers capture.
+    for (uint32_t depth = 1;
+         depth <= speculative_capacity_->num_speculative_tokens;
+         ++depth) {
+      LlmForwardInput candidate = input.clone();
+      candidate.input_params.meta.mtp_draft_steps = depth;
+      const Status status = warmup_speculative_graphs(candidate);
+      if (!status.ok()) {
+        return status;
+      }
+    }
     return Status();
   }
   if (dspark_adaptive_) {
@@ -1851,9 +1939,9 @@ void TaskExecutionPipeline::warmup_draft_graphs(const LlmForwardInput& input) {
   for (auto& task_slot : slots_) {
     auto* slot = task_slot->speculative.get();
     const uint32_t forwards =
-        slot->drafts.size() + (slot->prefix_refresh ? 1U : 0U);
+        draft_calls(*slot) + (slot->prefix_refresh ? 1U : 0U);
     for (uint32_t step = 0; step < forwards; ++step) {
-      const bool refresh = step == slot->drafts.size();
+      const bool refresh = step == draft_calls(*slot);
       auto& invocation = refresh ? *slot->prefix_refresh : *slot->drafts[step];
       const auto& parallel = invocation.input->model_params().parallel;
       const uint32_t padded_batch_size =
@@ -1943,8 +2031,7 @@ void TaskExecutionPipeline::prepare_prefix_refresh_state(SpeculativeSlot& slot,
                                                          bool warmup) {
   auto& refresh = *slot.prefix_refresh;
   auto& binding = *refresh.input;
-  const int64_t logical =
-      slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
+  const int64_t logical = slot.rows * (slot.draft_steps + 1);
   const int64_t physical = binding.tokens().numel();
   auto& params = binding.model_params();
   params.embedding.input_embedding = prefix(refresh.hidden_storage, physical);
@@ -2046,8 +2133,7 @@ Status TaskExecutionPipeline::prepare_speculative(
   status = slot.target_prefill->prepare_sampling(
       input.sampling_params, slot.model_tokens, prepare_stream_);
   CHECK(status.ok()) << status.message();
-  const uint32_t width =
-      slot.decode ? speculative_capacity_->num_speculative_tokens + 1 : 1;
+  const uint32_t width = slot.decode ? slot.draft_steps + 1 : 1;
   status = slot.samples == 0 ? slot.target_prefill->bind_result(0, 0, 0, false)
                              : slot.target_prefill->bind_result(
                                    slot.samples,
@@ -2136,7 +2222,7 @@ Status TaskExecutionPipeline::prepare_speculative(
       slot.rejection = std::make_unique<RejectionSampler>(
           base, base.logprobs, base.max_top_logprobs);
     }
-    for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
+    for (uint32_t step = 0; step < draft_calls(slot); ++step) {
       auto& invocation = *slot.drafts[step];
       status =
           SlotBuffer::prepare_planned_mtp_decode(*invocation.input,
@@ -2274,7 +2360,7 @@ void TaskExecutionPipeline::prepare_empty_shard(SpeculativeSlot& slot,
       draft_->executor.prepare_attention_metadata(draft_->kv_caches,
                                                   binding.model_params());
     } else {
-      for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
+      for (uint32_t step = 0; step < draft_calls(slot); ++step) {
         auto& invocation = *slot.drafts[step];
         auto& binding = *invocation.input;
         const Status status =
@@ -2339,7 +2425,7 @@ void TaskExecutionPipeline::launch_empty_shard(SpeculativeSlot& slot) {
                                      binding.model_params());
   };
   if (slot.decode) {
-    for (auto& invocation : slot.drafts) {
+    for (auto& invocation : std::span(slot.drafts).first(draft_calls(slot))) {
       invocation->output = run(*invocation->input, *draft_);
     }
     slot.target_output =
@@ -2426,11 +2512,11 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   if (launch_unified_block(slot)) {
     return;
   }
-  const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
+  const uint32_t width = slot.draft_steps + 1;
   if (block_draft()) {
     launch_block_draft(slot);
   } else {
-    for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
+    for (uint32_t step = 0; step < draft_calls(slot); ++step) {
       auto& invocation = *slot.drafts[step];
       SlotBuffer::patch_mtp_decode(*invocation.input, *slot.state);
       auto& binding = *invocation.input;
@@ -2513,8 +2599,9 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
     draft_logits = slot.drafts.front()->sampled.draft_logits;
   } else {
     std::vector<torch::Tensor> draft_logits_steps;
-    draft_logits_steps.reserve(slot.drafts.size());
-    for (const auto& invocation : slot.drafts) {
+    draft_logits_steps.reserve(draft_calls(slot));
+    for (const auto& invocation :
+         std::span(slot.drafts).first(draft_calls(slot))) {
       draft_logits_steps.emplace_back(invocation->sampled.draft_logits);
     }
     draft_logits = stack_draft_logits(draft_logits_steps);

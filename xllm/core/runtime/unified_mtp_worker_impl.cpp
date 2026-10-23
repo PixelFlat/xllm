@@ -123,7 +123,7 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
       options_.num_speculative_tokens() <= 0 ||
-      options_.enable_adaptive_spec_prune()) {
+      options_.enable_adaptive_target_verify()) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Unified MTP task pipeline requires fixed greedy MTP models.");

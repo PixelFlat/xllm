@@ -78,7 +78,7 @@ class SpeculativeConfig final {
            is_block_diffusion_algorithm(algorithm);
   }
 
-  static bool supports_adaptive_speculative_decode(std::string_view algorithm) {
+  static bool supports_adaptive_target_verify(std::string_view algorithm) {
     return is_dspark_algorithm(algorithm);
   }
 
@@ -122,7 +122,9 @@ class SpeculativeConfig final {
          "draft_sampling_mode",
          "enable_mtp_draft_body_tp1",
          "enable_atb_spec_kernel",
-         "enable_adaptive_spec_prune",
+         "enable_adaptive_target_verify",
+         "enable_adaptive_draft_step",
+         "adaptive_draft_step_config",
          "adaptive_speculative_min_gain",
          "adaptive_dspark_cost_table",
          "adaptive_dspark_calibration",
@@ -154,7 +156,9 @@ class SpeculativeConfig final {
 
   PROPERTY(bool, enable_atb_spec_kernel) = false;
 
-  PROPERTY(bool, enable_adaptive_spec_prune) = false;
+  PROPERTY(bool, enable_adaptive_target_verify) = false;
+  PROPERTY(bool, enable_adaptive_draft_step) = false;
+  PROPERTY(std::string, adaptive_draft_step_config);
 
   PROPERTY(double, adaptive_speculative_min_gain) = 0.0;
 

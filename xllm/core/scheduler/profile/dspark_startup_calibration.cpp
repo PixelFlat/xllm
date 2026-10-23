@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/request/request_state.h"
+#include "core/framework/speculative/draft_step_startup_calibration.h"
 #include "core/scheduler/profile/profile_manager.h"
 
 namespace xllm {
@@ -189,6 +190,22 @@ ProfileManager::dspark_calibration_config() {
 
 int32_t ProfileManager::dspark_calibration_warmup_seq_len(
     int32_t default_length) {
+  if (options_.enable_adaptive_draft_step()) {
+    auto* calibration = engine_->draft_step_startup_calibration();
+    CHECK(calibration != nullptr);
+    const uint32_t max_positions =
+        static_cast<uint32_t>(engine_->model_args().max_position_embeddings());
+    const auto& config = calibration->configuration(max_positions);
+    const auto length = dspark_calibration_warmup_length(
+        config.contexts.back().max_kv_length,
+        max_positions,
+        static_cast<uint32_t>(block_manager_pool_->block_size()),
+        static_cast<uint32_t>(default_length),
+        config.draft_width,
+        /*autoregressive_draft=*/true);
+    CHECK(length) << "MTP calibration exceeds safe graph warmup KV coverage.";
+    return static_cast<int32_t>(*length);
+  }
   if (!options_.enable_adaptive_dspark() &&
       options_.adaptive_dspark_calibration().empty() &&
       options_.adaptive_dspark_cost_table().empty()) {
@@ -350,9 +367,6 @@ void ProfileManager::calibrate_dspark_startup() {
     CHECK_LE(point.context.max_kv_length,
              captured->at("max_kv_length").get<uint32_t>());
   }
-  const uint64_t decode_rounds =
-      static_cast<uint64_t>(config.warmup_steps) +
-      static_cast<uint64_t>(config.window_steps) * config.windows_per_point + 1;
   CHECK_GT(engine_->model_args().vocab_size(), 2);
   nlohmann::json bundle{{"schema_version", 1},
                         {"measurement", "steady_full_step"},
@@ -372,96 +386,32 @@ void ProfileManager::calibrate_dspark_startup() {
         started->begin(), started->end(), [](const std::string& value) {
           return value == "sample_started";
         }));
-    std::mt19937 random(config.token_seed);
-    std::uniform_int_distribution<int32_t> token(
-        1, engine_->model_args().vocab_size() - 1);
-    std::vector<std::shared_ptr<Request>> owned;
-    std::vector<Sequence*> sequences;
-    owned.reserve(point.requests);
-    sequences.reserve(point.requests);
-    const size_t capacity = point.context.prefill_tokens +
-                            (decode_rounds + 3) * (config.draft_width + 1);
-    for (uint32_t row = 0; row < point.requests; ++row) {
-      std::vector<int32_t> prompt(point.context.prefill_tokens);
-      std::generate(
-          prompt.begin(), prompt.end(), [&]() { return token(random); });
-      RequestState state(std::move(prompt));
-      state.seq_capacity = capacity;
-      state.n = 1;
-      state.best_of = 1;
-      state.logprobs = false;
-      state.enable_schedule_overlap = true;
-      state.is_graph_warmup = false;
-      state.sampling_param.temperature = 0.0;
-      state.sampling_param.top_k = 0;
-      state.sampling_param.top_p = 1.0;
-      state.stopping_checker.set_ignore_eos(true);
-      state.stopping_checker.set_max_generated_tokens((decode_rounds + 3) *
-                                                      (config.draft_width + 1));
-      state.stopping_checker.set_max_context_len(capacity);
-      auto request = std::make_shared<Request>("dspark-calibration-" +
-                                                   std::to_string(index) + "-" +
-                                                   std::to_string(row),
-                                               "",
-                                               "",
-                                               std::move(state));
-      Sequence* sequence = request->sequences().front().get();
-      CHECK(block_manager_pool_->allocate(sequence, capacity))
-          << "Insufficient KV capacity for internal DSpark calibration.";
-      sequences.emplace_back(sequence);
-      owned.emplace_back(std::move(request));
-    }
-    // Bootstrap real target/draft KV and captured hidden state. Partial prefill
-    // is deliberately drained; these tasks are outside the measured window.
-    while (sequences.front()->stage() != SequenceStage::DECODE) {
-      std::vector<size_t> budgets;
-      budgets.reserve(sequences.size());
-      for (Sequence* sequence : sequences) {
-        const size_t remaining = sequence->num_prompt_tokens() -
-                                 sequence->kv_state().kv_cache_tokens_num();
-        budgets.emplace_back(
-            std::min(remaining,
-                     static_cast<size_t>(options_.max_tokens_per_batch()) /
-                         sequences.size()));
-      }
-      auto batch =
-          batch_factory_.create_batches(owned, sequences, budgets, nullptr);
-      step_callback_(batch);
-      result_callback_(batch);
-    }
-    std::optional<BatchGroup> previous;
-    const std::vector<size_t> budgets(sequences.size(), 1);
-    for (uint64_t round = 0; round < decode_rounds; ++round) {
-      auto batch =
-          batch_factory_.create_batches(owned, sequences, budgets, nullptr);
-      step_callback_(batch);
-      if (previous) {
-        result_callback_(*previous);
-      }
-      previous = std::move(batch);
-    }
-    CHECK(previous.has_value());
-    result_callback_(*previous);
-    previous.reset();
-    // Every rank's Slots are now retired; no task retains the sample's KV.
-    const auto finished = distributed_worker_manager_->dspark_calibration(
-        {DSparkCalibrationAction::FINISH_SAMPLE, {}});
-    CHECK(finished && finished->size() == capabilities->size());
-    CHECK(std::all_of(std::next(finished->begin()),
-                      finished->end(),
-                      [](const std::string& value) { return value == "[]"; }))
-        << "Only the designated DSpark leader may return calibration samples.";
-    const auto windows = nlohmann::json::parse(finished->front());
-    CHECK(windows.is_array() && windows.size() == config.windows_per_point);
-    for (const auto& sample : windows) {
-      context_windows.emplace_back(read_window(sample));
-    }
-    for (Sequence* sequence : sequences) {
-      block_manager_pool_->deallocate_without_cache(sequence);
-    }
+    run_startup_speculative_sample(
+        config,
+        point,
+        index,
+        []() {},
+        [&]() {
+          // Every rank's Slots are retired before finishing the measurement.
+          const auto finished = distributed_worker_manager_->dspark_calibration(
+              {DSparkCalibrationAction::FINISH_SAMPLE, {}});
+          CHECK(finished && finished->size() == capabilities->size());
+          CHECK(std::all_of(
+              std::next(finished->begin()),
+              finished->end(),
+              [](const std::string& value) { return value == "[]"; }))
+              << "Only the designated DSpark leader may return calibration "
+                 "samples.";
+          const auto windows = nlohmann::json::parse(finished->front());
+          CHECK(windows.is_array() &&
+                windows.size() == config.windows_per_point);
+          for (const auto& sample : windows) {
+            context_windows.emplace_back(read_window(sample));
+          }
+        });
     LOG(INFO) << "DSpark internal calibration sample complete: Bcap="
               << point.requests << ", G=" << point.target_graph_rows
-              << ", windows=" << windows.size();
+              << ", windows=" << config.windows_per_point;
     const bool last_context_point =
         index + 1 == points->size() ||
         (*points)[index + 1].context.max_kv_length !=
@@ -489,6 +439,94 @@ void ProfileManager::calibrate_dspark_startup() {
   }
   LOG(INFO) << "DSpark startup calibration complete; immutable full-step costs "
                "installed.";
+}
+
+void ProfileManager::run_startup_speculative_sample(
+    const DSparkStartupCalibrationConfig& config,
+    const DSparkCalibrationPoint& point,
+    uint64_t sample_id,
+    const std::function<void()>& after_prefill,
+    const std::function<void()>& after_drain) {
+  const uint64_t decode_rounds =
+      static_cast<uint64_t>(config.warmup_steps) +
+      static_cast<uint64_t>(config.window_steps) * config.windows_per_point + 1;
+  CHECK_GT(engine_->model_args().vocab_size(), 2);
+  std::mt19937 random(config.token_seed);
+  std::uniform_int_distribution<int32_t> token(
+      1, engine_->model_args().vocab_size() - 1);
+  std::vector<std::shared_ptr<Request>> owned;
+  std::vector<Sequence*> sequences;
+  owned.reserve(point.requests);
+  sequences.reserve(point.requests);
+  const size_t capacity = point.context.prefill_tokens +
+                          (decode_rounds + 3) * (config.draft_width + 1);
+  for (uint32_t row = 0; row < point.requests; ++row) {
+    std::vector<int32_t> prompt(point.context.prefill_tokens);
+    std::generate(
+        prompt.begin(), prompt.end(), [&]() { return token(random); });
+    RequestState state(std::move(prompt));
+    state.seq_capacity = capacity;
+    state.n = 1;
+    state.best_of = 1;
+    state.logprobs = false;
+    state.enable_schedule_overlap = true;
+    state.is_graph_warmup = false;
+    state.sampling_param.temperature = 0.0;
+    state.sampling_param.top_k = 0;
+    state.sampling_param.top_p = 1.0;
+    state.stopping_checker.set_ignore_eos(true);
+    state.stopping_checker.set_max_generated_tokens((decode_rounds + 3) *
+                                                    (config.draft_width + 1));
+    state.stopping_checker.set_max_context_len(capacity);
+    auto request = std::make_shared<Request>("spec-calibration-" +
+                                                 std::to_string(sample_id) +
+                                                 "-" + std::to_string(row),
+                                             "",
+                                             "",
+                                             std::move(state));
+    Sequence* sequence = request->sequences().front().get();
+    CHECK(block_manager_pool_->allocate(sequence, capacity))
+        << "Insufficient KV capacity for internal speculative calibration.";
+    sequences.emplace_back(sequence);
+    owned.emplace_back(std::move(request));
+  }
+  // Use the real prefill path to bootstrap target/draft KV and hidden state.
+  // Drain it before measuring the steady two-Slot decode path.
+  while (sequences.front()->stage() != SequenceStage::DECODE) {
+    std::vector<size_t> budgets;
+    budgets.reserve(sequences.size());
+    for (Sequence* sequence : sequences) {
+      const size_t remaining = sequence->num_prompt_tokens() -
+                               sequence->kv_state().kv_cache_tokens_num();
+      budgets.emplace_back(
+          std::min(remaining,
+                   static_cast<size_t>(options_.max_tokens_per_batch()) /
+                       sequences.size()));
+    }
+    auto batch =
+        batch_factory_.create_batches(owned, sequences, budgets, nullptr);
+    step_callback_(batch);
+    result_callback_(batch);
+  }
+  after_prefill();
+  std::optional<BatchGroup> previous;
+  const std::vector<size_t> budgets(sequences.size(), 1);
+  for (uint64_t round = 0; round < decode_rounds; ++round) {
+    auto batch =
+        batch_factory_.create_batches(owned, sequences, budgets, nullptr);
+    step_callback_(batch);
+    if (previous) {
+      result_callback_(*previous);
+    }
+    previous = std::move(batch);
+  }
+  CHECK(previous.has_value());
+  result_callback_(*previous);
+  previous.reset();
+  after_drain();
+  for (Sequence* sequence : sequences) {
+    block_manager_pool_->deallocate_without_cache(sequence);
+  }
 }
 
 }  // namespace xllm

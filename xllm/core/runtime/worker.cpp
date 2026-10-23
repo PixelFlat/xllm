@@ -68,9 +68,18 @@ Worker::Worker(const ParallelArgs& parallel_args,
   CHECK(extension_impl.empty() ||
         ExtensionRegistry::get_instance().has_implementation(extension_impl))
       << "Unknown extension implementation: " << extension_impl;
-  CHECK(!options.enable_adaptive_spec_prune() ||
+  CHECK(!options.enable_adaptive_draft_step() ||
+        (enable_task_pipeline_ && options.enable_speculative_decode() &&
+         options.enable_schedule_overlap() && options.enable_graph() &&
+         options.dp_size() == 1 && options.cp_size() == 1 &&
+         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) &&
+         !ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
+         !ExecutionConfig::get_instance().disable_graph_warmup()))
+      << "Adaptive MTP requires ordinary prewarmed Python graphs, async MTP "
+         "task pipeline and DP=CP=1; unified MTP is not supported yet.";
+  CHECK(!options.enable_adaptive_target_verify() ||
         (options.enable_speculative_decode() && enable_task_pipeline_ &&
-         SpeculativeConfig::supports_adaptive_speculative_decode(
+         SpeculativeConfig::supports_adaptive_target_verify(
              options.speculative_algorithm()) &&
          (options.num_speculative_tokens() == 5 ||
           options.num_speculative_tokens() == 7)))
@@ -115,7 +124,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
             (!options.enable_speculative_decode() ||
              (SpeculativeConfig::is_mtp_algorithm(
                   options.speculative_algorithm()) &&
-              !options.enable_adaptive_spec_prune())))
+              !options.enable_adaptive_target_verify())))
           << "Task pipeline PD requires NPU PUSH, PREFILL or DECODE roles, "
              "replicated KV caches and ordinary or fixed MTP decoding.";
       CHECK(options.instance_role() != InstanceRole::PREFILL ||
@@ -126,7 +135,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           (!options.enable_speculative_decode() ||
            (SpeculativeConfig::supports_task_pipeline(
                 options.speculative_algorithm()) &&
-            (!options.enable_adaptive_spec_prune() ||
+            (!options.enable_adaptive_target_verify() ||
              (SpeculativeConfig::is_dspark_algorithm(
                   options.speculative_algorithm()) &&
               options.enable_graph() && parallel_args.dp_size() == 1)))) &&
@@ -143,7 +152,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
           (Platform::is_npu() && (!options.enable_speculative_decode() ||
                                   (SpeculativeConfig::is_mtp_algorithm(
                                        options.speculative_algorithm()) &&
-                                   !options.enable_adaptive_spec_prune()))))
+                                   !options.enable_adaptive_draft_step() &&
+                                   !options.enable_adaptive_target_verify()))))
         << "Task pipeline Host KV cache requires NPU ordinary or fixed MTP "
            "decoding.";
   }

@@ -235,11 +235,91 @@ xLLM 使用 gflags 管理服务启动参数。`--model <PATH>` 是唯一必填�
 | `speculative_suffix_use_tree_spec` | `bool` | `false` | 是否使用 tree-based suffix speculation，而不是 path speculation。 |
 | `draft_sampling_mode` | `string` | `"greedy"` | draft 模型生成 proposal token 的采样方式：`greedy`、`probabilistic`。仅 `MTP`、`DSpark`、`Eagle3` 支持 `probabilistic`。 |
 | `enable_atb_spec_kernel` | `bool` | `false` | 是否使用 ATB speculative kernel。 |
-| `enable_adaptive_spec_prune` | `bool` | `false` | 开启 Python ACL graph、task pipeline 下的异步自适应 DSpark 裁剪，draft 使用 greedy Draft5/7 提议。普通 graph 支持 greedy 或随机 target 采样，unified graph 要求 greedy target。MTP、DFlash 和 DFlash2 使用固定宽度推理，不再支持旧同步自适应路径；未提供已保存成本表时，在服务就绪前标定 greedy 完整推理步成本。限制和示例见[自适应 DSpark](/zh/features/adaptive_dspark/)。 |
+| `enable_adaptive_target_verify` | `bool` | `false` | 开启 Python ACL graph、task pipeline 下的异步自适应 DSpark 裁剪，draft 使用 greedy Draft5/7。普通 graph 支持 greedy 或随机 target，unified graph 要求 greedy target。此开关不控制自适应 MTP，后者使用 `enable_adaptive_draft_step`；不恢复旧同步自适应 worker。见[自适应 DSpark](/zh/features/adaptive_dspark/)。 |
+| `enable_adaptive_draft_step` | `bool` | `false` | 以预计产出 token 数除以预计完整推理轮耗时，为每个 decode batch 统一选择 MTP 步数。`num_speculative_tokens` 是上限（1–64），不是当前实际步数。初版要求 Python GLM DSA、已预热的普通 ACL graph、异步 task pipeline、DP=CP=1，暂不支持 unified MTP 或 PD 分离。 |
+| `adaptive_draft_step_config` | `string` | `""` | 可选的策略与启动采样配置 JSON，为空使用默认值并打印日志。当前 MTP 服务在就绪前实测各候选步数的完整轮成本，复用 DSpark 的 SPS/二维加性拟合和预测代码，不复用 DSpark 的测量值。详细说明见下文。 |
 | `adaptive_speculative_min_gain` | `double` | `0.0` | DSpark 改变上一个有效验证预算时，要求的最小预测相对吞吐收益。 |
 | `adaptive_dspark_calibration` | `string` | `""` | 可选的启动标定 JSON 文件；为空时使用内置默认配置，两种情况都会打印实际生效值。不能与已保存成本表输入同时指定。 |
 | `adaptive_dspark_cost_table` | `string` | `""` | 加载兼容的已保存完整步成本表，跳过启动采样和拟合；支持一维 SPS 和二维加性模型，仍需 graph warmup。 |
 | `adaptive_dspark_cost_table_output` | `string` | `""` | 可选的启动标定结果输出文件，保存为带版本和配置身份的 bundle；为空则只保留在内存，绝不覆盖已有文件。加载已保存表时不能指定输出。 |
+
+### 吞吐感知的 draft 步数选择
+
+`enable_adaptive_draft_step` 调整 draft 模型实际执行的步数，
+`enable_adaptive_target_verify` 则在 target 验证前裁剪候选。
+两者分别控制不同阶段：当前前者支持 MTP，后者支持 DSpark Draft5/7，
+暂不支持同时开启。
+
+原来的 `enable_adaptive_mtp`、`adaptive_mtp_config`、
+`enable_adaptive_spec_prune` 分别改为 `enable_adaptive_draft_step`、
+`adaptive_draft_step_config`、`enable_adaptive_target_verify`。
+命令行和 JSON 配置均需更新；旧 JSON 字段会明确报错并提示迁移，
+不会静默忽略而关闭功能。
+
+启动参数示例：
+
+```bash
+--model_impl=python --speculative_algorithm=MTP \
+--num_speculative_tokens=3 --enable_task_pipeline=true \
+--enable_graph=true --enable_unified_mtp_graph=false \
+--enable_schedule_overlap=true --enable_adaptive_draft_step=true \
+--adaptive_draft_step_config=mtp_profile.json
+```
+
+另外指定正常的 target/draft 模型路径和并行参数。可选 JSON 只指定采样方式，
+不提供成本数值。不传 `adaptive_draft_step_config` 时使用默认策略与默认采样配置，
+两种情况都会打印实际生效值。以下示例要求图覆盖请求桶 1、2、4、8：
+
+```json
+{
+  "version": 1,
+  "policy": {
+    "window_size": 20, "update_interval": 5,
+    "switch_min_gain": 0.05
+  },
+  "calibration": {
+    "model": "additive", "request_buckets": [1, 2, 4, 8],
+    "contexts": [{"prefill_tokens": 2048, "min_kv_length": 1, "max_kv_length": 4096}],
+    "warmup_steps": 8, "window_steps": 32,
+    "windows_per_point": 3, "token_seed": 1
+  }
+}
+```
+
+启动时复用 DSpark 的内部请求驱动和稳态结果栅栏窗口，实际执行 MTP
+prefill/decode，无需重启服务或构造 HTTP 客户端。每个候选步数独立测量、拟合
+SPS（`model: "sps"`）或二维加性模型。二维轴分别是第一步 draft 的物理请求
+容量和 target 的 padding 后行数；同时测量合法的更大 target 桶以区分两个轴。
+成本包含逐步 draft、target 验证、采样、prefix refresh 和正常结果回收。
+拟合结果及诊断写入日志、保留在 engine 内存，不要求现成成本 JSON，更不套用
+DSpark 的实测数值。默认使用二维加性模型、实际捕获的请求桶（最多 128）、
+最多 2048 的 prefill、最多 4096 的 KV，并预留最坏接受长度的空间。
+显式配置必须落在真实捕获的图和 KV 容量内；覆盖不足时启动失败，不猜测成本。
+遍历候选步数和图桶会增加启动时间，不引入 NPU Event 测时。
+
+engine 从正常回收的结果统计逐位置前缀接受概率
+`p[j] = P(接受的 draft 前缀长度 > j)`，选择使
+`B * (1 + sum(p[:步数])) / cost_ms` 最大的步数。每个回收的验证 batch
+向各位置窗口记录一次“该 batch 中接受完整前缀的请求比例”，不同 batch
+等权，不因请求数较多而增加权重。默认窗口为最近 20 个已完成 batch，
+在各 batch size 间共享。当前深度的所有位置都填满窗口后，每完成 5 个 batch
+重新评分，切换要求超过 5% 的预测收益。未验证的位置不记作拒绝。
+降步时清空更深位置的窗口；缺少历史的位置按已知前缀概率做几何衰减外推，
+只有一个已知位置时延续该概率。不再周期性强制运行最大深度。
+旧策略字段 `min_observations`、`exploration_interval` 不再接受，
+改用 `window_size` 与 `update_interval` 配置。
+
+不新增 confidence D2H 或 TP 决策广播；异步模式使用已有结果回收中的历史，
+不修改已提交 task。CPU 侧记录各在途 batch 的统计版本，防止降步前的旧结果
+重新填回已清空的深层窗口。冷启动、成本覆盖不足或超出已预热 graph
+请求容量时，按明确策略使用配置的最大步数，启动时打印实际生效配置。
+排查决策时可开启 `--vmodule=draft_step_selector=1`。每次重新评分都会记录
+逐位置前缀接受概率、各候选的 target padding 行数、整轮成本、预期产出和
+吞吐分数，以及实际选择的步数、是否被切换收益门槛拦截。
+窗口尚未填满时记录各位置已有的已完成 batch 数。
+明细日志默认关闭；正式性能测量应保持关闭。
+启动预热覆盖各候选步数，Slot 保留最大容量的存储，不以在线重新捕获实现切换。
+开关默认关闭，不影响默认的固定步数 MTP。
 
 ## ProfileConfig
 

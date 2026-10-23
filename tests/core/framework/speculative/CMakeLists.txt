@@ -4,6 +4,16 @@ add_subdirectory(dspark)
 
 cc_test(
   NAME
+    draft_step_selector_test
+  SRCS
+    draft_step_selector_test.cpp
+  DEPS
+    :speculative
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     draft_config_test
   SRCS
     draft_config_test.cpp

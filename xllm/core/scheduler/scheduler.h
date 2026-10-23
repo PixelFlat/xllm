@@ -62,6 +62,7 @@ struct SchedulerOptions {
   PROPERTY(bool, enable_task_pipeline) = false;
   PROPERTY(std::string, adaptive_dspark_calibration);
   PROPERTY(bool, enable_adaptive_dspark) = false;
+  PROPERTY(bool, enable_adaptive_draft_step) = false;
   PROPERTY(std::string, adaptive_dspark_cost_table);
   PROPERTY(std::string, adaptive_dspark_cost_table_output);
   PROPERTY(std::string, dspark_calibration_compatibility);

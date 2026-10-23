@@ -16,12 +16,14 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/common/global_flags.h"
@@ -41,21 +43,19 @@ namespace {
 
 TEST(SpeculativeConfigTest, AdaptiveRequiresDsparkDraftFiveOrSeven) {
   SpeculativeConfig config;
-  config.enable_adaptive_spec_prune(true);
+  config.enable_adaptive_target_verify(true);
   for (const std::string& algorithm :
        {"MTP", "mtp", "DFlash", "DFlash2", "Eagle3", "Suffix", "unknown"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm).num_speculative_tokens(7);
     EXPECT_DEATH(config.validate(), "supports only DSpark Draft5/7");
-    EXPECT_FALSE(
-        SpeculativeConfig::supports_adaptive_speculative_decode(algorithm));
+    EXPECT_FALSE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
   }
   for (const std::string& algorithm :
        {"DSpark", "dspark", "DSPARK", "dSpArK"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm);
-    EXPECT_TRUE(
-        SpeculativeConfig::supports_adaptive_speculative_decode(algorithm));
+    EXPECT_TRUE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
     for (const int32_t width : {5, 7}) {
       config.num_speculative_tokens(width);
       EXPECT_NO_FATAL_FAILURE(config.validate());
@@ -73,24 +73,103 @@ TEST(SpeculativeConfigTest, FixedWidthAlgorithmsDoNotRequireAdaptiveSupport) {
        {"MTP", "DFlash", "DFlash2", "DSpark", "Eagle3", "Suffix"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm).num_speculative_tokens(3);
-    EXPECT_FALSE(config.enable_adaptive_spec_prune());
+    EXPECT_FALSE(config.enable_adaptive_target_verify());
     EXPECT_NO_FATAL_FAILURE(config.validate());
   }
 }
 
-TEST(SpeculativeConfigTest, RejectsRetiredAdaptiveFlagInJson) {
+TEST(SpeculativeConfigTest, RejectsRetiredAdaptiveFlagsInJson) {
   SpeculativeConfig config;
+  constexpr std::array<std::pair<const char*, const char*>, 3> retired{{
+      {"enable_adaptive_speculative_decode", "enable_adaptive_target_verify"},
+      {"enable_adaptive_spec_prune", "enable_adaptive_target_verify"},
+      {"enable_adaptive_mtp", "enable_adaptive_draft_step"},
+  }};
+  for (const auto& [old_name, new_name] : retired) {
+    SCOPED_TRACE(old_name);
+    for (const bool enabled : {false, true}) {
+      const JsonReader json =
+          config::parse_json_string(nlohmann::json{{old_name, enabled}}.dump());
+      EXPECT_DEATH(config.from_json(json),
+                   std::string("was renamed to ") + new_name);
+    }
+  }
   const JsonReader json = config::parse_json_string(
-      R"json({"enable_adaptive_speculative_decode":true})json");
+      R"({"adaptive_mtp_config":"mtp_profile.json"})");
   EXPECT_DEATH(config.from_json(json),
-               "was renamed to enable_adaptive_spec_prune");
+               "was renamed to adaptive_draft_step_config");
+}
+
+TEST(SpeculativeConfigTest, AdaptiveHelpRegistersOnlyCurrentNames) {
+  google::CommandLineFlagInfo flag_info;
+  const auto& names = SpeculativeConfig::option_category().option_names;
+  for (const std::string& name : {"enable_adaptive_draft_step",
+                                  "enable_adaptive_target_verify",
+                                  "adaptive_draft_step_config"}) {
+    SCOPED_TRACE(name);
+    EXPECT_TRUE(google::GetCommandLineFlagInfo(name.c_str(), &flag_info));
+    EXPECT_NE(std::find(names.begin(), names.end(), name), names.end());
+  }
+  for (const std::string& name : {"enable_adaptive_mtp",
+                                  "enable_adaptive_spec_prune",
+                                  "enable_adaptive_speculative_decode",
+                                  "adaptive_mtp_config"}) {
+    SCOPED_TRACE(name);
+    EXPECT_FALSE(google::GetCommandLineFlagInfo(name.c_str(), &flag_info));
+    EXPECT_EQ(std::find(names.begin(), names.end(), name), names.end());
+  }
+}
+
+TEST(SpeculativeConfigTest, AdaptiveCommandLineNamesReachConfiguration) {
+  {
+    google::FlagSaver flag_saver;
+    google::SetCommandLineOption("enable_adaptive_draft_step", "true");
+    google::SetCommandLineOption("adaptive_draft_step_config",
+                                 "draft_step.json");
+    SpeculativeConfig config;
+    config.from_flags();
+    EXPECT_TRUE(config.enable_adaptive_draft_step());
+    EXPECT_FALSE(config.enable_adaptive_target_verify());
+    EXPECT_EQ(config.adaptive_draft_step_config(), "draft_step.json");
+  }
+  {
+    google::FlagSaver flag_saver;
+    google::SetCommandLineOption("enable_adaptive_target_verify", "true");
+    SpeculativeConfig config;
+    config.from_flags();
+    EXPECT_TRUE(config.enable_adaptive_target_verify());
+    EXPECT_FALSE(config.enable_adaptive_draft_step());
+  }
+}
+
+TEST(SpeculativeConfigTest, ThroughputMtpHasSeparateAdmissionAndJsonKey) {
+  google::FlagSaver flag_saver;
+  SpeculativeConfig config;
+  config.from_json(config::parse_json_string(
+      R"({"enable_adaptive_draft_step":true,"adaptive_draft_step_config":"mtp_profile.json","num_speculative_tokens":3,"speculative_algorithm":"mTp"})"));
+  EXPECT_TRUE(config.enable_adaptive_draft_step());
+  EXPECT_FALSE(config.enable_adaptive_target_verify());
+  EXPECT_NO_FATAL_FAILURE(config.validate());
+  nlohmann::ordered_json saved;
+  config.append_config_json(saved);
+  EXPECT_EQ(saved["enable_adaptive_draft_step"], true);
+  EXPECT_EQ(saved["adaptive_draft_step_config"], "mtp_profile.json");
+  EXPECT_FALSE(saved.contains("enable_adaptive_mtp"));
+  EXPECT_FALSE(saved.contains("adaptive_mtp_config"));
+  config.speculative_algorithm("DSpark");
+  EXPECT_DEATH(config.validate(),
+               "draft-step selection currently requires MTP");
+  config.speculative_algorithm("MTP").adaptive_draft_step_config("");
+  EXPECT_NO_FATAL_FAILURE(config.validate());
+  config.enable_adaptive_target_verify(true);
+  EXPECT_DEATH(config.validate(), "disabled adaptive target verification");
 }
 
 TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
   google::FlagSaver flag_saver;
   google::CommandLineFlagInfo flag_info;
-  EXPECT_TRUE(
-      google::GetCommandLineFlagInfo("enable_adaptive_spec_prune", &flag_info));
+  EXPECT_TRUE(google::GetCommandLineFlagInfo("enable_adaptive_target_verify",
+                                             &flag_info));
   EXPECT_FALSE(google::GetCommandLineFlagInfo(
       "enable_adaptive_speculative_decode", &flag_info));
   SpeculativeConfig speculative_config;
@@ -98,7 +177,7 @@ TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
     "adaptive_dspark_cost_table":"/tmp/dspark_sps.json",
     "speculative_algorithm":"DSpark",
     "num_speculative_tokens":7,
-    "enable_adaptive_spec_prune":true
+    "enable_adaptive_target_verify":true
   })json");
   speculative_config.from_json(json);
   speculative_config.validate();
@@ -111,13 +190,14 @@ TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
   const auto& names = SpeculativeConfig::option_category().option_names;
   EXPECT_NE(std::find(names.begin(), names.end(), "adaptive_dspark_cost_table"),
             names.end());
-  EXPECT_NE(std::find(names.begin(), names.end(), "enable_adaptive_spec_prune"),
-            names.end());
+  EXPECT_NE(
+      std::find(names.begin(), names.end(), "enable_adaptive_target_verify"),
+      names.end());
   EXPECT_EQ(
       std::find(
           names.begin(), names.end(), "enable_adaptive_speculative_decode"),
       names.end());
-  EXPECT_TRUE(serialized.at("enable_adaptive_spec_prune").get<bool>());
+  EXPECT_TRUE(serialized.at("enable_adaptive_target_verify").get<bool>());
   EXPECT_FALSE(serialized.contains("enable_adaptive_speculative_decode"));
 }
 
@@ -127,7 +207,7 @@ TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveDsparkDraft7) {
   speculative_config.adaptive_dspark_cost_table("/tmp/dspark_sps.json");
   EXPECT_DEATH(speculative_config.validate(),
                "requires adaptive DSpark Draft5/7");
-  speculative_config.enable_adaptive_spec_prune(true)
+  speculative_config.enable_adaptive_target_verify(true)
       .speculative_algorithm("DSpark")
       .num_speculative_tokens(5);
   speculative_config.validate();
@@ -145,7 +225,7 @@ TEST(SpeculativeConfigTest,
     "adaptive_dspark_cost_table_output":"/tmp/new-costs.json",
     "speculative_algorithm":"DSpark",
     "num_speculative_tokens":7,
-    "enable_adaptive_spec_prune":true
+    "enable_adaptive_target_verify":true
   })json"));
   config.validate();
   nlohmann::ordered_json serialized;
@@ -168,7 +248,7 @@ TEST(SpeculativeConfigTest, StartupDsparkOutputAllowsDefaultCalibration) {
   SpeculativeConfig config;
   config.adaptive_dspark_cost_table_output("/tmp/output.json");
   EXPECT_DEATH(config.validate(), "requires startup calibration");
-  config.enable_adaptive_spec_prune(true)
+  config.enable_adaptive_target_verify(true)
       .speculative_algorithm("DSpark")
       .num_speculative_tokens(7);
   config.validate();

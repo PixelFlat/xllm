@@ -388,6 +388,32 @@ TEST_F(MtpDecodeInputTest, FirstDraftRepairsOnlyFullAcceptance) {
                     torch::kInt32)));
 }
 
+TEST_F(MtpDecodeInputTest, AdaptiveValidateDepthReusesMaximumStorage) {
+  spec_.kind = MtpInvocationKind::VALIDATE;
+  std::unique_ptr<SlotBuffer> binding;
+  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+                  spec_, torch::kBFloat16, device_, binding)
+                  .ok());
+  run(*binding, /*padded_batch_size=*/8);
+  const uint64_t bytes = binding->device_bytes();
+  const void* tokens = binding->tokens().const_data_ptr();
+  for (const uint32_t depth : {1U, 2U, 3U, 1U}) {
+    ASSERT_TRUE(
+        TaskPipelineTestPeer::set_mtp_validate_width(*binding, depth).ok());
+    run(*binding, /*padded_batch_size=*/8);
+    const torch::Tensor expected =
+        (torch::tensor({7, 15}, torch::kInt32).unsqueeze(1) +
+         torch::arange(depth + 1, torch::kInt32).unsqueeze(0))
+            .reshape({-1});
+    EXPECT_TRUE(torch::equal(
+        binding->positions().narrow(0, 0, 2 * (depth + 1)).cpu(), expected));
+    EXPECT_EQ(binding->tokens().const_data_ptr(), tokens);
+    EXPECT_EQ(binding->device_bytes(), bytes);
+  }
+  EXPECT_FALSE(TaskPipelineTestPeer::set_mtp_validate_width(*binding, 0).ok());
+  EXPECT_FALSE(TaskPipelineTestPeer::set_mtp_validate_width(*binding, 4).ok());
+}
+
 TEST_F(MtpDecodeInputTest, ValidateUsesActualDeviceBaseAcrossBlocks) {
   spec_.kind = MtpInvocationKind::VALIDATE;
   std::unique_ptr<SlotBuffer> binding;

@@ -79,6 +79,15 @@ LLMMaster::LLMMaster(const Options& options)
           options_.num_speculative_tokens(),
           options_.speculative_algorithm());
   CHECK(!speculative_error.has_value()) << speculative_error.value();
+  CHECK(
+      !options_.enable_adaptive_draft_step() ||
+      (options_.enable_task_pipeline() && options_.enable_schedule_overlap() &&
+       options_.enable_graph() && !options_.enable_disagg_pd() &&
+       options_.dp_size() == 1 && options_.cp_size() == 1 &&
+       SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+       model_type == "glm_moe_dsa"))
+      << "Adaptive MTP requires Python GLM DSA, ordinary graphs, async task "
+         "pipeline and DP=CP=1.";
   validate_layerwise_split_size_startup_config(
       options_, model_type, options_.nnodes());
 
@@ -200,7 +209,9 @@ LLMMaster::LLMMaster(const Options& options)
             options_.speculative_suffix_max_cached_requests())
         .speculative_suffix_use_tree_spec(
             options_.speculative_suffix_use_tree_spec())
-        .enable_adaptive_spec_prune(options_.enable_adaptive_spec_prune())
+        .enable_adaptive_target_verify(options_.enable_adaptive_target_verify())
+        .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
+        .adaptive_draft_step_config(options_.adaptive_draft_step_config())
         .adaptive_speculative_min_gain(options_.adaptive_speculative_min_gain())
         .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())
         .adaptive_dspark_calibration(options_.adaptive_dspark_calibration());
@@ -311,9 +322,10 @@ LLMMaster::LLMMaster(const Options& options)
   auto create_scheduler =
       [this, &scheduler_options, &response_options](auto* engine) {
         scheduler_options
+            .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
             .adaptive_dspark_calibration(options_.adaptive_dspark_calibration())
             .enable_adaptive_dspark(options_.enable_task_pipeline() &&
-                                    options_.enable_adaptive_spec_prune() &&
+                                    options_.enable_adaptive_target_verify() &&
                                     SpeculativeConfig::is_dspark_algorithm(
                                         options_.speculative_algorithm()))
             .adaptive_dspark_cost_table(options_.adaptive_dspark_cost_table())

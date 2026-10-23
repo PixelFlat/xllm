@@ -821,7 +821,7 @@ template <typename TargetInput>
 ::xllm::Status MTPWorkerImpl<TargetInput>::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      options_.enable_adaptive_spec_prune() ||
+      options_.enable_adaptive_target_verify() ||
       options_.num_speculative_tokens() <= 0 ||
       draft_impl_->context_.get_model_args().model_type() !=
           "glm_moe_dsa_mtp") {
@@ -836,6 +836,7 @@ template <typename TargetInput>
   }
   const auto& args = draft_impl_->context_.get_model_args();
   capacity.num_speculative_tokens = options_.num_speculative_tokens();
+  capacity.adaptive_draft_step = options_.enable_adaptive_draft_step();
   capacity.index_topk = args.index_topk();
   capacity.reuse_topk = args.index_share_for_mtp_iteration();
   capacity.refresh_target_prefix = capacity.num_speculative_tokens > 1;

@@ -23,7 +23,8 @@ limitations under the License.
 参数类型和默认值见 [CLI reference](/zh/cli_reference/#speculativeconfig)。
 
 自适应裁剪的命令行选项和 JSON 配置项已从
-`enable_adaptive_speculative_decode` 重命名为 `enable_adaptive_spec_prune`。
+`enable_adaptive_spec_prune`（更早为 `enable_adaptive_speculative_decode`）
+重命名为 `enable_adaptive_target_verify`。
 请同步更新现有启动脚本和 JSON 配置，旧名称不作为别名保留。
 
 ## 支持的配置
@@ -51,7 +52,7 @@ xllm --model=/models/target --draft_model=/models/dspark \
   --nnodes=16 --node_rank=0 --host=127.0.0.1 --port=8000 \
   --master_node_addr=127.0.0.1:27000 \
   --speculative_algorithm=DSpark --num_speculative_tokens=7 \
-  --draft_sampling_mode=greedy --enable_adaptive_spec_prune=true \
+  --draft_sampling_mode=greedy --enable_adaptive_target_verify=true \
   --enable_graph=true --python_graph_backend=aclgraph \
   --disable_graph_warmup=false --enable_schedule_overlap=true \
   --enable_task_pipeline=true --enable_unified_mtp_graph=false \

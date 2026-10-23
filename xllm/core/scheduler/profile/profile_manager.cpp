@@ -82,7 +82,8 @@ namespace {
 void configure_profile_sampling(RequestSamplingParam& sampling,
                                 const SpeculativeConfig& speculative_config,
                                 bool enable_task_pipeline) {
-  if (enable_task_pipeline && speculative_config.enable_adaptive_spec_prune() &&
+  if (enable_task_pipeline &&
+      speculative_config.enable_adaptive_target_verify() &&
       SpeculativeConfig::is_dspark_algorithm(
           speculative_config.speculative_algorithm())) {
     // Startup costs use a fixed greedy sampling policy. Serving may sample
@@ -200,6 +201,9 @@ ProfileManager::ProfileManager(
       !options_.adaptive_dspark_calibration().empty() ||
       !options_.adaptive_dspark_cost_table().empty()) {
     calibrate_dspark_startup();
+  }
+  if (options_.enable_adaptive_draft_step()) {
+    calibrate_draft_step_startup();
   }
 }
 

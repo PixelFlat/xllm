@@ -104,6 +104,7 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
       .enable_task_pipeline(options.enable_task_pipeline())
       .adaptive_dspark_calibration(options.adaptive_dspark_calibration())
       .enable_adaptive_dspark(options.enable_adaptive_dspark())
+      .enable_adaptive_draft_step(options.enable_adaptive_draft_step())
       .adaptive_dspark_cost_table(options.adaptive_dspark_cost_table())
       .adaptive_dspark_cost_table_output(
           options.adaptive_dspark_cost_table_output())

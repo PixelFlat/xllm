@@ -156,6 +156,8 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   };
 
   bool decode = false;
+  // Immutable until this Slot retires; capacity remains the maximum depth.
+  uint32_t draft_steps = 0;
   std::unique_ptr<Adaptive> adaptive;
   bool run_models = false;
   torch::Tensor dummy_hidden;

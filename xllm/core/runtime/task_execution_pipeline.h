@@ -107,6 +107,7 @@ struct SpeculativeTaskCapacity {
   DraftSamplingMode draft_sampling_mode = DraftSamplingMode::GREEDY;
   bool unified_graph = false;
   bool adaptive_dspark = false;
+  bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;
   double adaptive_min_gain = 0.0;
   // Startup calibration installs identical immutable costs on sampling ranks.
@@ -320,6 +321,7 @@ class TaskExecutionPipeline final {
   const SampleOutput& sample(Sampling& sampling, torch::Tensor& logits);
   Status validate_input(SpeculativeSlot& slot, const LlmForwardInput& input);
   Status plan_sampling(SpeculativeSlot& slot, const LlmForwardInput& input);
+  uint32_t draft_calls(const SpeculativeSlot& slot) const;
   Status validate_bootstrap(const LlmForwardInput& input) const;
   void prepare_bootstrap(SpeculativeSlot& slot, const LlmForwardInput& input);
   void apply_bootstrap(SpeculativeSlot& slot);
@@ -347,6 +349,7 @@ class TaskExecutionPipeline final {
                                         bool suppress_kv_writes);
   std::optional<std::string> dspark_calibration_impl(
       const DSparkCalibrationCommand& command);
+  std::optional<std::string> draft_step_calibration_geometry() const;
   void consume_adaptive_dspark(SpeculativeSlot& slot);
   void trace_adaptive_dspark(const SpeculativeSlot& slot,
                              const torch::Tensor& accepted_lengths) const;

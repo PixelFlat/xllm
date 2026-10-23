@@ -57,6 +57,8 @@ struct TaskPipelineTestPeer {
         return erased;
       };
   static constexpr auto plan_mtp_decode = SlotBuffer::plan_mtp_decode;
+  static constexpr auto set_mtp_validate_width =
+      SlotBuffer::set_mtp_validate_width;
   static constexpr auto prepare_mtp_decode = SlotBuffer::prepare_mtp_decode;
   static constexpr auto prepare_planned_mtp_decode =
       SlotBuffer::prepare_planned_mtp_decode;

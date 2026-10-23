@@ -94,6 +94,21 @@ using TokenInputTypes =
 TYPED_TEST_SUITE(ForwardSharedMemoryInputTest, TokenInputTypes);
 
 TYPED_TEST(ForwardSharedMemoryInputTest,
+           PackedInputPreservesEngineSelectedMtpDepth) {
+  TypeParam source = make_input<TypeParam>(make_sparse_role_offsets());
+  source.input_params.meta.mtp_draft_steps = 2;
+  source.input_params.meta.mtp_target_graph_rows = 16;
+  proto::PackedForwardInput packed;
+  ASSERT_TRUE(source.to_packed_proto(&packed));
+  TypeParam lazy;
+  ASSERT_TRUE(lazy.from_packed_proto(packed));
+  const TypeParam decoded =
+      lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
+  EXPECT_EQ(decoded.input_params.meta.mtp_draft_steps, 2U);
+  EXPECT_EQ(decoded.input_params.meta.mtp_target_graph_rows, 16U);
+}
+
+TYPED_TEST(ForwardSharedMemoryInputTest,
            PackedProtoPreservesSparseIndexOffsetsAfterSourceRelease) {
   const LayerOffsets expected = make_sparse_role_offsets();
   TypeParam lazy_input;

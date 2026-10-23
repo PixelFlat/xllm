@@ -31,6 +31,9 @@ struct DSparkWindowConfig {
   uint32_t window_steps = 32;
   uint32_t max_windows = 3;
   uint32_t draft_width = 7;
+  // MTP uses the same Host steady-window measurement, but drafts every
+  // position autoregressively rather than pruning a fixed block proposal.
+  bool autoregressive_draft = false;
 };
 
 // Borrowed Host snapshots of a retired Task; no Device reads or timing Events.
