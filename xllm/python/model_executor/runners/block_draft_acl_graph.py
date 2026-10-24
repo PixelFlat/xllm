@@ -421,11 +421,6 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
                 "DSpark ACL graph block_table exceeds the captured page-table capacity: "
                 f"live={max(page_counts)}, capacity={static.block_table.shape[1]}"
             )
-        if (
-            metadata.paged_kv_indices is not None
-            and metadata.paged_kv_indices.numel() > static.paged_kv_indices.numel()
-        ):
-            raise RuntimeError("DSpark ACL graph paged KV indices exceed the captured capacity")
         kv_host = getattr(metadata, "kv_seq_lens_host_values", None)
         if kv_host is None or len(kv_host) != block_table.shape[0]:
             raise ValueError("DSpark ACL graph requires one Host KV length per sequence")
@@ -441,22 +436,24 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         static.slot_mapping[:token_count].copy_(metadata.slot_mapping)
         static.slot_mapping[token_count:].fill_(-1)
         static.block_table.zero_()
+        static.paged_kv_indices.zero_()
+        static.paged_kv_last_page_len.fill_(1)
+        page_offset = 0
         for row, page_count in enumerate(page_counts):
             static.block_table[row, :page_count].copy_(block_table[row, :page_count])
+            # The scheduler's paging tensors may include reserved future
+            # pages. Rebuild the graph-owned compact layout from the live KV
+            # lengths instead of copying that unrelated allocation capacity.
+            static.paged_kv_indptr[row].fill_(page_offset)
+            static.paged_kv_indices[page_offset : page_offset + page_count].copy_(block_table[row, :page_count])
+            static.paged_kv_last_page_len[row].fill_((kv_host[row] - 1) % self._logical_page_size + 1)
+            page_offset += page_count
+        static.paged_kv_indptr[sequence_count:].fill_(page_offset)
         static.kv_seq_lens[:sequence_count].copy_(metadata.kv_seq_lens)
         static.kv_seq_lens[sequence_count:].fill_(1)
         if static.kv_cu_seq_lens is not None:
             static.kv_cu_seq_lens[0].zero_()
             torch.cumsum(static.kv_seq_lens, dim=0, out=static.kv_cu_seq_lens[1:])
-        if metadata.paged_kv_indptr is not None:
-            static.paged_kv_indptr[: sequence_count + 1].copy_(metadata.paged_kv_indptr)
-            static.paged_kv_indptr[sequence_count + 1 :].copy_(metadata.paged_kv_indptr[-1:])
-        if metadata.paged_kv_last_page_len is not None:
-            static.paged_kv_last_page_len[:sequence_count].copy_(metadata.paged_kv_last_page_len)
-            static.paged_kv_last_page_len[sequence_count:].fill_(1)
-        if metadata.paged_kv_indices is not None:
-            static.paged_kv_indices.zero_()
-            static.paged_kv_indices[: metadata.paged_kv_indices.numel()].copy_(metadata.paged_kv_indices)
         static.kv_seq_lens_host_values[:] = kv_host + [1] * (static.block_table.shape[0] - sequence_count)
 
         if not self.attention_backend.is_mla:

@@ -18,6 +18,9 @@ dispatch dependency."""
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import torch
 import torch.nn as nn
 
@@ -52,14 +55,37 @@ class RotaryEmbedding(nn.Module):
         rope_theta: float,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
+        rope_scaling: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+        attention_factor = 1.0
+        scaling = rope_scaling or {}
+        rope_type = scaling.get("rope_type", scaling.get("type", "default"))
+        if rope_type == "yarn":
+            factor = float(scaling["factor"])
+            original_max = int(scaling["original_max_position_embeddings"])
+            if factor <= 0 or original_max <= 0:
+                raise ValueError("YaRN requires positive scaling and original context length")
+            beta_fast = float(scaling.get("beta_fast", 32.0))
+            beta_slow = float(scaling.get("beta_slow", 1.0))
+
+            def correction(rotations: float) -> float:
+                return head_dim * math.log(original_max / (rotations * 2 * math.pi)) / (2 * math.log(rope_theta))
+
+            low = max(math.floor(correction(beta_fast)), 0)
+            high = min(math.ceil(correction(beta_slow)), head_dim - 1)
+            denominator = high - low if high != low else 0.001
+            ramp = ((torch.arange(head_dim // 2, dtype=torch.float32, device=device) - low) / denominator).clamp(0, 1)
+            inv_freq = inv_freq * ((1 - ramp) + ramp / factor)
+            attention_factor = float(scaling.get("attention_factor") or (0.1 * math.log(factor) + 1.0))
+        elif rope_type != "default":
+            raise NotImplementedError(f"unsupported Qwen RoPE type: {rope_type}")
         t = torch.arange(max_position, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)  # [max_position, head_dim/2]
-        cos_half = freqs.cos()  # [max_position, head_dim/2]
-        sin_half = freqs.sin()
+        cos_half = freqs.cos() * attention_factor  # [max_position, head_dim/2]
+        sin_half = freqs.sin() * attention_factor
         if dtype is not None:
             cos_half = cos_half.to(dtype)
             sin_half = sin_half.to(dtype)

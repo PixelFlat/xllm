@@ -45,6 +45,9 @@ inline void invalidate_draft_model_geometry(LlmModelParams& input_params) {
   // sparse tiling values such as ori_win_left into opaque tensors. A draft
   // input copied from the target must rebuild those tensors for draft geometry.
   input_params.attn_metadata.reset();
+  // Block drafters own no recurrent layers. Target slots and validity masks
+  // must not reach the draft metadata builder, including during graph warmup.
+  input_params.clear_linear_attention_state();
 }
 
 enum class DSparkSasMode : uint8_t {
@@ -71,7 +74,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                    const torch::Device& device,
                    const runtime::Options& options);
 
-  ~DFlashWorkerImpl() override = default;
+  ~DFlashWorkerImpl() override;
 
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
@@ -81,6 +84,13 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
 
   ::xllm::Status create_task_pipeline(
       std::unique_ptr<TaskExecutionPipeline>& output) override;
+  bool uses_worker_task_pipeline() const override {
+    return target_is_hybrid_recurrent_;
+  }
+  void prepare_task_pipeline_input(const LlmForwardInput& input,
+                                   LlmForwardInput& prepared) override;
+  std::optional<ForwardOutput> execute_task_pipeline(
+      const LlmForwardInput& prepared) override;
 
  protected:
   std::optional<ForwardOutput> step_prefill(
@@ -125,6 +135,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   bool draft_use_block_parallel_rows() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::COMPATIBILITY;
   }
+
   BatchForwardType draft_batch_forward_type() const {
     return draft_sas_mode_ == dflash_detail::DSparkSasMode::NATIVE
                ? BatchForwardType::DECODE
@@ -169,6 +180,11 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   bool target_is_hybrid_recurrent_ = false;
   dflash_detail::DSparkSasMode draft_sas_mode_ =
       dflash_detail::DSparkSasMode::NOT_DSPARK;
+
+ private:
+  // Launch-thread-owned JSON context; never borrows a retired result Slot.
+  ForwardOutput task_json_output_;
+  std::vector<std::string> task_json_sample_sequence_ids_;
 };
 
 }  // namespace xllm

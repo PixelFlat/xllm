@@ -76,11 +76,25 @@ void broadcast_spec_tokens(torch::Tensor& tokens,
   pg->broadcast(tokens, root_rank);
 }
 
+bool uses_hybrid_worker_pipeline(const runtime::Options& options) {
+  if (!options.enable_task_pipeline() || !Platform::is_npu()) {
+    return false;
+  }
+  const std::string model_type =
+      get_model_type(options.model_path(), options.backend());
+  return model_type == "qwen3_5" || model_type == "qwen3_5_text";
+}
+
 runtime::Options target_options(const runtime::Options& options) {
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
       .is_draft_engine(false)
       .enable_graph_aux_hidden_states(true);
+  if (uses_hybrid_worker_pipeline(options)) {
+    // The outer worker owns the task queue. Its leaf executors retain their
+    // recurrent-aware ACL runners instead of borrowing full-attention Slots.
+    opts.enable_task_pipeline(false);
+  }
   return opts;
 }
 
@@ -89,15 +103,22 @@ runtime::Options draft_options(const runtime::Options& options) {
   // DFlash-style drafts still run one step at a time.
   const bool is_dspark =
       SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm());
+  const bool hybrid_pipeline = uses_hybrid_worker_pipeline(options);
+  const bool is_dflash2 =
+      SpeculativeConfig::is_dflash2_algorithm(options.speculative_algorithm());
   const int32_t draft_num_speculative_tokens =
       is_dspark ? options.num_speculative_tokens() : 0;
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
       .is_draft_engine(true)
-      .num_decoding_tokens(1)
+      .num_decoding_tokens(hybrid_pipeline && is_dflash2
+                               ? options.num_speculative_tokens() + 1
+                               : 1)
       .num_speculative_tokens(draft_num_speculative_tokens)
       .enable_graph_aux_hidden_states(false);
-  if (options.enable_task_pipeline() && !is_dspark) {
+  if (hybrid_pipeline) {
+    opts.enable_task_pipeline(false);
+  } else if (options.enable_task_pipeline() && !is_dspark) {
     opts.enable_graph(false);
   }
   return opts;
@@ -349,8 +370,37 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
          "pipeline.";
 }
 
+DFlashWorkerImpl::~DFlashWorkerImpl() {
+  // Keep launch-thread-owned context alive until queued execution completes.
+  drain_pending_execution();
+}
+
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
+  if (target_is_hybrid_recurrent_) {
+    if (!uses_hybrid_worker_pipeline(options_) || !options_.enable_graph() ||
+        options_.enable_adaptive_target_verify() ||
+        parallel_args_.dp_size() != 1) {
+      return ::xllm::Status(
+          StatusCode::INVALID_ARGUMENT,
+          "Hybrid block task pipeline requires fixed-width Qwen3.5 Python "
+          "ACL graphs with DP=1.");
+    }
+    LlmTaskCapacity capacity;
+    ::xllm::Status status = impl_->task_capacity(options_, capacity);
+    if (!status.ok()) {
+      return status;
+    }
+    status = TaskExecutionPipeline::create(
+        threadpool_, impl_->task_model(), *this, capacity, output);
+    if (status.ok()) {
+      LOG(INFO) << options_.speculative_algorithm()
+                << " hybrid worker task execution pipeline: slots="
+                << capacity.slot_count
+                << ", speculative_tokens=" << options_.num_speculative_tokens();
+    }
+    return status;
+  }
   if (impl_ == nullptr || draft_impl_ == nullptr ||
       (options_.enable_adaptive_target_verify() &&
        !SpeculativeConfig::is_dspark_algorithm(
@@ -435,6 +485,58 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
             << ", pinned_bytes=" << output->pinned_bytes()
             << ", device_bytes=" << output->device_bytes();
   return ::xllm::Status();
+}
+
+void DFlashWorkerImpl::prepare_task_pipeline_input(const LlmForwardInput& input,
+                                                   LlmForwardInput& prepared) {
+  // Prepare owns only transport storage. The target leaf restores recurrent
+  // state on the ordered execution stream, after preceding model work.
+  prepare_input_on_stream(input,
+                          prepared,
+                          *prepare_stream_,
+                          /*record_ready_event=*/true,
+                          /*restore_linear_state=*/false,
+                          /*wait_for_compute_stream=*/false);
+}
+
+std::optional<ForwardOutput> DFlashWorkerImpl::execute_task_pipeline(
+    const LlmForwardInput& prepared) {
+  // A worker-owned queue must not use the driver's legacy last-step slot.
+  if (!enable_schedule_overlap() || prepared.json_object_states.empty()) {
+    task_json_output_ = ForwardOutput();
+    task_json_sample_sequence_ids_.clear();
+    return step(prepared);
+  }
+  LlmForwardInput input = prepared.clone();
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK(compute_stream_->wait_event(input.runtime.metadata_ready_event));
+  if (input.token_ids.numel() > 0 &&
+      input.input_params.meta.batch_forward_type.has_decode()) {
+    update_json_object_states_by_output(
+        input, task_json_output_, task_json_sample_sequence_ids_);
+    sanitize_json_object_error_inputs(input);
+  }
+  auto output = step(input);
+  task_json_output_ = ForwardOutput();
+  task_json_sample_sequence_ids_.clear();
+  if (output.has_value()) {
+    output->json_object_errors.insert(output->json_object_errors.end(),
+                                      input.json_object_errors.begin(),
+                                      input.json_object_errors.end());
+    if (output->sample_output.next_tokens.defined()) {
+      if (output->ready_event != nullptr) {
+        CHECK(output->ready_event->synchronize());
+      }
+      task_json_output_.sample_output.next_tokens =
+          safe_to(
+              output->sample_output.next_tokens,
+              torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
+              /*non_blocking=*/false)
+              .clone();
+      task_json_sample_sequence_ids_ = input.sample_sequence_ids;
+    }
+  }
+  return output;
 }
 
 bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,

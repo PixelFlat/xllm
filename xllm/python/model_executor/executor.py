@@ -19,6 +19,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
+from scripts.logger import logger
 from xllm.python import distributed
 from xllm.python.attention.backend import (
     AttentionBackend,
@@ -360,6 +361,7 @@ class ModelExecutor:
         if self.layerwise_split_size > 1 and config.get("model_type") != "glm_moe_dsa":
             raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
         self.decode_graph_runner = None
+        self._serving_acl_graph_logged = False
         self.prepared_graph_runner = None
         self.context_kv_graph_runner = None
         self.inductor_runner = None
@@ -373,6 +375,7 @@ class ModelExecutor:
         self.dp_size = dp_size
         self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
         self._prepared_dspark = config.get("model_type") in ("DSparkDraftModel", "glm5_dspark")
+        self._independent_block_draft = self._prepared_dspark or config.get("model_type") == "DFlash2DraftModel"
         self._prepared_block_draft = self._prepared_dspark or config.get("model_type") in (
             "DFlashDraftModel",
             "DFlash2DraftModel",
@@ -423,13 +426,18 @@ class ModelExecutor:
                 dp_rank,
             )
         elif graph_backend == "aclgraph":
-            if self._prepared_dspark:
+            if self._independent_block_draft:
                 from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAclGraphRunner
 
                 self.context_kv_graph_runner = ContextKvAclGraphRunner(model, device)
-                self._context_kv_draft_width = int(config.get("num_speculative_tokens", num_decoding_tokens))
+                self._context_kv_draft_width = (
+                    int(config.get("num_speculative_tokens", num_decoding_tokens))
+                    if self._prepared_dspark
+                    else int(model.cfg.block_size) - 1
+                )
                 if self._context_kv_draft_width <= 0:
-                    raise ValueError("DSpark context graphs require a positive speculative block width")
+                    raise ValueError("block-draft context graphs require a positive speculative width")
+                self._context_kv_query_width = self._context_kv_draft_width + int(not self._prepared_dspark)
             from xllm.python.model_executor.runners.block_draft_acl_graph import (
                 BlockDraftAclGraphRunner,
             )
@@ -469,7 +477,7 @@ class ModelExecutor:
                     block_draft=self._prepared_dspark,
                 )
             else:
-                if self._prepared_dspark:
+                if self._independent_block_draft:
                     self.decode_graph_runner = BlockDraftAclGraphRunner(
                         execution_model,
                         self.attention_backend,
@@ -864,7 +872,8 @@ class ModelExecutor:
             # Capture every accepted-row bucket up to the N+1 verify capacity,
             # including prefixes not encountered in the synthetic warmup.
             width = self._context_kv_draft_width
-            sequences = (input_ids.numel() + width - 1) // width
+            query_width = self._context_kv_query_width
+            sequences = (input_ids.numel() + query_width - 1) // query_width
             self.context_kv_graph_runner.warmup(sequences * (width + 1))
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
@@ -964,7 +973,7 @@ class ModelExecutor:
                 )
                 if graph_key is not None:
                     graph_kwargs["graph_key"] = graph_key
-            return graph_runner.execute(
+            output = graph_runner.execute(
                 input_ids,
                 positions,
                 metadata,
@@ -972,6 +981,19 @@ class ModelExecutor:
                 **graph_kwargs,
                 eplb=eplb,
             )
+            if (
+                isinstance(graph_runner, DecodeAclGraphRunner)
+                and not is_graph_warmup
+                and not self._serving_acl_graph_logged
+            ):
+                logger.info(
+                    "Python serving ACL graph replay: model=%s runner=%s rows=%d",
+                    type(self.model).__name__,
+                    type(graph_runner).__name__,
+                    input_ids.numel(),
+                )
+                self._serving_acl_graph_logged = True
+            return output
         if mtp_topk_indices is None and self.inductor_runner is not None and layer_synchronizer is None:
             return self.inductor_runner.execute(
                 input_ids,

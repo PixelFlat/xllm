@@ -1776,15 +1776,23 @@ TEST(AuxHiddenCaptureTest, PreservesConfiguredLayerOrderAndResidual) {
                            torch::full({3, 2}, 20.0f)));
 }
 
-TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionMetadataOnly) {
+TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionAndRecurrentMetadata) {
   LlmModelParams params;
   params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
   params.multi_block_tables.resize(3);
+  params.embedding.linear_state_ids = {4};
+  params.embedding.linear_state_indices = torch::tensor({4}, torch::kInt32);
+  params.linear_state_validity_mask = {1};
+  params.linear_state_cache_ops.resize(1);
 
   dflash_detail::invalidate_draft_model_geometry(params);
 
   EXPECT_EQ(params.attn_metadata, nullptr);
   EXPECT_EQ(params.multi_block_tables.size(), 3);
+  EXPECT_TRUE(params.embedding.linear_state_ids.empty());
+  EXPECT_FALSE(params.embedding.linear_state_indices.defined());
+  EXPECT_TRUE(params.linear_state_validity_mask.empty());
+  EXPECT_TRUE(params.linear_state_cache_ops.empty());
 }
 
 TEST(DSparkWorkerInputTest, ScalesPaddedAndRawDpTokenCountsTogether) {

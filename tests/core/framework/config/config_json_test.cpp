@@ -553,8 +553,7 @@ TEST(ModelConfigValidationTest, RejectsQwen35PythonSpeculativeDecode) {
           "python", "qwen3_5_moe_text", 4, "MTP");
 
   ASSERT_TRUE(error.has_value());
-  EXPECT_NE(error->find("does not support speculative decoding"),
-            std::string::npos);
+  EXPECT_NE(error->find("supports dense NPU"), std::string::npos);
   EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
                   "py", "qwen3_5_text", 1, "Eagle3")
                   .has_value());
@@ -571,6 +570,36 @@ TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
                    "python", "qwen3", 4, "MTP")
                    .has_value());
 }
+
+#if defined(USE_NPU)
+TEST(ModelConfigValidationTest, AcceptsDenseQwen35PythonBlockDrafts) {
+  for (const std::string_view algorithm : {"DFlash2", "DSpark"}) {
+    EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                     "python", "qwen3_5_text", 7, algorithm)
+                     .has_value());
+    EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                    "python", "qwen3_5_moe_text", 7, algorithm)
+                    .has_value());
+    EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                    "python", "qwen3_5_text", 17, algorithm)
+                    .has_value());
+  }
+}
+
+TEST(ModelConfigValidationTest, PreservesDenseQwen35PythonMtpAdmission) {
+  for (const std::string_view model_type :
+       {"qwen3_5", "qwen3_5_text", "qwen3_5_mtp"}) {
+    for (const int32_t width : {1, 3, 16}) {
+      EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
+                       "python", model_type, width, "MTP")
+                       .has_value());
+    }
+    EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
+                    "python", model_type, 17, "MTP")
+                    .has_value());
+  }
+}
+#endif
 
 TEST(ModelConfigValidationTest, AcceptsGlmPythonMtpWithSpeculativeTokens) {
   struct Case {

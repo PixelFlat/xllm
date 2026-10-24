@@ -34,6 +34,7 @@ from xllm.python.model_loader import (
     gqa_head_split,
     load_causal_lm_weights,
 )
+from xllm.python.models.aux_hidden_capture import AuxHiddenCapture
 from xllm.python.models.base import PyModelBase
 
 
@@ -85,6 +86,7 @@ class Qwen3_5Config:
     flashcomm1_min_prefill_tokens: int = 8192
     enable_mmrs_fusion: bool = False
     mmrs_comm_mode: str = "aiv"
+    layers_to_capture: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3_5Config:
@@ -176,6 +178,7 @@ class Qwen3_5Config:
             flashcomm1_min_prefill_tokens=int(pick("flashcomm1_min_prefill_tokens", default=8192)),
             enable_mmrs_fusion=bool(pick("enable_mmrs_fusion", default=False)),
             mmrs_comm_mode=str(pick("mmrs_comm_mode", default="aiv")),
+            layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
         )
 
     def validate(self) -> None:
@@ -313,8 +316,11 @@ class Qwen3_5Model(nn.Module):
             device=device,
         )
         self._inputs_embeds: torch.Tensor | None = None
+        self.aux_hidden_capture = AuxHiddenCapture(cfg.layers_to_capture)
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self._inputs_embeds is None:
             hidden = self.embed_tokens(input_ids)
         else:
@@ -324,13 +330,17 @@ class Qwen3_5Model(nn.Module):
         if flash_comm1 is not None:
             hidden = flash_comm1.shard(hidden)
         residual: torch.Tensor | None = None
+        aux_hidden_buffer = self.aux_hidden_capture.create_buffer(hidden)
         for layer_id, layer in enumerate(self.layers):
             hidden, residual = layer(hidden, residual, positions)
+            self.aux_hidden_capture.capture_layer(layer_id, hidden, residual, aux_hidden_buffer)
             record_layer_event(layer_id)
         hidden, _ = self.norm(hidden, residual)
         if flash_comm1 is not None:
             hidden = flash_comm1.gather(hidden)
-        return hidden
+            if aux_hidden_buffer is not None:
+                aux_hidden_buffer = flash_comm1.gather(aux_hidden_buffer)
+        return self.aux_hidden_capture.finalize(hidden, aux_hidden_buffer)
 
 
 class Qwen3_5ForCausalLM(PyModelBase):

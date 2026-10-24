@@ -333,6 +333,14 @@ REGISTER_MODEL_ARGS(qwen3, [&] {
   }();
   LOAD_ARG_OR(rope_theta, "rope_theta", 1000000.0f);
   LOAD_ARG_OR(rope_theta, "rope_parameters.rope_theta", args->rope_theta());
+  LOAD_ARG_OR(rope_scaling_rope_type, "rope_scaling.rope_type", "");
+  LOAD_ARG_OR(rope_scaling_factor, "rope_scaling.factor", 0.0f);
+  LOAD_ARG_OR(rope_scaling_original_max_position_embeddings,
+              "rope_scaling.original_max_position_embeddings",
+              0);
+  LOAD_ARG_OR(rope_scaling_beta_fast, "rope_scaling.beta_fast", 32);
+  LOAD_ARG_OR(rope_scaling_beta_slow, "rope_scaling.beta_slow", 1);
+  LOAD_ARG_OR(rope_scaling_attn_factor, "rope_scaling.attention_factor", 0.0f);
 
   // For qwen3/2.5 model < 7B,  tie_word_embeddings = true
   LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);

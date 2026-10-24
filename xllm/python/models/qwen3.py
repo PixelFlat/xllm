@@ -24,7 +24,7 @@ The model does not import FlashInfer, own wrappers, or call plan.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
@@ -77,6 +77,7 @@ class Qwen3Config:
     dp_rank: int = 0
     layers_to_capture: tuple[int, ...] = ()
     mrope_section: Sequence[int] = ()
+    rope_scaling: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> Qwen3Config:
@@ -88,6 +89,13 @@ class Qwen3Config:
 
         hidden = int(pick("hidden_size", default=1024))
         n_heads = int(pick("n_heads", "num_attention_heads", default=16))
+        rope_scaling = d.get("rope_scaling")
+        if not isinstance(rope_scaling, dict):
+            # ModelArgs also has an unrelated legacy integer rope_scaling
+            # property. Only HF dictionaries describe rotary cache scaling.
+            rope_scaling = d.get("rope_parameters")
+        if not isinstance(rope_scaling, dict):
+            rope_scaling = {}
         return cls(
             hidden_size=hidden,
             n_layers=int(pick("n_layers", "num_hidden_layers", default=28)),
@@ -107,6 +115,7 @@ class Qwen3Config:
             dp_size=int(pick("dp_size", default=1)),
             dp_rank=int(pick("dp_rank", default=0)),
             layers_to_capture=tuple(int(layer_id) for layer_id in pick("layers_to_capture", default=[])),
+            rope_scaling=dict(rope_scaling),
         )
 
     def head_split(self) -> tuple[int, int]:
@@ -311,6 +320,7 @@ class Qwen3Model(nn.Module):
             cfg.rope_theta,
             dtype=dtype,
             device=device,
+            rope_scaling=cfg.rope_scaling,
         )
         self.layers = cast(
             Sequence[Qwen3DecoderLayer],

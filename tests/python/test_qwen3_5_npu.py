@@ -147,6 +147,30 @@ def test_npu_decoder_factory_selects_privateuseone_backend() -> None:
     assert NpuQwen3_5DecoderLayer.normalization_cls is NpuGemmaRMSNorm
 
 
+@pytest.mark.parametrize("layer_type", ["full_attention", "linear_attention"])
+def test_npu_decoder_forward_does_not_require_tilelang_compiler(
+    layer_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _linear_config(
+        layer_types=[layer_type],
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    layer = NpuQwen3_5DecoderLayer(cfg, 0, torch.bfloat16, torch.device("cpu"), MagicMock())
+    hidden = torch.ones(2, cfg.hidden_size, dtype=torch.bfloat16)
+    monkeypatch.setattr(layer.input_layernorm, "forward", MagicMock(return_value=hidden))
+    monkeypatch.setattr(layer.post_attention_layernorm, "forward", MagicMock(return_value=(hidden, hidden)))
+    attention = layer.self_attn if layer_type == "full_attention" else layer.linear_attn
+    monkeypatch.setattr(attention, "forward", MagicMock(return_value=hidden))
+    monkeypatch.setattr(layer.mlp, "forward", MagicMock(return_value=hidden))
+    monkeypatch.setitem(sys.modules, "tilelang", None)
+
+    output, residual = layer(hidden, None, torch.arange(2))
+
+    torch.testing.assert_close(output, hidden)
+    torch.testing.assert_close(residual, hidden)
+
+
 def test_npu_gemma_rms_norm_uses_fused_residual_operator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -527,6 +551,8 @@ def test_npu_decode_uses_mega_fusion_boundary(monkeypatch: pytest.MonkeyPatch) -
         q_seq_lens_host=None,
         is_prefill=False,
         is_chunked_prefill=False,
+        is_dummy=False,
+        is_spec_verify=False,
     )
     context = ForwardContext(
         attention_backend=None,
@@ -634,6 +660,8 @@ def test_npu_gdn_uses_npu_prefill_fusion_boundary(monkeypatch: pytest.MonkeyPatc
         q_seq_lens_host=torch.tensor([1], dtype=torch.int32),
         is_prefill=True,
         is_chunked_prefill=False,
+        is_dummy=False,
+        is_spec_verify=False,
     )
     context = ForwardContext(
         attention_backend=None,
@@ -712,6 +740,8 @@ def test_npu_mega_prefill_metadata_is_shared_within_one_forward() -> None:
         slot_mapping=torch.zeros(256, dtype=torch.int32),
         is_prefill=True,
         is_chunked_prefill=False,
+        is_dummy=False,
+        is_spec_verify=False,
     )
     context = ForwardContext(
         None,

@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
+#include "core/platform/platform.h"
 #include "core/runtime/py_attention_metadata.h"
 #include "core/runtime/slot_buffer.h"
 #include "core/util/pybind_helper.h"
@@ -225,7 +226,12 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       SpeculativeConfig::requires_aux_hidden_capture(
           options_.speculative_algorithm());
   executor_config["enable_task_pipeline"] = options_.enable_task_pipeline();
-  if (options_.enable_task_pipeline()) {
+  // DFlash2 defaults to eager in the model config. Hybrid worker pipelines
+  // explicitly enable its independent full-block ACL runner on the leaf.
+  const bool independent_block_graph =
+      Platform::is_npu() && is_dflash2_draft_model_type(args_.model_type()) &&
+      options_.enable_graph() && options_.num_decoding_tokens() > 1;
+  if (options_.enable_task_pipeline() || independent_block_graph) {
     executor_config["enable_graph"] = options_.enable_graph();
     executor_config["python_graph_backend"] =
         options_.enable_graph() ? "aclgraph" : "off";

@@ -697,6 +697,38 @@ TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {
   EXPECT_TRUE(args.confidence_head_with_markov());
 }
 
+TEST(HFModelLoaderTest, Qwen38DSparkPreservesYarnGeometry) {
+  auto loader = ModelRegistry::get_model_args_loader("qwen3");
+  ASSERT_NE(loader, nullptr);
+  JsonReader reader;
+  ASSERT_TRUE(reader.parse_text(R"json(
+    {
+      "model_type": "qwen3",
+      "hidden_size": 5120,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128,
+      "sliding_window": null,
+      "rope_theta": 10000000,
+      "rope_scaling": {
+        "rope_type": "yarn",
+        "factor": 32.0,
+        "original_max_position_embeddings": 8192,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0
+      }
+    }
+  )json"));
+  ModelArgs args;
+  ASSERT_TRUE(loader(reader, &args));
+  EXPECT_EQ(args.head_dim(), 128);
+  EXPECT_EQ(args.rope_scaling_rope_type(), "yarn");
+  EXPECT_FLOAT_EQ(args.rope_scaling_factor(), 32.0f);
+  EXPECT_EQ(args.rope_scaling_original_max_position_embeddings(), 8192);
+  EXPECT_EQ(args.rope_scaling_beta_fast(), 32);
+  EXPECT_EQ(args.rope_scaling_beta_slow(), 1);
+}
+
 TEST(HFModelLoaderTest, Qwen3DFlash2AcceptsArrayEosTokenIds) {
   for (const char* model_name : {"qwen3", "qwen3_atb"}) {
     auto loader = ModelRegistry::get_model_args_loader(model_name);

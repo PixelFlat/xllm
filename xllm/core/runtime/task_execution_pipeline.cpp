@@ -165,9 +165,10 @@ Status TaskExecutionPipeline::create(
     return invalid("Worker task pipeline supports one or two slots.");
   }
 
-  if (!target.executor.supports_prepared_attention_metadata()) {
+  if (!target.executor.supports_prepared_attention_metadata() &&
+      target.executor.python_impl() == nullptr) {
     return invalid(
-        "Worker task pipeline requires prepared attention metadata support.");
+        "Worker task pipeline requires Python or prepared attention metadata.");
   }
   c10::DeviceGuard guard(target.model.device());
   auto pipeline = std::unique_ptr<TaskExecutionPipeline>(

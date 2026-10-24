@@ -43,6 +43,7 @@ limitations under the License.
 #include "core/framework/speculative/adaptive/spec_cost_profile_store.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/runtime/dflash_worker_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "core/runtime/unified_mtp_worker_impl.h"
@@ -673,6 +674,32 @@ class JsonTaskTestWorker final : public UnifiedMtpWorkerImpl {
 
   int64_t next_token = 0;
   bool with_output = true;
+  std::vector<int32_t> observed_tokens;
+
+ private:
+  static runtime::Options options() {
+    runtime::Options result;
+    result.enable_schedule_overlap(true);
+    return result;
+  }
+};
+
+class HybridBlockTaskTestWorker final : public DFlashWorkerImpl {
+ public:
+  explicit HybridBlockTaskTestWorker(const torch::Device& device)
+      : DFlashWorkerImpl(ParallelArgs(0, 1, 1, nullptr), device, options()) {
+    target_is_hybrid_recurrent_ = true;
+  }
+
+  std::optional<ForwardOutput> step(const LlmForwardInput& input) override {
+    observed_tokens = input.json_object_states.front().snapshot().token_ids;
+    ForwardOutput output;
+    output.sample_output.next_tokens =
+        torch::tensor({next_token}, torch::kInt64);
+    return output;
+  }
+
+  int64_t next_token = 0;
   std::vector<int32_t> observed_tokens;
 
  private:
@@ -4021,6 +4048,30 @@ TEST_F(SpeculativePipelineTest, UnifiedTaskAdvancesJsonFromOwnedPriorTokens) {
   ASSERT_EQ(missing->json_object_errors.size(), 1U);
   EXPECT_EQ(missing->json_object_errors.front().sample_sequence_id,
             "new-json#0");
+}
+
+TEST_F(SpeculativePipelineTest, HybridBlockTaskPreservesJsonAcrossRetirement) {
+  HybridBlockTaskTestWorker worker(device_);
+  EXPECT_TRUE(worker.uses_worker_task_pipeline());
+  JsonObjectGrammar grammar({"{", "}", "stop"}, {2});
+  auto prefill = input(false);
+  prefill.json_object_states = {grammar.initial_state()};
+  prefill.sample_sequence_ids = {"hybrid-json#0"};
+  prefill.sample_prior_output_rows = {-1};
+  auto first = worker.execute_task_pipeline(prefill);
+  ASSERT_TRUE(first.has_value());
+  first->sample_output.next_tokens.fill_(2);
+
+  auto decode = input(true);
+  decode.json_object_states = {grammar.initial_state()};
+  decode.sample_sequence_ids = {"hybrid-json#0"};
+  decode.sample_prior_output_rows = {0};
+  worker.next_token = 1;
+  auto second = worker.execute_task_pipeline(decode);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_TRUE(second->json_object_errors.empty());
+  EXPECT_EQ(worker.observed_tokens, (std::vector<int32_t>{0}));
+  EXPECT_TRUE(decode.json_object_states.front().snapshot().token_ids.empty());
 }
 
 TEST_F(SpeculativePipelineTest, MinimumLengthConstrainsTargetButNotDraft) {

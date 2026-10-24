@@ -32,7 +32,9 @@ DEFINE_bool(enable_task_pipeline,
             "scheduler overlap and one slot without it. "
             "Python eager/ACL Graph models with prepared attention metadata; "
             "Supports DP, or GLM DSA DCP with DP=1 for ordinary/fixed MTP "
-            "decoding. CP/layerwise split are unsupported.");
+            "decoding. Qwen3.5-family hybrid DFlash2/DSpark uses worker-owned "
+            "fixed-width ACL graphs with DP=1. CP/layerwise split are "
+            "unsupported.");
 
 DEFINE_bool(
     enable_graph,
@@ -271,8 +273,11 @@ DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
              SpeculativeConfig::is_dspark_algorithm(speculative_algorithm)) {
     config.draft_shapes.emplace_back(
         DraftGraphWarmupShape{num_speculative_tokens, true});
+  } else if (enable_task_pipeline() &&
+             SpeculativeConfig::is_dflash2_algorithm(speculative_algorithm)) {
+    config.draft_shapes.emplace_back(
+        DraftGraphWarmupShape{num_speculative_tokens + 1, true});
   }
-  // Non-DSpark block drafts currently disable independent draft graphs.
   return config;
 }
 

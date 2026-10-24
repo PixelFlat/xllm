@@ -836,6 +836,8 @@ class DecodeAclGraphRunner(AclGraphRunner):
         linear_snapshot = []
         backend_snapshot = None
         if idx is not None:
+            # Scheduler indices are int32, but index_copy_ restores with int64.
+            idx = idx.to(torch.int64)
             for cache in self.layer_caches:
                 if (conv := cache.conv) is not None and (ssm := cache.ssm) is not None:
                     # GDN stores S SSM checkpoints for each Conv slot. Save

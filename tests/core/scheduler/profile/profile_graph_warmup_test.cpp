@@ -453,7 +453,11 @@ TEST(DecodeGraphWarmupPlanTest, ResolvesIndependentDraftInvocationShapes) {
     EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, width);
     EXPECT_TRUE(config.draft_shapes.front().bucket_by_sequence);
   }
-  for (const std::string algorithm : {"DFlash", "DFlash2", "Suffix"}) {
+  config = execution.decode_graph_warmup_config(7, false, "DFlash2");
+  ASSERT_EQ(config.draft_shapes.size(), 1);
+  EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 8);
+  EXPECT_TRUE(config.draft_shapes.front().bucket_by_sequence);
+  for (const std::string algorithm : {"DFlash", "Suffix"}) {
     EXPECT_TRUE(execution.decode_graph_warmup_config(7, false, algorithm)
                     .draft_shapes.empty());
   }

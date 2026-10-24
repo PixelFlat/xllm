@@ -66,6 +66,17 @@ class DFlashQwen3Config(Qwen3Config):
         rope_parameters = d.get("rope_parameters") or {}
         if normalized_config.get("rope_theta") is None:
             normalized_config["rope_theta"] = rope_parameters.get("rope_theta")
+        if d.get("rope_scaling_rope_type"):
+            normalized_config["rope_scaling"] = {
+                "rope_type": d["rope_scaling_rope_type"],
+                "factor": d["rope_scaling_factor"],
+                "original_max_position_embeddings": d["rope_scaling_original_max_position_embeddings"],
+                "beta_fast": d["rope_scaling_beta_fast"],
+                "beta_slow": d["rope_scaling_beta_slow"],
+                "attention_factor": d["rope_scaling_attn_factor"],
+            }
+        if normalized_config.get("sliding_window") is None:
+            normalized_config["sliding_window"] = 0
 
         base = Qwen3Config.from_dict(normalized_config)
         draft_vocab_size = int(d.get("draft_vocab_size") or base.vocab_size)

@@ -26,7 +26,7 @@ from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.csa_attention import DsaAttentionBackend
 from xllm.python.attention.dsa_metadata import DsaMetadataBuilder, build_cache_specs
 from xllm.python.attention.paged_kv_metadata import build_row_aligned_paged_kv_metadata
-from xllm.python.model_executor.runners.acl_graph import AclGraphEntry
+from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner
 from xllm.python.model_executor.runners.block_draft_acl_graph import (
     BlockDraftAclGraphRunner,
 )
@@ -311,6 +311,47 @@ def test_dspark_graph_capacity_does_not_use_model_maximum() -> None:
     assert entry.static_metadata.kv_seq_lens_host_values == [4096]
 
 
+@pytest.mark.parametrize(("sequence_count", "padded_count"), [(1, 1), (2, 4)])
+def test_block_draft_graph_compacts_reserved_pages_with_live_lengths(sequence_count: int, padded_count: int) -> None:
+    runner = _block_draft_runner(max_batch=4)
+    runner.max_model_len = 1_048_576
+    runner.attention_backend.logical_page_size = 128
+    block_table = torch.arange(1, sequence_count * 128 + 1, dtype=torch.int32).view(sequence_count, 128)
+    metadata = _block_draft_metadata(block_table)
+    lengths = [4095, 129][:sequence_count]
+    metadata.kv_seq_lens = torch.tensor(lengths, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values = lengths
+    input_ids = torch.arange(2 * sequence_count, dtype=torch.int32)
+    entry = runner._allocate_entry(input_ids, input_ids, metadata, sequence_count=padded_count)
+
+    runner._fill_entry(entry, input_ids, input_ids, metadata)
+
+    static = entry.static_metadata
+    assert static.block_table.shape == (padded_count, 32)
+    counts = [(length + 127) // 128 for length in lengths]
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    assert static.paged_kv_indptr.tolist() == offsets + [offsets[-1]] * (padded_count - sequence_count)
+    expected = torch.cat([block_table[row, :count] for row, count in enumerate(counts)])
+    torch.testing.assert_close(static.paged_kv_indices[: expected.numel()], expected)
+    assert not static.paged_kv_indices[expected.numel() :].count_nonzero().item()
+    assert static.paged_kv_last_page_len.tolist() == [127, 1][:sequence_count] + [1] * (padded_count - sequence_count)
+    prepared = static.prepared_attention_state
+    assert prepared.actual_seq_kv == [4096] * padded_count
+
+    # Reuse the same storage for a shorter request and clear all old pages.
+    smaller = _block_draft_metadata(torch.full((1, 128), 500, dtype=torch.int32))
+    smaller.kv_seq_lens.fill_(129)
+    smaller.kv_seq_lens_host_values = [129]
+    runner._fill_entry(entry, input_ids[:2], input_ids[:2], smaller)
+    assert static.paged_kv_indptr.tolist() == [0] + [2] * padded_count
+    assert static.paged_kv_last_page_len.tolist() == [1] * padded_count
+    assert static.paged_kv_indices[:2].tolist() == [500, 500]
+    assert not static.paged_kv_indices[2:].count_nonzero().item()
+    assert prepared.actual_seq_kv == [4096] * padded_count
+
+
 def test_dspark_warmup_captures_once_per_page_capacity_bucket() -> None:
     runner = _block_draft_runner()
     input_ids = torch.arange(2, dtype=torch.int32)
@@ -448,7 +489,7 @@ def test_dspark_graph_replay_clears_stale_page_table_tail() -> None:
     )
     runner._fill_entry(entry, input_ids, positions, second_metadata)
     assert entry.static_metadata.block_table[0].tolist() == [20, 0, 0, 0]
-    assert entry.static_metadata.paged_kv_indices.tolist() == [0, 0, 0, 0]
+    assert entry.static_metadata.paged_kv_indices.tolist() == [20, 0, 0, 0]
 
     with pytest.raises(RuntimeError, match="exceeds the captured page-table capacity"):
         runner._fill_entry(
@@ -462,7 +503,7 @@ def test_dspark_graph_replay_clears_stale_page_table_tail() -> None:
 @pytest.mark.parametrize(
     ("invalid", "error_type", "message"),
     [
-        ("indices_capacity", RuntimeError, "paged KV indices exceed the captured capacity"),
+        ("paged_metadata", ValueError, "paged KV metadata is inconsistent"),
         ("table_capacity", RuntimeError, "exceeds the captured page-table capacity"),
         ("host_lengths", ValueError, "requires one Host KV length per sequence"),
         ("prepared_state", RuntimeError, "prepared attention state is missing"),
@@ -498,9 +539,9 @@ def test_dspark_graph_validation_preserves_static_inputs(
     old_kv_lengths = list(prepared.actual_seq_kv)
     invalid_metadata = _block_draft_metadata(torch.tensor([[20]], dtype=torch.int32))
     invalid_metadata.slot_mapping.add_(100)
-    if invalid == "indices_capacity":
+    if invalid == "paged_metadata":
         invalid_metadata.paged_kv_indices = torch.arange(5, dtype=torch.int32)
-        invalid_metadata.paged_kv_indptr = torch.tensor([0, 5], dtype=torch.int32)
+        invalid_metadata.paged_kv_indptr = torch.tensor([0, 4], dtype=torch.int32)
     elif invalid == "table_capacity":
         invalid_metadata = _block_draft_metadata(torch.zeros(1, 5, dtype=torch.int32))
     elif invalid == "host_lengths":
@@ -693,6 +734,83 @@ def test_linear_state_indices_use_stable_graph_buffer() -> None:
 
     assert static_indices.data_ptr() == data_ptr
     assert static_indices.tolist() == [4, 8, 12, 16, 0, 0, 0, 0]
+
+
+def test_accepted_counts_refresh_in_stable_graph_buffer() -> None:
+    runner = _runner()
+    runner._has_linear_cache = True
+    runner._model_owns_linear_spec_verify = True
+    input_ids = torch.arange(4, dtype=torch.int32)
+    metadata = _metadata(torch.tensor([1, 2], dtype=torch.int32), rows=4)
+    metadata.q_seq_lens_host = torch.tensor([2, 2], dtype=torch.int32)
+    metadata.q_cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    metadata.expanded_decode_metadata = SimpleNamespace(
+        enabled=True,
+        kv_seq_lens=metadata.kv_seq_lens,
+        block_table=metadata.block_table,
+        paged_kv_indptr=metadata.paged_kv_indptr,
+        paged_kv_indices=metadata.paged_kv_indices,
+        paged_kv_last_page_len=metadata.paged_kv_last_page_len,
+        paged_attention_tiling_data=None,
+        kv_seq_lens_host=None,
+        kv_seq_lens_host_values=metadata.kv_seq_lens_host_values,
+    )
+    metadata.num_accepted_tokens = torch.tensor([1, 2], dtype=torch.int32)
+    metadata.num_accepted_tokens_host_values = (1, 2)
+    entry = runner._allocate_entry(8, input_ids, metadata)
+    counts = entry.static_metadata.num_accepted_tokens
+    pointer = counts.data_ptr()
+    expanded = runner._expanded_verify_view(metadata)
+    assert expanded is not None
+    with patch(
+        "xllm.python.model_executor.runners.decode_acl_graph.kernels.update_decode_graph_metadata",
+        create=True,
+    ):
+        runner._fill_entry(entry, input_ids, input_ids, metadata, 4, None, expanded=expanded)
+        assert counts.tolist() == [1, 2, 1, 1]
+        metadata.num_accepted_tokens = torch.tensor([2, 1], dtype=torch.int32)
+        metadata.num_accepted_tokens_host_values = (2, 1)
+        runner._fill_entry(entry, input_ids, input_ids, metadata, 4, None, expanded=expanded)
+    assert counts.data_ptr() == pointer
+    assert counts.tolist() == [2, 1, 1, 1]
+    assert entry.static_metadata.linear_state_indices.tolist() == [1, 2, 0, 0]
+    assert entry.static_metadata.q_cu_seq_lens.tolist() == [0, 1, 2, 3, 4, 4, 4, 4, 4]
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_capture_restores_all_gdn_checkpoints(index_dtype: torch.dtype) -> None:
+    runner = _runner()
+    indices = torch.tensor([1], dtype=index_dtype)
+    conv = torch.arange(60, dtype=torch.float32).reshape(3, 10, 2)
+    ssm = torch.arange(96, dtype=torch.float32).reshape(24, 1, 2, 2)
+    original_conv, original_ssm = conv.clone(), ssm.clone()
+    runner.layer_caches = [LayerCache(key=None, value=None, conv=conv, ssm=ssm)]
+    runner.attention_backend.snapshot_linear_state = lambda _: None
+    entry = AclGraphEntry()
+    entry.static_metadata = SimpleNamespace(
+        linear_state_indices=indices,
+    )
+    snapshot_rows: list[int] = []
+    index_select = torch.Tensor.index_select
+
+    def record_snapshot(tensor: torch.Tensor, dim: int, selected: torch.Tensor) -> torch.Tensor:
+        snapshot_rows.append(selected.numel())
+        return index_select(tensor, dim, selected)
+
+    def capture(*_: object) -> None:
+        conv[1].fill_(-1)
+        ssm[8:16].fill_(-1)
+
+    with (
+        patch.object(AclGraphRunner, "_capture", side_effect=capture),
+        patch.object(torch.npu, "current_stream", return_value=Mock()),
+        patch.object(torch.Tensor, "index_select", new=record_snapshot),
+    ):
+        runner._capture(entry, Mock())
+
+    torch.testing.assert_close(conv, original_conv)
+    torch.testing.assert_close(ssm, original_ssm)
+    assert snapshot_rows == [1, 8]
 
 
 def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:

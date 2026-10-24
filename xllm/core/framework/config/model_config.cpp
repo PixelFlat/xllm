@@ -177,9 +177,15 @@ std::optional<std::string> ModelConfig::validate_python_speculative_decode(
         num_speculative_tokens <= 16) {
       return std::nullopt;
     }
+    if ((model_type == "qwen3_5" || model_type == "qwen3_5_text") &&
+        (SpeculativeConfig::is_dflash2_algorithm(speculative_algorithm) ||
+         SpeculativeConfig::is_dspark_algorithm(speculative_algorithm)) &&
+        num_speculative_tokens <= 16) {
+      return std::nullopt;
+    }
 #endif
-    return "Qwen3.5 Python speculative decoding supports dense NPU MTP with "
-           "1 to 16 speculative tokens only";
+    return "Qwen3.5 Python speculative decoding supports dense NPU MTP, "
+           "DFlash2 and DSpark with 1 to 16 speculative tokens only";
   }
   return std::nullopt;
 }
