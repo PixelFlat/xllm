@@ -119,6 +119,28 @@ class Qwen3_5GdnMetadataBuilder:
         device = metadata.slot_mapping.device
         if device != self._device:
             raise ValueError("Qwen3.5 GDN input and state caches must use one device")
+        graph = getattr(metadata, "linear_verify_graph", None)
+        if graph is not None:
+            if graph.query_width != self._checkpoint_stride:
+                raise ValueError("Qwen3.5 packed graph width must match the GDN checkpoint stride")
+            batch_size = graph.state_indices.numel()
+            token_count = metadata.slot_mapping.numel()
+            for tensor, count, dtype in (
+                (graph.state_indices, batch_size, torch.int32),
+                (graph.num_accepted_tokens, batch_size, torch.int32),
+                (graph.packed_to_dense, token_count, torch.int64),
+                (graph.dense_to_packed, batch_size * graph.query_width, torch.int64),
+            ):
+                if tensor.shape != (count,) or tensor.dtype != dtype or tensor.device != device:
+                    raise ValueError("Qwen3.5 packed graph requires fixed request indices and token maps")
+            return GdnVerifyMetadata(
+                self._state_caches,
+                graph.state_indices,
+                graph.num_accepted_tokens,
+                graph.query_width,
+                graph.packed_to_dense,
+                graph.dense_to_packed,
+            )
         read_indices, write_indices = resolve_linear_state_io_indices(metadata)
         if read_indices is None or write_indices is None:
             raise RuntimeError("Qwen3.5 GDN requires read/write state indices")
@@ -162,7 +184,17 @@ class Qwen3_5GdnMetadataBuilder:
         host_query_ends = getattr(metadata, "q_cu_seq_lens_host_values", None)
         if host_query_ends and host_query_ends != query_ends and host_query_ends != query_ends[1:]:
             raise ValueError("Qwen3.5 cumulative query lengths do not match host query lengths")
-        if cu_seqlens is None or (cu_seqlens.device.type != "cpu" and not host_query_ends):
+        # Prepared Slots expose B cumulative ends for paged attention. GDN's
+        # packed prefill contract instead includes the initial zero (B+1).
+        native_end_only = (
+            cu_seqlens is not None
+            and cu_seqlens.dim() == 1
+            and cu_seqlens.numel() == len(query_lengths)
+            and host_query_ends == query_ends[1:]
+        )
+        if native_end_only and cu_seqlens.device.type == "cpu" and cu_seqlens.tolist() != query_ends[1:]:
+            raise ValueError("Qwen3.5 cumulative query lengths do not match host query lengths")
+        if cu_seqlens is None or native_end_only or (cu_seqlens.device.type != "cpu" and not host_query_ends):
             cu_seqlens = torch.tensor(query_ends, dtype=torch.int32, device=device)
         if cu_seqlens.dim() != 1 or cu_seqlens.numel() != len(query_lengths) + 1:
             raise ValueError("Qwen3.5 cu_seqlens must contain B+1 entries")

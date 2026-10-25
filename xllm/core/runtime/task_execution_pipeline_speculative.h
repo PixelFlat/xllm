@@ -165,6 +165,12 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     SampleOutput sampled;
   };
 
+  struct Recurrent {
+    torch::Tensor host_state_indices;
+    torch::Tensor state_indices;
+    torch::Tensor accepted_lengths;
+  };
+
   struct Bootstrap {
     torch::Tensor host_rows;
     torch::Tensor row_storage;
@@ -181,6 +187,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   // Immutable until this Slot retires; capacity remains the maximum depth.
   uint32_t draft_steps = 0;
   std::unique_ptr<Adaptive> adaptive;
+  std::unique_ptr<Recurrent> recurrent;
   bool run_models = false;
   torch::Tensor dummy_hidden;
   bool is_warmup = false;
@@ -248,6 +255,8 @@ struct TaskExecutionPipeline::AdaptiveVerifyState {
   std::optional<SpecCalibrationPoint> calibration_point;
   std::unique_ptr<SpecCalibrationSession> calibration_session;
   bool startup_calibration_complete = false;
+  // EMBEDDING-row keyed, updated and gathered only on the FIFO task stream.
+  torch::Tensor accepted_lengths;
 };
 
 }  // namespace xllm

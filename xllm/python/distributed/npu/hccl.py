@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HCCL collectives on the caller's current NPU stream.
+"""HCCL collectives with a bounded current-stream all-reduce fast path.
 
 Buffers must be contiguous and nonempty. AllGather also accepts aligned,
 whole 2D FRACTAL_NZ storage; other collectives require ND. The caller must retain
-the group and buffers through completion and graph replay. Capture requires
-``HCCL_OP_EXPANSION_MODE=AIV``; unsupported execution fails without fallback.
+the group and buffers through completion and graph replay. Direct capture
+requires ``HCCL_OP_EXPANSION_MODE=AIV``. Large all-reduces use c10d's managed
+communication stream because HCCL can select multi-stream AI CPU expansion
+despite that environment setting.
 """
 
 from __future__ import annotations
@@ -25,6 +27,11 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch_npu
+
+# Keep the inline optimization conservative, rather than assuming HCCL's
+# topology- and version-dependent AIV-to-AI-CPU threshold. c10d owns the stream
+# fork/join and buffer lifetimes for larger transfers, including graph capture.
+_CURRENT_STREAM_ALL_REDUCE_MAX_BYTES = 512 * 1024
 
 
 def get_hccl_comm(
@@ -54,7 +61,11 @@ def get_hccl_comm(
 
 def all_reduce_on_current_stream(x: torch.Tensor, group: dist.ProcessGroup) -> None:
     """In-place SUM, preserving the input dtype."""
-    torch.ops.xllm_ops.npu_all_reduce(x, get_hccl_comm(group, x.device))
+    comm = get_hccl_comm(group, x.device)
+    if x.numel() * x.element_size() > _CURRENT_STREAM_ALL_REDUCE_MAX_BYTES:
+        dist.all_reduce(x, group=group)
+        return
+    torch.ops.xllm_ops.npu_all_reduce(x, comm)
 
 
 def all_gather_on_current_stream(

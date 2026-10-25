@@ -87,6 +87,7 @@ struct TaskModel {
   TaskKVPush push_kv = {};
   TaskKVLoad load_kv = {};
   TaskKVFence fence_kv = {};
+  std::function<void(const ModelParamsView&)> restore_request_state = {};
 };
 
 class ProcessGroup;
@@ -111,6 +112,7 @@ struct SpeculativeTaskCapacity {
   bool adaptive_target_verify = false;
   bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;
+  bool hybrid_recurrent_target = false;
   double adaptive_min_gain = 0.0;
   // Startup calibration installs identical immutable costs on sampling ranks.
   std::shared_ptr<const SpecCostProfileStore> adaptive_costs;
@@ -244,7 +246,8 @@ class TaskExecutionPipeline final {
   friend class TaskExecutionPipelineInputTest;
   static Status validate_input(const LlmForwardInput& input,
                                const LlmTaskCapacity& capacity,
-                               bool speculative = false);
+                               bool speculative = false,
+                               bool recurrent = false);
   static std::vector<int64_t> graph_batch_sizes(
       const LlmTaskCapacity& capacity);
   static uint32_t graph_batch_size(const LlmForwardInput& input,
@@ -378,6 +381,8 @@ class TaskExecutionPipeline final {
                               bool& run_models,
                               bool& decode);
   bool block_draft() const;
+  Status prepare_recurrent_state(SpeculativeSlot& slot,
+                                 const LlmForwardInput& input);
   uint32_t context_hidden_size() const;
   void release_outputs(SpeculativeSlot& slot);
 
@@ -398,6 +403,7 @@ class TaskExecutionPipeline final {
   TaskKVPush push_kv_;
   TaskKVLoad load_kv_;
   TaskKVFence fence_kv_;
+  std::function<void(const ModelParamsView&)> restore_request_state_;
   LlmTaskCapacity capacity_;
   Device device_;
   Stream prepare_stream_;

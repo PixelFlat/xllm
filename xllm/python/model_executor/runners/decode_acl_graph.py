@@ -884,20 +884,20 @@ class DecodeAclGraphRunner(AclGraphRunner):
         backend_snapshot = None
         if idx is not None:
             # Scheduler indices are int32, but index_copy_ restores with int64.
-            idx = idx.to(torch.int64)
+            # Padding and synthetic warmup share slot zero. Snapshot each
+            # touched state once, not once per repeated request/token row.
+            idx = torch.unique(idx.to(torch.int64))
             for cache in self.layer_caches:
                 if (conv := cache.conv) is not None and (ssm := cache.ssm) is not None:
                     # GDN stores S SSM checkpoints for each Conv slot. Save
                     # every checkpoint, not just the row at the logical ID.
                     stride = ssm.shape[0] // conv.shape[0]
                     ssm_idx = (idx[:, None] * stride + torch.arange(stride, device=idx.device)).reshape(-1)
-                    ssm_rows = ssm.index_select(0, ssm_idx)
-                    if self._enable_decode_no_padding:
-                        # Exact shapes retain more graphs. Keep capture-only
-                        # checkpoints on the host so their peak device memory
-                        # does not grow with the number of recurrent layers.
-                        ssm_rows = ssm_rows.cpu()
-                    linear_snapshot.append((conv, ssm, ssm_idx, conv.index_select(0, idx), ssm_rows))
+                    # Keep all layers' backups on Host. Retaining every GDN
+                    # checkpoint on Device can exhaust HBM before capture.
+                    linear_snapshot.append(
+                        (conv, ssm, ssm_idx, conv.index_select(0, idx).cpu(), ssm.index_select(0, ssm_idx).cpu())
+                    )
             backend_snapshot = self.attention_backend.snapshot_linear_state(idx)
 
         try:
@@ -908,8 +908,8 @@ class DecodeAclGraphRunner(AclGraphRunner):
             torch.npu.current_stream().wait_stream(stream)
             if idx is not None:
                 for conv, ssm, ssm_idx, conv_rows, ssm_rows in linear_snapshot:
-                    conv.index_copy_(0, idx, conv_rows)
-                    ssm.index_copy_(0, ssm_idx, ssm_rows.to(device=ssm.device))
+                    conv.index_copy_(0, idx, conv_rows.to(conv.device))
+                    ssm.index_copy_(0, ssm_idx, ssm_rows.to(ssm.device))
             if backend_snapshot is not None:
                 self.attention_backend.restore_linear_state(backend_snapshot)
 

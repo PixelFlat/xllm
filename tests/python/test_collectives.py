@@ -212,6 +212,37 @@ def test_npu_all_reduce_binding_applies_to_every_group(monkeypatch: pytest.Monke
         collectives.all_reduce_(torch.ones(1), group_name)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("extra_elements", [0, 1])
+def test_npu_all_reduce_selects_managed_stream_above_inline_limit(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, extra_elements: int
+) -> None:
+    from xllm.python.distributed.npu import hccl
+
+    item_size = torch.empty((), dtype=dtype).element_size()
+    value = torch.ones(hccl._CURRENT_STREAM_ALL_REDUCE_MAX_BYTES // item_size + extra_elements, dtype=dtype)
+    group = _FakeGroup(0, 2)
+    communicator = MagicMock(return_value=17)
+    inline = MagicMock(side_effect=lambda tensor, comm: tensor.mul_(2))
+    managed = MagicMock(side_effect=lambda tensor, group: tensor.mul_(2))
+    # Test the size-based dispatch without constructing an NPU communicator.
+    # Real HCCL graph replay is covered by the opt-in multi-rank probe.
+    monkeypatch.setattr(hccl, "get_hccl_comm", communicator)
+    monkeypatch.setattr(torch.ops.xllm_ops, "npu_all_reduce", inline)
+    monkeypatch.setattr(hccl.dist, "all_reduce", managed)
+
+    hccl.all_reduce_on_current_stream(value, group)
+
+    communicator.assert_called_once_with(group, value.device)
+    if extra_elements:
+        managed.assert_called_once_with(value, group=group)
+        inline.assert_not_called()
+    else:
+        inline.assert_called_once_with(value, 17)
+        managed.assert_not_called()
+    torch.testing.assert_close(value, torch.full_like(value, 2))
+
+
 def test_native_runtime_bridge_bypasses_python_process_groups(monkeypatch):
     calls: list[str] = []
 

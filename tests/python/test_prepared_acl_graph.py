@@ -22,7 +22,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from xllm.python.attention.backend import AttentionBackend
+from xllm.python.attention.backend import AttentionBackend, LinearVerifyGraphInputs
 from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 from xllm.python.model_executor.dspark_ragged import allocate_verify_prefixes, create_verify_buffers, pack_verify_inputs
 from xllm.python.model_executor.executor import ModelExecutor
@@ -467,14 +467,98 @@ def test_adaptive_and_ordinary_prepared_bindings_can_coexist(runner: PreparedAcl
     assert len(runner._prepared_graphs) == 2
 
 
-@pytest.mark.parametrize("case", ["draft", "attention", "hidden", "topk"])
+@pytest.mark.parametrize("live,suppress", [(1, False), (2, False), (3, False), (2, True)])
+def test_recurrent_verify_maps_refresh_request_prefixes_and_zero_padding(live: int, suppress: bool) -> None:
+    _, _, _, inputs = _adaptive_inputs(torch.device("cpu"))
+    inputs = replace(
+        inputs,
+        linear_state_indices=torch.tensor([2, 1, 3], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([4, 2, 1], dtype=torch.int32),
+    )
+    inputs.control.fill_(live | (int(suppress) << 32))
+    widths = [2, 3, 1][:live]
+    offsets = [0]
+    for width in widths:
+        offsets.append(offsets[-1] + width)
+    inputs.offsets.fill_(-99)
+    inputs.offsets[: live + 1].copy_(torch.tensor(offsets, dtype=torch.int32))
+    inputs.owners.fill_(-1)
+    inputs.columns.fill_(-1)
+    for row, width in enumerate(widths):
+        inputs.owners[offsets[row] : offsets[row + 1]].fill_(row)
+        inputs.columns[offsets[row] : offsets[row + 1]].copy_(torch.arange(width))
+    graph = LinearVerifyGraphInputs(
+        torch.empty(3, dtype=torch.int32),
+        torch.empty(3, dtype=torch.int32),
+        8,
+        torch.empty(8, dtype=torch.int64),
+        torch.empty(24, dtype=torch.int64),
+    )
+    addresses = tuple(
+        tensor.data_ptr() for tensor in (graph.state_indices, graph.dense_to_packed, graph.packed_to_dense)
+    )
+    PreparedAclGraphRunner._refresh_linear_verify_graph(inputs, graph, 8)
+    expected_dense = [8] * 24
+    expected_packed = [24] * 8
+    for row, width in enumerate(widths):
+        expected_dense[row * 8 : row * 8 + width] = range(offsets[row], offsets[row + 1])
+        expected_packed[offsets[row] : offsets[row + 1]] = range(row * 8, row * 8 + width)
+    assert graph.dense_to_packed.tolist() == expected_dense
+    assert graph.packed_to_dense.tolist() == expected_packed
+    assert graph.state_indices.tolist() == ([0] * 3 if suppress else [2, 1, 3][:live] + [0] * (3 - live))
+    assert graph.num_accepted_tokens.tolist() == [4, 2, 1][:live] + [1] * (3 - live)
+    assert addresses == tuple(
+        tensor.data_ptr() for tensor in (graph.state_indices, graph.dense_to_packed, graph.packed_to_dense)
+    )
+
+
+def test_recurrent_prepared_graph_binds_request_state_and_compact_device_lengths(
+    runner: PreparedAclGraphRunner,
+) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = False
+    runner.attention_backend.page_size = runner.attention_backend.logical_page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"), table_width=128)
+    inputs = replace(
+        inputs,
+        linear_state_indices=torch.ones(3, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    entry = next(iter(runner._prepared_graphs.values()))
+    graph = entry.static_metadata.linear_verify_graph
+    assert graph is not None and graph.query_width == 8
+    assert entry.source_block_table is metadata.block_table
+    assert entry.static_metadata.block_table.shape == (8, 32)
+    assert entry.static_metadata.kv_seq_lens_host_values == [4096] * 8
+    assert entry.static_metadata.q_cu_seq_lens_host_values == list(range(1, 9))
+    runner.attention_backend.prepare_metadata.assert_called_once_with(entry.static_metadata, device_kv_lengths=True)
+    with pytest.raises(RuntimeError, match="warmed Slot binding"):
+        runner.execute(
+            tokens,
+            positions,
+            metadata,
+            dspark_adaptive=replace(inputs, num_accepted_tokens=inputs.num_accepted_tokens.clone()),
+        )
+
+
+@pytest.mark.parametrize("case", ["recurrent_dp", "draft", "attention", "hidden", "topk"])
 def test_adaptive_prepared_rejects_non_target_contract(runner: PreparedAclGraphRunner, case: str) -> None:
     runner.max_batch = 8
     runner.attention_backend.is_mla = True
     runner.attention_backend.logical_page_size = 128
     tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"))
     hidden = topk = None
-    if case == "draft":
+    if case == "recurrent_dp":
+        runner.dp_size = 2
+        runner.attention_backend.is_mla = False
+        inputs = replace(
+            inputs,
+            linear_state_indices=torch.ones(3, dtype=torch.int32),
+            num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+        )
+    elif case == "draft":
         runner._block_draft = True
     elif case == "attention":
         runner.attention_backend.is_mla = False
@@ -482,7 +566,7 @@ def test_adaptive_prepared_rejects_non_target_contract(runner: PreparedAclGraphR
         hidden = torch.zeros(8, 4)
     else:
         topk = torch.zeros(8, 1, 2, dtype=torch.int32)
-    with pytest.raises(ValueError, match="ordinary MLA target graph"):
+    with pytest.raises(ValueError, match="MLA or recurrent target graph"):
         runner.warmup_prepared(tokens, positions, metadata, hidden, topk, dspark_adaptive=inputs)
     runner._capture.assert_not_called()
     runner.attention_backend.prepare.assert_not_called()

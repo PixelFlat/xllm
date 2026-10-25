@@ -41,3 +41,7 @@ class DSparkAdaptiveGraphInputs:
     columns: torch.Tensor
     block_size: int
     draft_width: int = 7
+    # Hybrid targets restore request-scoped checkpoints before packed verify.
+    # The preceding accepted lengths are gathered on the ordered task stream.
+    linear_state_indices: torch.Tensor | None = None
+    num_accepted_tokens: torch.Tensor | None = None

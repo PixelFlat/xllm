@@ -86,7 +86,15 @@ py::object dspark_adaptive_graph_input(const ModelParamsView& params) {
           py::arg("owners") = input.owners,
           py::arg("columns") = input.columns,
           py::arg("block_size") = input.block_size,
-          py::arg("draft_width") = input.draft_width);
+          py::arg("draft_width") = input.draft_width,
+          py::arg("linear_state_indices") =
+              input.linear_state_indices.defined()
+                  ? py::cast(input.linear_state_indices)
+                  : py::none(),
+          py::arg("num_accepted_tokens") =
+              input.num_accepted_tokens.defined()
+                  ? py::cast(input.num_accepted_tokens)
+                  : py::none());
 }
 
 void register_xllm_runtime_module(py::module_& m) {
@@ -242,6 +250,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["enable_task_pipeline"] = options_.enable_task_pipeline();
   executor_config["enable_graph_mode_decode_no_padding"] =
       ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding();
+  executor_config["enable_adaptive_target_verify"] =
+      options_.enable_adaptive_target_verify();
   // DFlash2 defaults to eager in the model config. Hybrid worker pipelines
   // explicitly enable its independent full-block ACL runner on the leaf.
   const bool independent_block_graph =

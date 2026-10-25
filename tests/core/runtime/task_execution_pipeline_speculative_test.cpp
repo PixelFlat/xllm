@@ -478,6 +478,7 @@ class CountingModel final : public CausalLM {
   bool require_bound_context_cache = false;
   std::mutex prepared_mutex;
   std::vector<std::array<uintptr_t, 2>> prepared_cache_bindings;
+  std::vector<torch::Tensor> recurrent_accepted_counts;
   std::vector<PreparedTestEvent> prepared_events;
   std::vector<bool> context_cache_bound;
   bool adaptive_unified_capable = true;
@@ -619,13 +620,13 @@ class PreparedTestExecutor final : public ExecutorImpl {
     counting->prepared_cache_bindings.clear();
     counting->prepared_cache_bindings.reserve(kv_caches.size());
     for (const auto& cache : kv_caches) {
+      const auto key = cache.has_request_state() ? cache.get_conv_cache()
+                                                 : cache.get_k_cache();
+      const auto value = cache.has_request_state() ? cache.get_ssm_cache()
+                                                   : cache.get_v_cache();
       counting->prepared_cache_bindings.emplace_back(std::array<uintptr_t, 2>{
-          cache.get_k_cache().defined()
-              ? reinterpret_cast<uintptr_t>(cache.get_k_cache().data_ptr())
-              : 0,
-          cache.get_v_cache().defined()
-              ? reinterpret_cast<uintptr_t>(cache.get_v_cache().data_ptr())
-              : 0});
+          key.defined() ? reinterpret_cast<uintptr_t>(key.data_ptr()) : 0,
+          value.defined() ? reinterpret_cast<uintptr_t>(value.data_ptr()) : 0});
     }
     counting->prepared_events.emplace_back(
         PreparedTestEvent::METADATA_PREPARED);
@@ -780,6 +781,10 @@ class PreparedTestExecutor final : public ExecutorImpl {
     auto* counting = dynamic_cast<CountingModel*>(model_);
     const auto& adaptive = params.graph.dspark_adaptive;
     if (adaptive.arena.defined()) {
+      if (adaptive.num_accepted_tokens.defined()) {
+        counting->recurrent_accepted_counts.emplace_back(
+            adaptive.num_accepted_tokens.clone());
+      }
       // Emulate the prepared graph prehook with the actual NPU operators.
       // This eager executor double verifies pipeline data flow, not capture.
       auto arena = adaptive.arena;
@@ -4073,6 +4078,109 @@ TEST_F(SpeculativePipelineTest,
   const auto context_slots = draft_->context_slots.back().cpu();
   EXPECT_TRUE(torch::equal(context_slots.masked_select(context_slots.ge(0)),
                            torch::tensor({18, 50, 82}, torch::kInt32)));
+  pipeline_.reset();
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveDSparkRecurrentTasksPrepareAndRestoreRequestState) {
+  configure_adaptive_dspark(/*profiled=*/false);
+  capacity_.common.model.enable_linear_attention = true;
+  capacity_.common.enable_mla = false;
+  capacity_.sparse_dsa_target = false;
+  capacity_.hybrid_recurrent_target = true;
+  target_cache_.emplace_back(LinearAttentionKVCacheTensors{
+      torch::zeros({5, 10, 1}, target_->options()),
+      torch::zeros({40, 1, 1, 1}, target_->options())});
+  bool restored = false;
+  bool warming_graph = false;
+  uint32_t restored_prefills = 0;
+  uint32_t restored_decodes = 0;
+  TaskModel target{*target_, *target_executor_, target_cache_};
+  target.restore_request_state = [&](const ModelParamsView& params) {
+    EXPECT_EQ(params.embedding.linear_state_indices.numel(),
+              params.embedding.linear_state_ids.size());
+    EXPECT_EQ(params.embedding.linear_state_ids.size(),
+              params.linear_state_validity_mask.size());
+    if (warming_graph) {
+      EXPECT_TRUE(params.linear_state_cache_ops.empty());
+    } else {
+      EXPECT_EQ(params.linear_state_cache_ops.size(),
+                params.linear_state_validity_mask.size());
+    }
+    if (params.meta.batch_forward_type.is_prefill()) {
+      EXPECT_TRUE(params.attn_metadata->has_initial_states.defined());
+      EXPECT_EQ(params.attn_metadata->has_initial_states.scalar_type(),
+                torch::kBool);
+      EXPECT_FALSE(
+          params.attn_metadata->has_initial_states.any().cpu().item<bool>());
+      ++restored_prefills;
+    } else {
+      ++restored_decodes;
+    }
+    restored = true;
+  };
+  auto unsupported_dp = capacity_;
+  unsupported_dp.common.dp_size = 2;
+  const Status dp_status = TaskExecutionPipeline::create(
+      state_thread_,
+      target,
+      TaskModel{*draft_, *draft_executor_, draft_cache_},
+      unsupported_dp,
+      pipeline_);
+  EXPECT_FALSE(dp_status.ok());
+  EXPECT_EQ(dp_status.message(),
+            "Recurrent DSpark requires adaptive prepared graphs, request state "
+            "restoration and DP=CP=1 without unified graphs.");
+  const Status status = TaskExecutionPipeline::create(
+      state_thread_,
+      std::move(target),
+      TaskModel{*draft_, *draft_executor_, draft_cache_},
+      capacity_,
+      pipeline_);
+  ASSERT_TRUE(status.ok()) << status.message();
+  const auto recurrent_input = [&](uint32_t rows,
+                                   bool decode,
+                                   bool placeholder = false,
+                                   int32_t position = 2) {
+    auto source = dspark_batch_input(rows, decode, placeholder, position);
+    auto& params = source.input_params;
+    for (uint32_t row = 0; row < rows; ++row) {
+      LinearStateCacheOp op;
+      op.linear_state_id = static_cast<int32_t>(row + 1);
+      op.reset_requested = !decode;
+      params.embedding.linear_state_ids.emplace_back(op.linear_state_id);
+      params.linear_state_cache_ops.emplace_back(op);
+    }
+    return source;
+  };
+  for (uint32_t rows = 1; rows <= 3; ++rows) {
+    execute(recurrent_input(rows, /*decode=*/false));
+    auto warmup = recurrent_input(rows, /*decode=*/true);
+    warmup.input_params.meta.is_graph_warmup = true;
+    warming_graph = true;
+    execute(warmup);
+    warming_graph = false;
+  }
+  target_->recurrent_accepted_counts.clear();
+  target_->after_forward = [&] {
+    EXPECT_TRUE(restored);
+    restored = false;
+  };
+  restored_prefills = 0;
+  restored_decodes = 0;
+  execute(recurrent_input(3, /*decode=*/false));
+  execute(recurrent_input(3, /*decode=*/true));
+  execute(recurrent_input(
+      3, /*decode=*/true, /*placeholder=*/true, /*position=*/3));
+  EXPECT_EQ(restored_prefills, 1U);
+  EXPECT_EQ(restored_decodes, 2U);
+  ASSERT_EQ(target_->recurrent_accepted_counts.size(), 2U);
+  EXPECT_TRUE(
+      torch::equal(target_->recurrent_accepted_counts[0].narrow(0, 0, 3).cpu(),
+                   torch::ones({3}, torch::kInt32)));
+  EXPECT_TRUE(
+      torch::equal(target_->recurrent_accepted_counts[1].narrow(0, 0, 3).cpu(),
+                   torch::full({3}, 8, torch::kInt32)));
   pipeline_.reset();
 }
 

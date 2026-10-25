@@ -397,6 +397,15 @@ class ModelExecutor:
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
         self._prepared_mtp = config.get("model_type") == "glm_moe_dsa_mtp"
+        self._prepared_recurrent_target = (
+            current_platform.is_npu()
+            and config.get("model_type") in ("qwen3_5", "qwen3_5_text")
+            and config.get("enable_adaptive_target_verify", False)
+            and config.get("enable_task_pipeline", False)
+            and graph_backend == "aclgraph"
+            and dp_size == 1
+            and cp_size == 1
+        )
         self._prepared_block_draft = is_block_draft_model(config)
         self._prepared_dspark = is_dspark_draft_model(config)
         # DSpark drafts and DFlash2 write their own context-KV via the shared
@@ -461,6 +470,7 @@ class ModelExecutor:
                 or prepared_qwen_generation
                 or self._prepared_qwen_mtp_target
                 or self._prepared_qwen_mtp_draft
+                or self._prepared_recurrent_target
                 or (self._prepared_block_draft and graph_backend in _DISABLED_GRAPH_BACKENDS)
                 or (self._prepared_dspark and config.get("enable_task_pipeline", False) and graph_backend == "aclgraph")
             )
@@ -884,12 +894,16 @@ class ModelExecutor:
     def prepare_metadata(self, metadata: AttentionMetadata) -> None:
         if not self._supports_prepared_metadata or not self._kv_bound:
             raise RuntimeError("prepared metadata requires an initialized supported Qwen3 or GLM executor")
-        if self._prepared_qwen_gdn:
+        if self._prepared_qwen_gdn and not self._prepared_recurrent_target:
             self._validate_prepared_qwen_metadata(metadata)
         qwen_device_decode = (self._prepared_qwen_mtp_target or self._prepared_qwen_mtp_draft) and (
             metadata.is_spec_verify or not (metadata.is_prefill or metadata.is_chunked_prefill)
         )
-        if self._prepared_block_draft or qwen_device_decode:
+        if (
+            self._prepared_block_draft
+            or qwen_device_decode
+            or (self._prepared_recurrent_target and not (metadata.is_prefill or metadata.is_chunked_prefill))
+        ):
             metadata.prepared_attention_state = self.attention_backend.prepare_metadata(
                 metadata, device_kv_lengths=True
             )

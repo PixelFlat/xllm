@@ -34,8 +34,9 @@ limitations under the License.
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/linear_state_restore.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/runtime/dflash2_worker_impl.h"
-#include "runtime/dspark_worker_impl.h"
+#include "core/runtime/dspark_worker_impl.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
@@ -60,6 +61,19 @@ uint32_t TaskExecutionPipeline::context_hidden_size() const {
 }
 
 namespace {
+
+int64_t paged_cache_blocks(const std::vector<KVCache>& caches) {
+  for (const auto& cache : caches) {
+    if (cache.empty() || cache.has_request_state()) {
+      continue;
+    }
+    const auto key = cache.get_k_cache();
+    if (key.defined() && key.numel() != 0) {
+      return key.size(0);
+    }
+  }
+  return 0;
+}
 
 ModelInputBatch model_batch(const LlmForwardInput& input) {
   const auto& meta = input.input_params.meta;
@@ -303,7 +317,13 @@ Status TaskExecutionPipeline::create(
     TaskModel draft,
     const SpeculativeTaskCapacity& capacity,
     std::unique_ptr<TaskExecutionPipeline>& output) {
-  const auto& common = capacity.common;
+  auto prepared_capacity = capacity;
+  if (prepared_capacity.hybrid_recurrent_target) {
+    // Packed block graphs bind request state through their descriptor, not
+    // through the fixed-width recurrent MTP Slot layout.
+    prepared_capacity.common.model.enable_linear_attention = false;
+  }
+  const auto& common = prepared_capacity.common;
   const uint64_t width =
       static_cast<uint64_t>(capacity.num_speculative_tokens) + 1;
   const uint64_t rows =
@@ -332,7 +352,8 @@ Status TaskExecutionPipeline::create(
         capacity.kind != SpeculativeTaskKind::MTP) ||
        (capacity.num_speculative_tokens != 5 &&
         capacity.num_speculative_tokens != 7) ||
-       !capacity.sparse_dsa_target || !common.enable_mla ||
+       (!(capacity.sparse_dsa_target && common.enable_mla) &&
+        !capacity.hybrid_recurrent_target) ||
        common.max_graph_batch_size == 0 || common.model.max_sequences > 128 ||
        capacity.is_probabilistic_draft ||
        !std::isfinite(capacity.adaptive_min_gain) ||
@@ -344,7 +365,7 @@ Status TaskExecutionPipeline::create(
          capacity.unified_graph || !capacity.refresh_target_prefix)))) {
     return invalid(
         "Adaptive task pipeline requires NPU MTP/DSpark Draft5/7, sparse DSA "
-        "Target graphs, greedy draft sampling and supported "
+        "or recurrent Target graphs, greedy draft sampling and supported "
         "request/page capacity.");
   }
   if (capacity.adaptive_draft_step &&
@@ -353,6 +374,15 @@ Status TaskExecutionPipeline::create(
        capacity.adaptive_target_verify || capacity.unified_graph ||
        capacity.num_speculative_tokens > 64)) {
     return invalid("Adaptive MTP requires ordinary NPU MTP tasks and DP=CP=1.");
+  }
+  if (capacity.hybrid_recurrent_target &&
+      (capacity.kind != SpeculativeTaskKind::DSPARK ||
+       !capacity.adaptive_target_verify || capacity.unified_graph ||
+       common.dp_size != 1 || common.cp_sampling_group != nullptr ||
+       !target.restore_request_state)) {
+    return invalid(
+        "Recurrent DSpark requires adaptive prepared graphs, request state "
+        "restoration and DP=CP=1 without unified graphs.");
   }
   if (capacity.adaptive_target_verify &&
       (rows * common.model.max_blocks_per_sequence >
@@ -423,8 +453,9 @@ Status TaskExecutionPipeline::create(
                                 std::move(target.load_kv),
                                 std::move(target.fence_kv)));
   program->speculative_capacity_ =
-      std::make_unique<SpeculativeTaskCapacity>(capacity);
+      std::make_unique<SpeculativeTaskCapacity>(std::move(prepared_capacity));
   program->draft_ = std::make_unique<TaskModel>(std::move(draft));
+  program->restore_request_state_ = std::move(target.restore_request_state);
   program->hidden_dtype_ = target.model.options().dtype().toScalarType();
   Status status = program->initialize_speculative();
   if (!status.ok()) {
@@ -525,6 +556,13 @@ Status TaskExecutionPipeline::initialize_speculative() {
       return status;
     }
     const auto indices = options.dtype(torch::kInt32);
+    if (speculative_capacity_->hybrid_recurrent_target) {
+      slot->recurrent = std::make_unique<SpeculativeSlot::Recurrent>();
+      slot->recurrent->host_state_indices =
+          torch::zeros({count}, pinned.dtype(torch::kInt32));
+      slot->recurrent->state_indices = torch::zeros({count}, indices);
+      slot->recurrent->accepted_lengths = torch::ones({count}, indices);
+    }
     if (block_draft()) {
       slot->draft_block_indices =
           speculative_capacity_->kind == SpeculativeTaskKind::DSPARK
@@ -1017,17 +1055,8 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (!slot.run_models) {
     return Status();
   }
-  // Hybrid models may start with a recurrent layer. Page-table bounds belong
-  // to the full-attention pool, not the recurrent state bank of that layer.
-  const auto full_attention = [](const std::vector<KVCache>& caches) {
-    return std::find_if(caches.begin(), caches.end(), [](const KVCache& cache) {
-      return !cache.empty() && cache.get_k_cache().defined();
-    });
-  };
-  const auto target_cache = full_attention(kv_caches_);
-  const auto draft_cache = full_attention(draft_->kv_caches);
-  if (target_cache == kv_caches_.end() ||
-      draft_cache == draft_->kv_caches.end()) {
+  if (paged_cache_blocks(kv_caches_) == 0 ||
+      paged_cache_blocks(draft_->kv_caches) == 0) {
     return Status(StatusCode::UNAVAILABLE, "MTP requires Target and Draft KV.");
   }
   if (count == 0) {
@@ -1036,8 +1065,8 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     }
     return Status();
   }
-  const int64_t blocks = std::min(target_cache->get_k_cache().size(/*dim=*/0),
-                                  draft_cache->get_k_cache().size(/*dim=*/0));
+  const int64_t blocks = std::min(paged_cache_blocks(kv_caches_),
+                                  paged_cache_blocks(draft_->kv_caches));
   if (std::any_of(
           host.block_tables.begin(),
           host.block_tables.end(),
@@ -1833,6 +1862,10 @@ void TaskExecutionPipeline::bind_adaptive_verify_graph_input(
   input.offsets = adaptive.offsets_storage;
   input.owners = prefix(adaptive.owners_storage, adaptive.plan.graph_rows);
   input.columns = prefix(adaptive.columns_storage, adaptive.plan.graph_rows);
+  if (slot.recurrent) {
+    input.linear_state_indices = slot.recurrent->state_indices;
+    input.num_accepted_tokens = slot.recurrent->accepted_lengths;
+  }
   input.block_size = capacity_.logical_block_size;
   input.draft_width = speculative_capacity_->num_speculative_tokens;
   slot.validate_input->model_params().graph.dspark_adaptive = std::move(input);
@@ -2358,15 +2391,11 @@ Status TaskExecutionPipeline::prepare_speculative(
     slot.adaptive->generation = next_task_id_;
   }
   c10::DeviceGuard guard(device_.unwrap());
-  const auto embedding_cache = std::find_if(
-      kv_caches_.begin(), kv_caches_.end(), [](const KVCache& cache) {
-        return !cache.empty() && cache.get_k_cache().defined();
-      });
-  if (embedding_cache == kv_caches_.end()) {
+  if (paged_cache_blocks(kv_caches_) == 0) {
     return Status(StatusCode::UNAVAILABLE,
                   "MTP embedding resources are not allocated.");
   }
-  const int64_t embedding_rows = embedding_cache->get_k_cache().size(0);
+  const int64_t embedding_rows = paged_cache_blocks(kv_caches_);
   if (embedding_rows <= 0 ||
       embedding_rows > std::numeric_limits<int32_t>::max()) {
     return invalid("Invalid allocated MTP embedding capacity.");
@@ -2387,6 +2416,11 @@ Status TaskExecutionPipeline::prepare_speculative(
     *context_ = std::move(*context);
     if (adaptive_verify_) {
       adaptive_verify_->histories.resize(embedding_rows);
+      if (speculative_capacity_->hybrid_recurrent_target) {
+        auto stream_guard = prepare_stream_.set_stream_guard();
+        adaptive_verify_->accepted_lengths = torch::ones(
+            {embedding_rows}, model_.options().dtype(torch::kInt32));
+      }
     }
     LOG(INFO) << "Task pipeline embedding context: rows=" << embedding_rows
               << ", device_bytes=" << mtp_context_bytes(*context_);
@@ -2607,6 +2641,8 @@ Status TaskExecutionPipeline::prepare_speculative(
       bind_adaptive_verify_graph_input(slot,
                                        /*suppress_kv_writes=*/slot.is_warmup);
     }
+    status = prepare_recurrent_state(slot, input);
+    CHECK(status.ok()) << status.message();
     executor_.prepare_attention_metadata(kv_caches_, binding.model_params());
   } else {
     status = slot.target_prefill->prepare(host, batch, prepare_stream_);
@@ -2623,7 +2659,8 @@ Status TaskExecutionPipeline::prepare_speculative(
                  sample_views(slot.target_prefill->device_result()),
                  {}};
     auto& target_input = *slot.target_prefill;
-
+    status = prepare_recurrent_state(slot, input);
+    CHECK(status.ok()) << status.message();
     executor_.prepare_attention_metadata(kv_caches_,
                                          target_input.model_params());
     if (!block_draft()) {
@@ -2726,6 +2763,77 @@ void TaskExecutionPipeline::publish_mtp_context(SpeculativeSlot& slot) {
   }
   slot.context_published = true;
   slot.publication->submitted_cv.notify_all();
+}
+
+Status TaskExecutionPipeline::prepare_recurrent_state(
+    SpeculativeSlot& slot,
+    const LlmForwardInput& input) {
+  if (!slot.recurrent) {
+    return Status();
+  }
+  const auto& source = input.input_params;
+  const auto& ids = source.embedding.linear_state_ids;
+  if (ids.size() != slot.rows) {
+    return invalid("Recurrent DSpark requires one state slot per request.");
+  }
+  const auto cache = std::find_if(
+      kv_caches_.begin(), kv_caches_.end(), [](const KVCache& value) {
+        return value.has_request_state();
+      });
+  CHECK(cache != kv_caches_.end());
+  const int64_t state_capacity = cache->get_conv_cache().size(0);
+  const bool warmup = source.meta.is_graph_warmup;
+  if (std::any_of(ids.begin(), ids.end(), [state_capacity, warmup](int32_t id) {
+        return id < (warmup ? 0 : 1) || id >= state_capacity;
+      })) {
+    return invalid("Recurrent DSpark state slot is outside allocated cache.");
+  }
+  auto& recurrent = *slot.recurrent;
+  recurrent.host_state_indices.zero_();
+  std::copy(
+      ids.begin(), ids.end(), recurrent.host_state_indices.data_ptr<int32_t>());
+  copy_input(
+      recurrent.state_indices, recurrent.host_state_indices, prepare_stream_);
+  auto& target = slot.decode ? slot.validate_input->model_params()
+                             : slot.target_prefill->model_params();
+  target.embedding.linear_state_ids = ids;
+  target.embedding.linear_state_indices =
+      prefix(recurrent.state_indices, slot.rows);
+  target.linear_state_cache_ops = source.linear_state_cache_ops;
+  target.linear_state_validity_mask = source.linear_state_validity_mask;
+  if (warmup) {
+    // Synthetic warmup owns padding slot zero, never a live reset/copy lease.
+    target.linear_state_cache_ops.clear();
+    target.linear_state_validity_mask.assign(slot.rows, 0);
+  } else if (target.linear_state_validity_mask.empty()) {
+    const auto host = SlotBuffer::model_input_view(input);
+    std::vector<int32_t> cached;
+    cached.reserve(slot.rows);
+    for (uint32_t row = 0; row < slot.rows; ++row) {
+      cached.emplace_back(host.kv_seq_lens[row] - host.q_seq_lens[row]);
+    }
+    target.linear_state_validity_mask =
+        build_linear_state_mask(cached, slot.rows);
+  }
+  if (!target.linear_state_cache_ops.empty()) {
+    std::transform(target.linear_state_cache_ops.begin(),
+                   target.linear_state_cache_ops.end(),
+                   target.linear_state_validity_mask.begin(),
+                   target.linear_state_validity_mask.begin(),
+                   [](const LinearStateCacheOp& op, int64_t valid) {
+                     return op.reset_requested
+                                ? int64_t{0}
+                                : (op.restore_requested || op.is_direct_read()
+                                       ? int64_t{1}
+                                       : valid);
+                   });
+  }
+  if (!slot.decode) {
+    target.attn_metadata->has_initial_states = torch::tensor(
+        target.linear_state_validity_mask,
+        torch::TensorOptions().dtype(torch::kBool).device(device_.unwrap()));
+  }
+  return Status();
 }
 
 void TaskExecutionPipeline::prepare_empty_shard(SpeculativeSlot& slot,
@@ -2892,6 +3000,10 @@ void TaskExecutionPipeline::launch_empty_shard(SpeculativeSlot& slot) {
 
 void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
   auto& target_input = *slot.target_prefill;
+  if (slot.recurrent) {
+    CHECK(restore_request_state_);
+    restore_request_state_(target_input.model_params());
+  }
   slot.target_output = executor_.forward(target_input.tokens(),
                                          target_input.positions(),
                                          kv_caches_,
@@ -2920,6 +3032,9 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
         slot.target_prefill->device_result().tokens,
         *slot.state);
     write_block_context(slot, /*prefill=*/true);
+    if (slot.recurrent) {
+      adaptive_verify_->accepted_lengths.index_fill_(0, slot.state->rows_, 1);
+    }
     context_publish(*slot.state);
     return;
   }
@@ -3337,7 +3452,15 @@ void TaskExecutionPipeline::launch_adaptive_verify(SpeculativeSlot& slot) {
     launch_block_draft(slot);
   }
   auto& adaptive = *slot.adaptive;
+  if (slot.recurrent) {
+    prefix(slot.recurrent->accepted_lengths, slot.rows)
+        .copy_(adaptive_verify_->accepted_lengths.index_select(
+            0, slot.state->rows_));
+  }
   auto& validate = *slot.validate_input;
+  if (slot.recurrent) {
+    restore_request_state_(validate.model_params());
+  }
   auto& attention = validate.model_params().attention.device;
   // Proposal/confidence consensus is complete. The prepared Target graph owns
   // Device allocation, packing and attention metadata refresh in that order.
@@ -3380,6 +3503,10 @@ void TaskExecutionPipeline::launch_adaptive_verify(SpeculativeSlot& slot) {
                                                      slot.context_slots);
   if (block_draft()) {
     write_block_context(slot, /*prefill=*/false);
+    if (slot.recurrent) {
+      adaptive_verify_->accepted_lengths.index_copy_(
+          0, slot.state->rows_, result.lengths.to(torch::kInt32));
+    }
     context_advance(
         *slot.state, result.tokens, result.lengths, torch::Tensor());
   } else {
@@ -3746,6 +3873,9 @@ uint64_t TaskExecutionPipeline::speculative_pinned_bytes() const {
     if (slot.adaptive) {
       bytes += slot.adaptive->host_feedback_storage.nbytes();
     }
+    if (slot.recurrent) {
+      bytes += slot.recurrent->host_state_indices.nbytes();
+    }
     if (slot.prefix_refresh) {
       bytes += slot.prefix_refresh->input->pinned_bytes();
     }
@@ -3755,6 +3885,9 @@ uint64_t TaskExecutionPipeline::speculative_pinned_bytes() const {
 
 uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
   uint64_t bytes = mtp_context_bytes(*context_);
+  if (adaptive_verify_ && adaptive_verify_->accepted_lengths.defined()) {
+    bytes += adaptive_verify_->accepted_lengths.nbytes();
+  }
   for (const auto& task_slot : slots_) {
     const auto& slot = *task_slot->speculative;
     bytes +=
@@ -3781,6 +3914,10 @@ uint64_t TaskExecutionPipeline::speculative_device_bytes() const {
     if (slot.prefix_refresh) {
       bytes += slot.prefix_refresh->input->device_bytes() +
                slot.prefix_refresh->hidden_storage.nbytes();
+    }
+    if (slot.recurrent) {
+      bytes += slot.recurrent->state_indices.nbytes() +
+               slot.recurrent->accepted_lengths.nbytes();
     }
     for (const auto* tensor : {&slot.context_slots_storage,
                                &slot.draft_block_indices,

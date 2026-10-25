@@ -63,7 +63,8 @@ namespace {
 // draft through the plain worker path: model-type check at create time,
 // before the model args are parsed.
 bool uses_hybrid_worker_pipeline(const runtime::Options& options) {
-  if (!options.enable_task_pipeline() || !Platform::is_npu()) {
+  if (!options.enable_task_pipeline() || !Platform::is_npu() ||
+      options.enable_adaptive_target_verify()) {
     return false;
   }
   const std::string model_type =
@@ -365,7 +366,8 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
 
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
-  if (target_is_hybrid_recurrent_) {
+  if (target_is_hybrid_recurrent_ &&
+      !options_.enable_adaptive_target_verify()) {
     if (!uses_hybrid_worker_pipeline(options_) || !options_.enable_graph() ||
         options_.enable_adaptive_target_verify() ||
         parallel_args_.dp_size() != 1) {
@@ -393,7 +395,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
       (options_.enable_adaptive_target_verify() &&
        !SpeculativeConfig::is_dspark_algorithm(
            options_.speculative_algorithm())) ||
-      options_.num_speculative_tokens() <= 0 || target_is_hybrid_recurrent_) {
+      options_.num_speculative_tokens() <= 0) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
                           "Block task pipeline requires fixed-width or "
                           "adaptive DSpark full-attention models.");
@@ -403,7 +405,8 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
   if (!status.ok()) {
     return status;
   }
-  if (!capacity.common.enable_mla) {
+  capacity.hybrid_recurrent_target = target_is_hybrid_recurrent_;
+  if (!capacity.common.enable_mla && !capacity.hybrid_recurrent_target) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Block task pipeline currently requires a GLM DSA target; "

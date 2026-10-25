@@ -2138,6 +2138,40 @@ def test_executor_accepts_prepared_qwen_hybrid_generation(
     assert not backend._prepared
 
 
+@pytest.mark.parametrize("prefill", [False, True])
+def test_packed_recurrent_dspark_keeps_request_state_separate_from_qwen_mtp(prefill: bool) -> None:
+    backend = _PreparedStubAttentionBackend()
+    config = {
+        "model_type": "qwen3_5_text",
+        "num_speculative_tokens": 7,
+        "is_block_diffusion_algorithm": True,
+        "enable_task_pipeline": True,
+        "enable_adaptive_target_verify": True,
+        "python_graph_backend": "aclgraph",
+    }
+    with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2, num_decoding_tokens=8)
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = _prepared_qwen_metadata()
+    metadata.is_prefill = prefill
+    if not prefill:
+        # Packed target token rows and logical recurrent requests have different
+        # capacities; the graph descriptor supplies the request-scoped state.
+        metadata.slot_mapping = torch.arange(16, dtype=torch.int32)
+        metadata.q_seq_lens = torch.ones(16, dtype=torch.int32)
+        metadata.q_cu_seq_lens = torch.arange(17, dtype=torch.int32)
+        metadata.q_cu_seq_lens_host_values = list(range(1, 17))
+    executor.prepare_metadata(metadata)
+    assert executor.supports_prepared_metadata
+    assert executor._prepared_recurrent_target
+    assert not executor._prepared_qwen_mtp_target
+    assert executor.prepared_graph_runner._spec_verify_width == 1
+    assert not executor.prepared_graph_runner._device_kv_lengths
+    assert metadata.linear_state_indices.numel() == 2
+    assert metadata.prepared_attention_state.device_kv_lengths is not prefill
+
+
 @pytest.mark.parametrize("draft_tokens", [1, 2, 3, 7, 16])
 @pytest.mark.parametrize("graph_backend", ["off", "aclgraph"])
 def test_executor_prepares_qwen_mtp_with_logical_accepted_state(draft_tokens: int, graph_backend: str) -> None:

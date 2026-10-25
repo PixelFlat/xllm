@@ -966,7 +966,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             and prepared.device_kv_lengths is not None
         ):
             return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
-        if metadata.is_prefill or metadata.is_chunked_prefill:
+        device_lengths = isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None
+        if metadata.is_prefill or metadata.is_chunked_prefill or device_lengths:
             if self._use_expanded_decode:
                 return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
             return self._prefill(
@@ -1919,8 +1920,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             v_flat = v_cache.view(v_cache.size(0), block_size, -1)
             prepared = getattr(metadata, "prepared_attention_state", None)
             if isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None:
-                if layer.causal:
-                    raise ValueError("device-length block attention requires a non-causal draft")
+                if layer.causal and prepared.query_lengths[0] != 1:
+                    raise ValueError("causal device-length attention requires singleton packed queries")
                 # Host lengths are safe upper bounds prepared before the prior
                 # Slot accepts its prefix. Mask that bounded tail using the
                 # exact device lengths; never read acceptance back to Host.

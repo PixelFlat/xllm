@@ -59,6 +59,10 @@ class GdnVerifyMetadata(GdnMetadata):
     # Packed token -> dense [request, verify position] row. None for uniform
     # batches, which can be reshaped without padding or copying.
     packed_to_dense: torch.Tensor | None
+    # Device-built inverse mapping for adaptive graph rows. Missing dense
+    # positions use the appended zero row at packed_token_count; padding in
+    # packed_to_dense uses the appended zero row at batch_size * query_width.
+    dense_to_packed: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

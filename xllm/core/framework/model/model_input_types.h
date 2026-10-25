@@ -516,6 +516,8 @@ struct DSparkAdaptiveGraphInput {
   torch::Tensor offsets;
   torch::Tensor owners;
   torch::Tensor columns;
+  torch::Tensor linear_state_indices;
+  torch::Tensor num_accepted_tokens;
   uint32_t block_size = 0;
   uint32_t draft_width = 7;
 };
@@ -533,8 +535,12 @@ inline DSparkAdaptiveGraphInput dspark_adaptive_graph_input_to(
                                 &out.base_block_table,
                                 &out.offsets,
                                 &out.owners,
-                                &out.columns}) {
-    *tensor = safe_to(*tensor, device, /*non_blocking=*/true);
+                                &out.columns,
+                                &out.linear_state_indices,
+                                &out.num_accepted_tokens}) {
+    if (tensor->defined()) {
+      *tensor = safe_to(*tensor, device, /*non_blocking=*/true);
+    }
   }
   return out;
 }

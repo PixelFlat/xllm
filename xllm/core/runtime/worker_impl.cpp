@@ -2079,6 +2079,9 @@ TaskModel WorkerImpl::task_model() {
   CHECK(status_ == Status::LOADED || status_ == Status::READY);
   CHECK(model_ != nullptr && model_executor_ != nullptr);
   TaskModel task{*model_, *model_executor_, kv_caches_};
+  task.restore_request_state = [this](const ModelParamsView& params) {
+    try_restore_linear_state_slots(params);
+  };
   if (options_.host_blocks_factor() > 1.0) {
     // KV allocation follows pipeline creation. Resolve the shared target/draft
     // hierarchy only after a Task has passed admission and Prepare.

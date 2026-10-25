@@ -70,7 +70,7 @@ def _check_rank_snapshots(artifacts: Path) -> None:
     assert not mismatches, f"{len(mismatches)} TP bitwise mismatches; inspect {artifacts}:\n" + "\n".join(mismatches)
 
 
-def test_two_rank_dspark_greedy_graph_consensus(tmp_path: Path) -> None:
+def _run_workers(tmp_path: Path, *, all_reduce_only: bool = False) -> tuple[Path, list[dict]]:
     selection = os.environ.get("XLLM_TEST_HCCL_DEVICES")
     if selection is None:
         pytest.skip("set XLLM_TEST_HCCL_DEVICES to two verified-free logical NPU ids")
@@ -93,19 +93,22 @@ def test_two_rank_dspark_greedy_graph_consensus(tmp_path: Path) -> None:
         try:
             for rank, device in enumerate(devices):
                 log = stack.enter_context((artifacts / f"rank-{rank}.log").open("xb"))
+                command = [
+                    sys.executable,
+                    "-m",
+                    "tests.npu.dspark_greedy_consensus_worker",
+                    "--rank",
+                    str(rank),
+                    "--device",
+                    str(device),
+                    "--artifact-dir",
+                    str(artifacts),
+                ]
+                if all_reduce_only:
+                    command.append("--all-reduce-only")
                 processes.append(
                     subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "tests.npu.dspark_greedy_consensus_worker",
-                            "--rank",
-                            str(rank),
-                            "--device",
-                            str(device),
-                            "--artifact-dir",
-                            str(artifacts),
-                        ],
+                        command,
                         cwd=repo,
                         env=environment,
                         stdout=log,
@@ -138,10 +141,25 @@ def test_two_rank_dspark_greedy_graph_consensus(tmp_path: Path) -> None:
     assert summary["returncodes"] == [0, 0], f"rank failure; inspect {artifacts}"
     results = [json.loads((artifacts / f"rank-{rank}.json").read_text(encoding="utf-8")) for rank in range(2)]
     assert [result["rank"] for result in results] == [0, 1]
-    assert all(result["graph_replays"] == 12 for result in results)
     worker = Path(__file__).resolve().with_name("dspark_greedy_consensus_worker.py")
     source_hash = hashlib.sha256(worker.read_bytes()).hexdigest()
     assert all(result["worker_sha256"] == source_hash for result in results)
+    return artifacts, results
+
+
+def test_two_rank_large_all_reduce_graph_replays_changed_inputs(tmp_path: Path) -> None:
+    _, results = _run_workers(tmp_path, all_reduce_only=True)
+    assert all(result["cases"] == [] for result in results)
+    assert all(
+        result["mixed_all_reduce"]
+        == {"rows": [7, 448, 1024, 7], "hidden_size": 5120, "dtype": "bfloat16", "checked_values": [14, 18, 22]}
+        for result in results
+    )
+
+
+def test_two_rank_dspark_greedy_graph_consensus(tmp_path: Path) -> None:
+    artifacts, results = _run_workers(tmp_path)
+    assert all(result["graph_replays"] == 12 for result in results)
     assert [(case["dtype"], case["batch_size"]) for case in results[0]["cases"]] == [
         (dtype, batch) for dtype in ("torch.float32", "torch.bfloat16") for batch in (2, 3)
     ]

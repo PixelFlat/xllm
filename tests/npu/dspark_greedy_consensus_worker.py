@@ -194,11 +194,52 @@ def _run_case(
     return {"batch_size": batch_size, "dtype": str(dtype), "confidence_sha256": digests}
 
 
+def _run_mixed_all_reduce_graph(rank: int, device: torch.device) -> dict[str, object]:
+    """Mix inline and managed reductions at realistic C64 draft capacities."""
+    from xllm.python import distributed
+
+    rows = (7, 448, 1024, 7)
+    inputs = [torch.full((count, 5120), rank + 1, dtype=torch.bfloat16, device=device) for count in rows]
+
+    def operation() -> list[torch.Tensor]:
+        outputs = []
+        for value in inputs:
+            reduced = value + 1
+            distributed.tp_all_reduce(reduced)
+            outputs.append(reduced * 2)
+        return outputs
+
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        operation()
+        operation()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=stream):
+        outputs = operation()
+    pointers = [output.data_ptr() for output in outputs]
+    checked_values = []
+    for replay in range(3):
+        for value, output in zip(inputs, outputs, strict=True):
+            value.add_(1)
+            output.fill_(-99)
+        graph.replay()
+        torch.npu.synchronize()
+        expected = 14 + replay * 4
+        for output in outputs:
+            torch.testing.assert_close(output, torch.full_like(output, expected), atol=0, rtol=0)
+        assert [output.data_ptr() for output in outputs] == pointers
+        checked_values.append(expected)
+    return {"rows": rows, "hidden_size": 5120, "dtype": "bfloat16", "checked_values": checked_values}
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, choices=(0, 1), required=True)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--all-reduce-only", action="store_true")
     args = parser.parse_args()
     if args.device < 0:
         parser.error("device must be nonnegative")
@@ -230,11 +271,16 @@ def _main() -> None:
     collectives._group_ranks[("tp", str(device))] = (0, 1)
     get_hccl_comm(group, device, initialize=True)
     with torch.no_grad():
-        cases = [
-            _run_case(args.rank, batch, dtype, device, args.artifact_dir)
-            for dtype in (torch.float32, torch.bfloat16)
-            for batch in (2, 3)
-        ]
+        cases = (
+            []
+            if args.all_reduce_only
+            else [
+                _run_case(args.rank, batch, dtype, device, args.artifact_dir)
+                for dtype in (torch.float32, torch.bfloat16)
+                for batch in (2, 3)
+            ]
+        )
+        mixed_all_reduce = _run_mixed_all_reduce_graph(args.rank, device) if args.all_reduce_only else None
     collectives._groups.clear()
     collectives._group_ranks.clear()
     dist.destroy_process_group()
@@ -243,6 +289,7 @@ def _main() -> None:
         "graph_replays": len(cases) * 3,
         "worker_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "cases": cases,
+        "mixed_all_reduce": mixed_all_reduce,
     }
     (args.artifact_dir / f"rank-{args.rank}.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     logger.info(

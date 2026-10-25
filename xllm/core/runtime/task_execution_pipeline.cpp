@@ -210,7 +210,8 @@ void TaskExecutionPipeline::check_external_thread() const {
 
 Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
                                              const LlmTaskCapacity& capacity,
-                                             bool speculative) {
+                                             bool speculative,
+                                             bool recurrent) {
   const auto& params = source.input_params;
   const auto& host = params.attention.host;
   const auto& meta = params.meta;
@@ -227,7 +228,7 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
       params.prefill_without_cache ||
       ((!params.linear_state_cache_ops.empty() ||
         !params.linear_state_validity_mask.empty()) &&
-       !capacity.model.enable_linear_attention) ||
+       !recurrent && !capacity.model.enable_linear_attention) ||
       !params.multi_block_tables.empty() || params.mtp_topk_state != nullptr ||
       params.num_accepted_tokens.defined() ||
       !params.num_accepted_tokens_host.empty() ||
@@ -253,17 +254,51 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
   const auto inactive = [](int32_t id) { return id == -1; };
   const auto& linear_ids = embedding.linear_state_ids;
   const auto& linear_indices = embedding.linear_state_indices;
-  if (!capacity.model.enable_linear_attention &&
-      ((!linear_ids.empty() &&
-        (linear_ids.size() != host.q_seq_lens.size() ||
-         !std::all_of(linear_ids.begin(), linear_ids.end(), inactive))) ||
-       (linear_indices.defined() &&
-        (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
-         linear_indices.numel() !=
-             static_cast<int64_t>(host.q_seq_lens.size()) ||
-         !std::all_of(int_span(linear_indices).begin(),
-                      int_span(linear_indices).end(),
-                      inactive))))) {
+  if (recurrent) {
+    const size_t rows = host.q_seq_lens.size();
+    const auto& ops = params.linear_state_cache_ops;
+    if (!speculative || linear_ids.size() != rows ||
+        std::any_of(
+            linear_ids.begin(),
+            linear_ids.end(),
+            [&](int32_t id) { return id < (meta.is_graph_warmup ? 0 : 1); }) ||
+        (linear_indices.defined() &&
+         (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
+          linear_indices.numel() != static_cast<int64_t>(rows) ||
+          !std::equal(linear_ids.begin(),
+                      linear_ids.end(),
+                      int_span(linear_indices).begin()))) ||
+        (!ops.empty() &&
+         (ops.size() != rows ||
+          !std::equal(ops.begin(),
+                      ops.end(),
+                      linear_ids.begin(),
+                      [](const LinearStateCacheOp& op, int32_t id) {
+                        return op.linear_state_id == id;
+                      }))) ||
+        (!params.linear_state_validity_mask.empty() &&
+         params.linear_state_validity_mask.size() != rows)) {
+      return invalid("Recurrent task requires aligned CPU request state.");
+    }
+    if (meta.batch_forward_type.is_decode() &&
+        std::any_of(ops.begin(), ops.end(), [](const LinearStateCacheOp& op) {
+          return op.is_direct_read();
+        })) {
+      return invalid(
+          "Recurrent Decode cannot directly read a Prefill checkpoint.");
+    }
+  } else if (!capacity.model.enable_linear_attention &&
+             ((!linear_ids.empty() &&
+               (linear_ids.size() != host.q_seq_lens.size() ||
+                !std::all_of(
+                    linear_ids.begin(), linear_ids.end(), inactive))) ||
+              (linear_indices.defined() &&
+               (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
+                linear_indices.numel() !=
+                    static_cast<int64_t>(host.q_seq_lens.size()) ||
+                !std::all_of(int_span(linear_indices).begin(),
+                             int_span(linear_indices).end(),
+                             inactive))))) {
     return Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline does not support active linear-attention state.");
@@ -457,7 +492,10 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
   }
   const bool speculative = speculative_capacity_ != nullptr;
   if (worker_pipeline_ == nullptr) {
-    const Status status = validate_input(*source, capacity_, speculative);
+    const bool recurrent =
+        speculative && speculative_capacity_->hybrid_recurrent_target;
+    const Status status =
+        validate_input(*source, capacity_, speculative, recurrent);
     if (!status.ok()) {
       return TaskSubmission{status, 0};
     }

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from scripts.logger import logger
-from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LinearVerifyGraphInputs
 from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
@@ -39,13 +39,14 @@ class _PreparedBlockGraphEntry(AclGraphEntry):
 class _PreparedDSparkGraphEntry(AclGraphEntry):
     """Capture adaptive packing into the target's borrowed input views."""
 
-    __slots__ = ("dspark_adaptive",)
+    __slots__ = ("dspark_adaptive", "source_block_table")
 
     dspark_adaptive: DSparkAdaptiveGraphInputs
+    source_block_table: torch.Tensor
 
 
 def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tensor, ...]:
-    return (
+    tensors = (
         inputs.arena,
         inputs.control,
         inputs.anchors,
@@ -55,6 +56,9 @@ def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tens
         inputs.offsets,
         inputs.owners,
         inputs.columns,
+    )
+    return tensors + tuple(
+        tensor for tensor in (inputs.linear_state_indices, inputs.num_accepted_tokens) if tensor is not None
     )
 
 
@@ -169,6 +173,17 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if not isinstance(inputs.draft_width, int) or inputs.draft_width not in (5, 7):
             raise ValueError("adaptive DSpark draft_width must be 5 or 7")
         capacity = inputs.anchors.numel()
+        recurrent = inputs.linear_state_indices is not None or inputs.num_accepted_tokens is not None
+        if recurrent:
+            for tensor in (inputs.linear_state_indices, inputs.num_accepted_tokens):
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.shape != (capacity,)
+                    or tensor.dtype != torch.int32
+                    or tensor.device != input_ids.device
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError("adaptive recurrent DSpark requires request-scoped int32 state and acceptance")
         graph_rows = input_ids.numel()
         if graph_rows > 128 * (inputs.draft_width + 1):
             raise ValueError("adaptive DSpark graph capacity exceeds the compiled draft-width limit")
@@ -242,11 +257,15 @@ class PreparedAclGraphRunner(AclGraphRunner):
             raise ValueError("prepared ACL graph batch size exceeds capacity or is empty")
         if dspark_adaptive is not None and (
             self._block_draft
-            or not self.attention_backend.is_mla
+            or (not self.attention_backend.is_mla and dspark_adaptive.linear_state_indices is None)
+            or (self.dp_size != 1 and dspark_adaptive.linear_state_indices is not None)
             or input_embedding is not None
             or mtp_topk_indices is not None
         ):
-            raise ValueError("adaptive DSpark requires an ordinary MLA target graph with token-only inputs")
+            raise ValueError(
+                "adaptive DSpark requires an MLA or recurrent target graph with token-only inputs; "
+                "recurrent targets require DP=1"
+            )
         self._validate_prepared_dp(input_ids, metadata)
         if self._block_draft:
             if metadata.is_prefill or not metadata.is_chunked_prefill or metadata.is_spec_verify:
@@ -415,6 +434,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if dspark_adaptive is not None:
             entry = _PreparedDSparkGraphEntry()
             entry.dspark_adaptive = dspark_adaptive
+            entry.source_block_table = metadata.block_table
         else:
             entry = _PreparedBlockGraphEntry() if self._block_draft or self._device_kv_lengths else AclGraphEntry()
         entry.kv_capacity_pages = capacity_pages
@@ -469,10 +489,27 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 if entry.static_metadata.linear_state_write_indices is not None
                 else entry.static_metadata.linear_state_indices
             )
-        if self._block_draft or self._device_kv_lengths:
-            # Device-length graphs capture every declared capacity tier. DSpark retains its
-            # startup context bound. Live device lengths mask the valid prefix
-            # within each graph's fixed FIA capacity.
+        recurrent_verify = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
+        if recurrent_verify:
+            # Every admitted request owns at least its anchor, so a G-row
+            # graph can never contain more than G live recurrent states.
+            capacity = min(dspark_adaptive.anchors.numel(), entry.batch_size)
+            width = dspark_adaptive.draft_width + 1
+            entry.static_metadata.linear_verify_graph = LinearVerifyGraphInputs(
+                state_indices=torch.zeros(capacity, dtype=torch.int32, device=self.device),
+                num_accepted_tokens=torch.ones(capacity, dtype=torch.int32, device=self.device),
+                query_width=width,
+                packed_to_dense=torch.full(
+                    (entry.batch_size,), capacity * width, dtype=torch.int64, device=self.device
+                ),
+                dense_to_packed=torch.full(
+                    (capacity * width,), entry.batch_size, dtype=torch.int64, device=self.device
+                ),
+            )
+        if self._block_draft or self._device_kv_lengths or recurrent_verify:
+            # Like the legacy DSpark runner, capture at least the startup
+            # 16-page context plus the query. Keep the FIA bound constant;
+            # live device lengths, not captured Host lists, mask the prefix.
             page_size = self.attention_backend.page_size
             request_count = metadata.block_table.shape[0]
             query_width = entry.batch_size // request_count
@@ -487,13 +524,16 @@ class PreparedAclGraphRunner(AclGraphRunner):
             # metadata table at warmup; refresh it inside the captured forward
             # so replay has no extra Host launch and never scans full-context
             # padding just to preserve contiguity.
-            entry.source_block_table = metadata.block_table[:, :pages]
+            if self._block_draft or self._device_kv_lengths:
+                entry.source_block_table = metadata.block_table[:, :pages]
             static.block_table = (
-                entry.source_block_table.clone(memory_format=torch.contiguous_format)
+                metadata.block_table[:, :pages].clone(memory_format=torch.contiguous_format)
                 if self._device_kv_lengths
-                else entry.source_block_table.contiguous()
+                else metadata.block_table[:, :pages].contiguous()
             )
-            static.q_cu_seq_lens_host_values = list(metadata.q_cu_seq_lens_host_values)
+            static.q_cu_seq_lens_host_values = (
+                list(range(1, entry.batch_size + 1)) if recurrent_verify else list(metadata.q_cu_seq_lens_host_values)
+            )
             static.kv_seq_lens_host_values = [pages * page_size] * request_count
             static.is_chunked_prefill = self._block_draft
             static.prepared_attention_state = self.attention_backend.prepare_metadata(static, device_kv_lengths=True)
@@ -553,18 +593,45 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 entry.static_positions,
                 metadata.kv_seq_lens,
                 metadata.slot_mapping,
-                metadata.block_table,
+                entry.source_block_table,
                 metadata.q_seq_lens,
                 inputs.owners,
                 inputs.columns,
                 inputs.block_size,
                 inputs.draft_width,
             )
+            if metadata.block_table.data_ptr() != entry.source_block_table.data_ptr():
+                metadata.block_table.copy_(entry.source_block_table[:, : metadata.block_table.shape[1]])
+            graph = metadata.linear_verify_graph
+            if graph is not None:
+                self._refresh_linear_verify_graph(inputs, graph, entry.batch_size)
         if isinstance(entry, _PreparedBlockGraphEntry):
             table = entry.static_metadata.block_table
             if table.data_ptr() != entry.source_block_table.data_ptr():
                 table.copy_(entry.source_block_table)
         return super()._forward_static(entry)
+
+    @staticmethod
+    def _refresh_linear_verify_graph(
+        inputs: DSparkAdaptiveGraphInputs, graph: LinearVerifyGraphInputs, graph_rows: int
+    ) -> None:
+        # All control and prefix arithmetic stays on Device and is captured.
+        # Padding must select an explicit zero row, never a live request row.
+        capacity = graph.state_indices.numel()
+        rows = torch.arange(capacity, device=inputs.control.device)
+        columns = torch.arange(graph.query_width, device=inputs.control.device)
+        live = inputs.control.to(torch.int32)
+        active = rows < live
+        writable = active & (inputs.control < 2**32)
+        graph.state_indices.copy_(torch.where(writable, inputs.linear_state_indices[:capacity], 0))
+        graph.num_accepted_tokens.copy_(torch.where(active, inputs.num_accepted_tokens[:capacity], 1))
+        offsets = inputs.offsets[: capacity + 1].to(torch.int64)
+        widths = offsets[1:] - offsets[:-1]
+        dense = offsets[:-1, None] + columns
+        dense = torch.where(active[:, None] & (columns < widths[:, None]), dense, graph_rows)
+        graph.dense_to_packed.copy_(dense.flatten())
+        packed = inputs.owners.to(torch.int64) * graph.query_width + inputs.columns
+        graph.packed_to_dense.copy_(torch.where(inputs.owners >= 0, packed, capacity * graph.query_width))
 
     def execute(
         self,
@@ -620,9 +687,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
             # Counts precede native Slot padding; execution counts are physical.
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)
         self._prepare_graph_eplb_state(entry, eplb, metadata, first_capture=False)
-        self._prepare_attention(
-            entry, entry.static_metadata if self._block_draft or self._device_kv_lengths else metadata, replay=True
-        )
+        owned_metadata = self._block_draft or self._device_kv_lengths or isinstance(entry, _PreparedDSparkGraphEntry)
+        self._prepare_attention(entry, entry.static_metadata if owned_metadata else metadata, replay=True)
         stream = torch.npu.current_stream(self.device)
         entry.graph.replay()
         self._update_after_replay(entry, stream)

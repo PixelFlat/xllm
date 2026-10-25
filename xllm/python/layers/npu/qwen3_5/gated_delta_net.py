@@ -202,7 +202,10 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         state_cache = metadata.state_caches[self.layer_id]
 
         def _pad(tensor: torch.Tensor) -> torch.Tensor:
-            if metadata.packed_to_dense is not None:
+            if metadata.dense_to_packed is not None:
+                tensor = torch.cat((tensor, torch.zeros_like(tensor[:1])), dim=0)
+                tensor = tensor.index_select(0, metadata.dense_to_packed)
+            elif metadata.packed_to_dense is not None:
                 dense = tensor.new_zeros((batch_size * width, *tensor.shape[1:]))
                 tensor = dense.index_copy_(0, metadata.packed_to_dense, tensor)
             return tensor.reshape(batch_size, width, *tensor.shape[1:])
@@ -235,6 +238,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         output = chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=0)
         output = output.reshape(batch_size * width, self.value_dim)
         if metadata.packed_to_dense is not None:
+            if metadata.dense_to_packed is not None:
+                output = torch.cat((output, torch.zeros_like(output[:1])), dim=0)
             output = output.index_select(0, metadata.packed_to_dense)
         return output
 

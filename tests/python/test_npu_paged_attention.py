@@ -811,7 +811,7 @@ def test_prepared_decode_updates_captured_lists_without_mutating_snapshots() -> 
         assert prepared.actual_seq_kv is not captured_kv
 
 
-@pytest.mark.parametrize("width", [4, 8])
+@pytest.mark.parametrize("width", [1, 4, 8])
 @pytest.mark.parametrize("window", [None, 32])
 def test_block_attention_reads_accepted_device_lengths(width: int, window: int | None) -> None:
     if not torch.npu.is_available():
@@ -850,7 +850,7 @@ def test_block_attention_reads_accepted_device_lengths(width: int, window: int |
     metadata.kv_seq_lens.copy_(torch.tensor([130, 139], device=device, dtype=torch.int32))
     assert metadata.prepared_attention_state.actual_seq_kv == [137, 143]
     layer = SimpleNamespace(
-        causal=False,
+        causal=width == 1,
         fia_use_attention_mask=False,
         fia_sparse_mode=None,
         fia_pre_tokens=2147483647,

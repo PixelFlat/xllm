@@ -778,14 +778,21 @@ def test_accepted_counts_refresh_in_stable_graph_buffer() -> None:
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_capture_restores_all_gdn_checkpoints(index_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("state_ids", [(1,), (0,) * 64, (2, 0, 2, 1, 0), tuple(range(64))])
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_capture_restores_all_gdn_checkpoints(
+    index_dtype: torch.dtype, state_ids: tuple[int, ...], capture_fails: bool
+) -> None:
     runner = _runner()
-    indices = torch.tensor([1], dtype=index_dtype)
-    conv = torch.arange(60, dtype=torch.float32).reshape(3, 10, 2)
-    ssm = torch.arange(96, dtype=torch.float32).reshape(24, 1, 2, 2)
+    indices = torch.tensor(state_ids, dtype=index_dtype)
+    touched = torch.tensor(sorted(set(state_ids)), dtype=torch.int64)
+    checkpoints = (touched[:, None] * 8 + torch.arange(8)).reshape(-1)
+    slots = max(3, max(state_ids) + 1)
+    conv = torch.arange(slots * 20, dtype=torch.float32).reshape(slots, 10, 2)
+    ssm = torch.arange(slots * 32, dtype=torch.float32).reshape(slots * 8, 1, 2, 2)
     original_conv, original_ssm = conv.clone(), ssm.clone()
     runner.layer_caches = [LayerCache(key=None, value=None, conv=conv, ssm=ssm)]
-    runner.attention_backend.snapshot_linear_state = lambda _: None
+    runner.attention_backend.snapshot_linear_state = Mock(return_value=None)
     entry = AclGraphEntry()
     entry.static_metadata = SimpleNamespace(
         linear_state_indices=indices,
@@ -798,19 +805,25 @@ def test_capture_restores_all_gdn_checkpoints(index_dtype: torch.dtype) -> None:
         return index_select(tensor, dim, selected)
 
     def capture(*_: object) -> None:
-        conv[1].fill_(-1)
-        ssm[8:16].fill_(-1)
+        conv.index_fill_(0, touched, -1)
+        ssm.index_fill_(0, checkpoints, -1)
+        if capture_fails:
+            raise RuntimeError("capture failed")
 
     with (
         patch.object(AclGraphRunner, "_capture", side_effect=capture),
         patch.object(torch.npu, "current_stream", return_value=Mock()),
         patch.object(torch.Tensor, "index_select", new=record_snapshot),
     ):
-        runner._capture(entry, Mock())
+        failure = pytest.raises(RuntimeError, match="capture failed") if capture_fails else nullcontext()
+        with failure:
+            runner._capture(entry, Mock())
 
     torch.testing.assert_close(conv, original_conv)
     torch.testing.assert_close(ssm, original_ssm)
-    assert snapshot_rows == [8, 1]
+    assert snapshot_rows == [touched.numel(), checkpoints.numel()]
+    saved_indices = runner.attention_backend.snapshot_linear_state.call_args.args[0]
+    torch.testing.assert_close(saved_indices, touched)
 
 
 def test_untyped_verify_reuses_row_aligned_paging_metadata() -> None:
