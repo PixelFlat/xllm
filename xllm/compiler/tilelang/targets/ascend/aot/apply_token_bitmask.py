@@ -52,4 +52,7 @@ class ApplyTokenBitmaskKernel(TilelangKernel):
         )
         with tilelang.tvm.transform.PassContext(opt_level=3, config=DEFAULT_ASCEND_PASS_CONFIGS):
             kernel = tilelang.engine.lower(tilelang_kernel)
-        return kernel.kernel_source
+        # TileLang can emit CUDA's infinity macro for Ascend float constants.
+        # Keep the mask at -inf without requiring CUDA headers or build flags.
+        compat_header = "#ifndef CUDART_INF\n#define CUDART_INF (__builtin_inff())\n#endif\n"
+        return compat_header + kernel.kernel_source

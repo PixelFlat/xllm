@@ -194,6 +194,40 @@ TEST_F(ApplyTokenBitmaskWrapperTest, MatchesReferenceAcrossDtypesAndPatterns) {
   }
 }
 
+TEST_F(ApplyTokenBitmaskWrapperTest,
+       PreservesAllowedLogitsAndMasksWithInfinity) {
+  const torch::Device device("npu:0");
+  const std::vector<torch::ScalarType> dtypes = {
+      torch::kFloat16, torch::kBFloat16, torch::kFloat32};
+  for (const torch::ScalarType dtype : dtypes) {
+    SCOPED_TRACE(static_cast<int32_t>(dtype));
+    const auto options = torch::TensorOptions().dtype(dtype).device(device);
+    torch::Tensor input = torch::arange(64, options).view({2, 32}) - 32;
+    input.select(/*dim=*/1, /*index=*/0)
+        .fill_(-std::numeric_limits<float>::infinity());
+    const torch::Tensor bitmask = make_mask(2, 32, "boundaries").to(device);
+    torch::Tensor actual = input.clone();
+
+    ASSERT_TRUE(can_apply_token_bitmask_inplace(actual, bitmask));
+    apply_token_bitmask_inplace(actual, bitmask);
+    ASSERT_EQ(aclrtSynchronizeStream(
+                  c10_npu::getCurrentNPUStream(device.index()).stream()),
+              ACL_SUCCESS);
+
+    const torch::Tensor result = actual.to(torch::kCPU);
+    const torch::Tensor original = input.to(torch::kCPU);
+    EXPECT_TRUE(torch::equal(result.select(/*dim=*/1, /*index=*/0),
+                             original.select(/*dim=*/1, /*index=*/0)));
+    EXPECT_TRUE(torch::equal(result.select(/*dim=*/1, /*index=*/31),
+                             original.select(/*dim=*/1, /*index=*/31)));
+    EXPECT_TRUE(
+        torch::isneginf(result.slice(/*dim=*/1, /*start=*/1, /*end=*/31))
+            .all()
+            .item<bool>());
+    EXPECT_FALSE(torch::isnan(result).any().item<bool>());
+  }
+}
+
 TEST_F(ApplyTokenBitmaskWrapperTest, RejectsInputsThatRequireFallback) {
   const auto device = torch::Device("npu:0");
   const auto options =
