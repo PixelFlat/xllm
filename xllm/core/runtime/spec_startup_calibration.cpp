@@ -38,7 +38,7 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration(
       return;
     }
     if (!speculative_capacity_ || !speculative_capacity_->startup_calibration ||
-        !dspark_adaptive_ || dspark_adaptive_->startup_calibration_complete ||
+        !adaptive_verify_ || adaptive_verify_->startup_calibration_complete ||
         !accepted_.empty()) {
       promise.setValue(std::nullopt);
       return;
@@ -127,8 +127,9 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
   std::vector<uint32_t> graphs;
   const uint32_t draft_width = speculative_capacity_->num_speculative_tokens;
   const auto& first = *slots_.front()->speculative->drafts.front();
+  const uint32_t draft_rows_per_request = block_draft() ? draft_width : 2;
   for (const int64_t rows : first.captured_graph_batch_sizes) {
-    if (rows <= 0 || rows % draft_width != 0) {
+    if (rows <= 0 || rows % draft_rows_per_request != 0) {
       return std::nullopt;
     }
     const bool common =
@@ -138,17 +139,29 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
           return std::binary_search(captured.begin(), captured.end(), rows);
         });
     if (common) {
-      requests.emplace_back(static_cast<uint32_t>(rows / draft_width));
+      requests.emplace_back(
+          static_cast<uint32_t>(rows / draft_rows_per_request));
     }
   }
   graphs.reserve(captured_graph_batch_sizes_.size());
   for (const int64_t rows : captured_graph_batch_sizes_) {
     graphs.emplace_back(static_cast<uint32_t>(rows));
   }
-  const auto graph_coverage = adaptive_dspark_graph_coverage();
+  const auto graph_coverage = adaptive_verify_graph_coverage();
   const auto kv_bound = [&](uint32_t batch) {
     uint64_t bound =
         std::min(capacity_.max_kv_seq_len, capacity_.max_positions);
+    if (!block_draft()) {
+      const auto capabilities = draft_step_calibration_capabilities();
+      if (!capabilities) {
+        return uint32_t{0};
+      }
+      bound = std::min(bound,
+                       nlohmann::json::parse(*capabilities)
+                           .at("max_kv_length")
+                           .get<uint64_t>());
+      return static_cast<uint32_t>(bound);
+    }
     for (const auto& slot : slots_) {
       const auto& draft = *slot->speculative->drafts.front();
       const auto captured =
@@ -187,7 +200,7 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
           .dump();
     }
     case SpecCalibrationAction::BEGIN_SAMPLE: {
-      if (dspark_adaptive_->calibration_point) {
+      if (adaptive_verify_->calibration_point) {
         return std::nullopt;
       }
       const auto data = nlohmann::json::parse(command.payload, nullptr, false);
@@ -210,19 +223,19 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
       if (point.context.max_kv_length > kv_bound(point.requests)) {
         return std::nullopt;
       }
-      dspark_adaptive_->calibration_point = point;
+      adaptive_verify_->calibration_point = point;
       if (speculative_capacity_->calibration_leader) {
-        dspark_adaptive_->calibration_session =
+        adaptive_verify_->calibration_session =
             std::make_unique<SpecCalibrationSession>(*config, point);
       }
       return std::string("sample_started");
     }
     case SpecCalibrationAction::FINISH_SAMPLE: {
-      if (!dspark_adaptive_->calibration_point) {
+      if (!adaptive_verify_->calibration_point) {
         return std::nullopt;
       }
       nlohmann::json result = nlohmann::json::array();
-      const auto& session = dspark_adaptive_->calibration_session;
+      const auto& session = adaptive_verify_->calibration_session;
       if (speculative_capacity_->calibration_leader) {
         if (!session || !session->finished()) {
           return std::nullopt;
@@ -242,12 +255,12 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
                              {"elapsed_ms", window.elapsed_ms}});
         }
       }
-      dspark_adaptive_->calibration_session.reset();
-      dspark_adaptive_->calibration_point.reset();
+      adaptive_verify_->calibration_session.reset();
+      adaptive_verify_->calibration_point.reset();
       return result.dump();
     }
     case SpecCalibrationAction::INSTALL_COSTS: {
-      if (dspark_adaptive_->calibration_point) {
+      if (adaptive_verify_->calibration_point) {
         return std::nullopt;
       }
       const auto bundle = SpecCostTableBundle::from_json(command.payload);
@@ -298,14 +311,14 @@ std::optional<std::string> TaskExecutionPipeline::spec_calibration_impl(
       if (installed_profiles == 0) {
         return std::nullopt;
       }
-      dspark_adaptive_->owned_costs = std::move(costs);
-      speculative_capacity_->adaptive_costs = dspark_adaptive_->owned_costs;
-      dspark_adaptive_->histories.assign(dspark_adaptive_->histories.size(),
+      adaptive_verify_->owned_costs = std::move(costs);
+      speculative_capacity_->adaptive_costs = adaptive_verify_->owned_costs;
+      adaptive_verify_->histories.assign(adaptive_verify_->histories.size(),
                                          {});
-      dspark_adaptive_->retired_plans = {};
+      adaptive_verify_->retired_plans = {};
       std::fill(context_->published_.begin(), context_->published_.end(), 0);
       context_->request_ids_.assign(context_->request_ids_.size(), {});
-      dspark_adaptive_->startup_calibration_complete = true;
+      adaptive_verify_->startup_calibration_complete = true;
       // Echo the canonical table, allowing the master to confirm every rank
       // installed exactly the same immutable costs before declaring ready.
       return command.payload;

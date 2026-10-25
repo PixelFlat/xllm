@@ -75,7 +75,8 @@ DEFINE_bool(
     "Adapt the target verification budget by pruning already-generated "
     "draft proposals using historical confidence and full-cycle costs, "
     "without reducing draft generation steps. Currently implemented "
-    "for DSpark Draft5/7 with Python ACL graphs and task pipeline. "
+    "for DSpark and greedy MTP Draft5/7 with Python ACL graphs and task "
+    "pipeline. "
     "Costs are calibrated at startup unless a saved table is supplied.");
 
 DEFINE_bool(enable_adaptive_draft_step,
@@ -97,7 +98,7 @@ DEFINE_double(
     adaptive_target_verify_min_gain,
     0.0,
     "Minimum predicted relative throughput gain required to change the "
-    "adaptive DSpark verification budget.");
+    "adaptive target verification budget.");
 
 DEFINE_string(
     adaptive_target_verify_cost_table,
@@ -261,28 +262,30 @@ void SpeculativeConfig::validate() const {
   CHECK(adaptive_target_verify_calibration().empty() ||
         (adaptive_target_verify_cost_table().empty() &&
          enable_adaptive_target_verify() &&
-         is_dspark_algorithm(speculative_algorithm()) &&
+         supports_adaptive_target_verify(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
-      << "adaptive_target_verify_calibration requires adaptive DSpark Draft5/7 "
+      << "adaptive_target_verify_calibration requires adaptive MTP/DSpark "
+         "Draft5/7 "
          "without "
          "a cost-table input.";
   CHECK(adaptive_target_verify_cost_table_output().empty() ||
         (adaptive_target_verify_cost_table().empty() &&
          enable_adaptive_target_verify() &&
-         is_dspark_algorithm(speculative_algorithm()) &&
+         supports_adaptive_target_verify(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
       << "adaptive_target_verify_cost_table_output requires startup "
          "calibration.";
   CHECK(adaptive_target_verify_cost_table().empty() ||
         (enable_adaptive_target_verify() &&
-         is_dspark_algorithm(speculative_algorithm()) &&
+         supports_adaptive_target_verify(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
-      << "adaptive_target_verify_cost_table requires adaptive DSpark Draft5/7.";
+      << "adaptive_target_verify_cost_table requires adaptive MTP/DSpark "
+         "Draft5/7.";
   CHECK(!enable_adaptive_target_verify() ||
         (supports_adaptive_target_verify(speculative_algorithm()) &&
          (num_speculative_tokens() == 5 || num_speculative_tokens() == 7)))
-      << "Adaptive target verification supports only DSpark Draft5/7; "
-         "MTP, DFlash and DFlash2 do not support target verification pruning.";
+      << "Adaptive target verification supports MTP/DSpark Draft5/7; "
+         "DFlash and DFlash2 do not support target verification pruning.";
   if (enable_probabilistic_draft()) {
     CHECK(is_probabilistic_draft_sampling_supported(speculative_algorithm()))
         << speculative_algorithm()

@@ -123,6 +123,8 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     torch::Tensor owners;
     torch::Tensor columns_storage;
     torch::Tensor columns;
+    // Dense refresh/state recovery reuses MTP's existing hidden-state buffer.
+    torch::Tensor hidden_columns;
   };
   struct Draft {
     std::vector<int64_t> graph_batch_sizes;
@@ -194,7 +196,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   torch::Tensor target_logits;
 };
 
-struct TaskExecutionPipeline::DSparkAdaptiveState {
+struct TaskExecutionPipeline::AdaptiveVerifyState {
   struct Feedback {
     uint64_t generation = 0;
     uint64_t rounds_since_full_width = 0;

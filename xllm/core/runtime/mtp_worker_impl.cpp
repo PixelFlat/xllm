@@ -812,7 +812,6 @@ template <typename TargetInput>
 ::xllm::Status MTPWorkerImpl<TargetInput>::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      options_.enable_adaptive_target_verify() ||
       options_.num_speculative_tokens() <= 0 ||
       draft_impl_->context_.get_model_args().model_type() !=
           "glm_moe_dsa_mtp") {
@@ -828,10 +827,20 @@ template <typename TargetInput>
   const auto& args = draft_impl_->context_.get_model_args();
   capacity.num_speculative_tokens = options_.num_speculative_tokens();
   capacity.adaptive_draft_step = options_.enable_adaptive_draft_step();
+  capacity.adaptive_target_verify = options_.enable_adaptive_target_verify();
+  capacity.adaptive_min_gain = options_.adaptive_target_verify_min_gain();
+  capacity.startup_calibration = capacity.adaptive_target_verify;
+  capacity.calibration_leader = parallel_args_.rank() == 0;
+  capacity.sparse_dsa_target =
+      impl_->context_.get_model_args().model_type() == "glm_moe_dsa";
   capacity.index_topk = args.index_topk();
   capacity.reuse_topk = args.index_share_for_mtp_iteration();
   capacity.refresh_target_prefix = capacity.num_speculative_tokens > 1;
-  if (get_optimization_config().enable_spec_token_broadcast) {
+  // Ragged random-target verification commits context before returning the
+  // final result. Its target draws must agree even if optional legacy token
+  // broadcast is disabled; greedy tasks still skip the collective entirely.
+  if (get_optimization_config().enable_spec_token_broadcast ||
+      capacity.adaptive_target_verify) {
     capacity.common.sampling_group = parallel_args_.tp_group_ != nullptr
                                          ? parallel_args_.tp_group_
                                          : parallel_args_.process_group_;

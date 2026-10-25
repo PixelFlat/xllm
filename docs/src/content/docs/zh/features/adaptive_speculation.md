@@ -25,7 +25,7 @@ limitations under the License.
 | 控制开关 | 本身含义 | 当前接入及适用原因 |
 |:---------|:---------|:-------------------|
 | `enable_adaptive_draft_step` | 调整一次 target 验证前实际执行的顺序 draft forward 步数。 | MTP 顺序生成候选，减少步数既能省去 draft forward，也能缩短验证长度。 |
-| `enable_adaptive_target_verify` | 调整已经生成的候选中，交给 target 验证的数量。 | DSpark 一次 forward 并行生成候选块，裁剪低置信度后缀可减少验证工作，但不改变 draft 的生成宽度。 |
+| `enable_adaptive_target_verify` | 调整已经生成的候选中，交给 target 验证的数量。 | DSpark 使用 confidence head，MTP 使用选中 token 的 draft 概率；均保持 draft 生成宽度不变，只裁剪验证工作。 |
 
 两个开关默认均为 `false`，当前不能同时开启；通用命名不表示其他算法已经接入。
 参数类型和默认值见 [CLI reference](/zh/cli_reference/#speculativeconfig)。
@@ -100,6 +100,33 @@ xllm --model=/models/target --draft_model=/models/mtp \
 其中任一部分均可省略并使用默认值。显式采样范围必须落在真实预热图和 KV 容量
 内；这些设置影响启动标定的覆盖范围与耗时，不修改客户端请求或采样参数。
 各候选步数均独立实测成本；此参数不支持加载预计算的 `step_cost_models`。
+
+## 基于 MTP logits 的自适应 target 验证
+
+greedy MTP Draft5/7 可开启 `enable_adaptive_target_verify=true`。每轮仍执行
+全部 draft 步数，再以 `exp(selected_logit - logsumexp(draft_logits))` 作为
+接受概率的预测分数。它不等于真实 target 接受概率。前缀分配、打包及提交复用
+现有 kernel，不增加另一套 MTP 专用裁剪 kernel。
+
+Host 仅用 n−2 及更早回收的反馈，以及当前 MTP 服务实测的完整轮成本，提前
+决定 padding 后的 target 图预算。当前轮概率保留在 Device 上用于前缀分配，
+小量异步反馈与正常结果一起回收，不在 draft 与 target 之间新增 Host 等待。
+紧凑 target 输出的 hidden state 按 Device offsets 恢复后再更新 MTP 上下文
+及 prefix refresh。
+
+在上面的 MTP 启动命令中，用以下选项替换自适应步长设置：
+
+```bash
+--num_speculative_tokens=5 --enable_adaptive_draft_step=false \
+--enable_adaptive_target_verify=true --enable_probabilistic_draft=false
+```
+
+此路径要求普通 Python GLM DSA ACL graph、异步调度、task pipeline 和 DP=CP=1。
+greedy 或随机 target（包括混合 batch）复用现有 ragged 验证器，draft 必须保持
+greedy。随机 target 的 token 在前缀提交和上下文更新之前先达成 TP 共识。
+unified MTP graph 以及同时开启自适应 draft 步长会在执行前拒绝。启动成本标定
+使用 greedy target，未计入随机 target 的额外采样工作。下述 `adaptive_target_verify_*`
+成本表与启动标定选项也适用，但不能将 DSpark 实测成本表用于 MTP。
 
 ## 自适应 target 验证（DSpark）
 

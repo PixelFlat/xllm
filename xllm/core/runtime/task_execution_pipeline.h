@@ -106,7 +106,7 @@ struct SpeculativeTaskCapacity {
   bool refresh_target_prefix = false;
   bool is_probabilistic_draft = false;
   bool unified_graph = false;
-  bool adaptive_dspark = false;
+  bool adaptive_target_verify = false;
   bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;
   double adaptive_min_gain = 0.0;
@@ -336,22 +336,22 @@ class TaskExecutionPipeline final {
   void launch_block_draft(SpeculativeSlot& slot);
   void generate_adaptive_dspark_proposals(SpeculativeSlot& slot,
                                           const torch::Tensor& anchors);
-  void launch_adaptive_dspark(SpeculativeSlot& slot);
-  Status plan_adaptive_dspark(SpeculativeSlot& slot,
+  void launch_adaptive_verify(SpeculativeSlot& slot);
+  Status plan_adaptive_verify(SpeculativeSlot& slot,
                               const LlmForwardInput& input);
   Status plan_dp_adaptive_dspark(SpeculativeSlot& slot,
                                  const LlmForwardInput& input);
-  Status warmup_adaptive_dspark_graphs(const LlmForwardInput& input);
+  Status warmup_adaptive_verify_graphs(const LlmForwardInput& input);
   Status warmup_adaptive_unified_graphs(const LlmForwardInput& input);
-  std::vector<SpecCalibrationGraphCoverage> adaptive_dspark_graph_coverage()
+  std::vector<SpecCalibrationGraphCoverage> adaptive_verify_graph_coverage()
       const;
-  void bind_adaptive_dspark_views(SpeculativeSlot& slot);
-  void bind_adaptive_dspark_graph_input(SpeculativeSlot& slot,
+  void bind_adaptive_verify_views(SpeculativeSlot& slot);
+  void bind_adaptive_verify_graph_input(SpeculativeSlot& slot,
                                         bool suppress_kv_writes);
   std::optional<std::string> spec_calibration_impl(
       const SpecCalibrationCommand& command);
   std::optional<std::string> draft_step_calibration_capabilities() const;
-  void consume_adaptive_dspark(SpeculativeSlot& slot);
+  void consume_adaptive_verify(SpeculativeSlot& slot);
   void write_block_context(SpeculativeSlot& slot, bool prefill);
   // Broadcasts the sample result tensors across the TP/CP sampling groups.
   void synchronize_samples(const TokenResultTensors& result,
@@ -376,8 +376,8 @@ class TaskExecutionPipeline final {
   void release_outputs(SpeculativeSlot& slot);
 
   std::unique_ptr<SpeculativeTaskCapacity> speculative_capacity_;
-  struct DSparkAdaptiveState;
-  std::unique_ptr<DSparkAdaptiveState> dspark_adaptive_;
+  struct AdaptiveVerifyState;
+  std::unique_ptr<AdaptiveVerifyState> adaptive_verify_;
   WorkerImpl* worker_pipeline_ = nullptr;
   std::unique_ptr<TaskModel> draft_;
   torch::ScalarType hidden_dtype_ = torch::kFloat32;

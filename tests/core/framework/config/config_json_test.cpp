@@ -41,18 +41,18 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(SpeculativeConfigTest, AdaptiveRequiresDsparkDraftFiveOrSeven) {
+TEST(SpeculativeConfigTest, AdaptiveVerifyRequiresMtpOrDsparkDraftFiveOrSeven) {
   SpeculativeConfig config;
   config.enable_adaptive_target_verify(true);
   for (const std::string& algorithm :
-       {"MTP", "mtp", "DFlash", "DFlash2", "Eagle3", "Suffix", "unknown"}) {
+       {"DFlash", "DFlash2", "Eagle3", "Suffix", "unknown"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm).num_speculative_tokens(7);
-    EXPECT_DEATH(config.validate(), "supports only DSpark Draft5/7");
+    EXPECT_DEATH(config.validate(), "supports MTP/DSpark Draft5/7");
     EXPECT_FALSE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
   }
   for (const std::string& algorithm :
-       {"DSpark", "dspark", "DSPARK", "dSpArK"}) {
+       {"MTP", "mtp", "MtP", "DSpark", "dspark", "DSPARK", "dSpArK"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm);
     EXPECT_TRUE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
@@ -62,7 +62,7 @@ TEST(SpeculativeConfigTest, AdaptiveRequiresDsparkDraftFiveOrSeven) {
     }
     for (const int32_t width : {0, 1, 3, 6, 8}) {
       config.num_speculative_tokens(width);
-      EXPECT_DEATH(config.validate(), "supports only DSpark Draft5/7");
+      EXPECT_DEATH(config.validate(), "supports MTP/DSpark Draft5/7");
     }
   }
 }
@@ -232,19 +232,25 @@ TEST(SpeculativeConfigTest, ExternalDsparkCostTableRoundTripsAndAppearsInHelp) {
   EXPECT_FALSE(serialized.contains("enable_adaptive_speculative_decode"));
 }
 
-TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveDsparkDraft7) {
+TEST(SpeculativeConfigTest, ExternalCostTableRequiresAdaptiveMtpOrDspark) {
   google::FlagSaver flag_saver;
   SpeculativeConfig speculative_config;
   speculative_config.adaptive_target_verify_cost_table("/tmp/dspark_sps.json");
   EXPECT_DEATH(speculative_config.validate(),
-               "requires adaptive DSpark Draft5/7");
-  speculative_config.enable_adaptive_target_verify(true)
-      .speculative_algorithm("DSpark")
-      .num_speculative_tokens(5);
-  speculative_config.validate();
+               "requires adaptive MTP/DSpark Draft5/7");
+  speculative_config.enable_adaptive_target_verify(true);
+  for (const std::string& algorithm : {"DSpark", "MTP"}) {
+    SCOPED_TRACE(algorithm);
+    speculative_config.speculative_algorithm(algorithm);
+    for (const int32_t width : {5, 7}) {
+      SCOPED_TRACE(width);
+      speculative_config.num_speculative_tokens(width);
+      EXPECT_NO_FATAL_FAILURE(speculative_config.validate());
+    }
+  }
   speculative_config.num_speculative_tokens(6);
   EXPECT_DEATH(speculative_config.validate(),
-               "requires adaptive DSpark Draft5/7");
+               "requires adaptive MTP/DSpark Draft5/7");
 }
 
 TEST(SpeculativeConfigTest,

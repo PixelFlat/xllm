@@ -332,7 +332,7 @@ LLMMaster::LLMMaster(const Options& options)
             .enable_adaptive_target_verify(
                 options_.enable_task_pipeline() &&
                 options_.enable_adaptive_target_verify() &&
-                SpeculativeConfig::is_dspark_algorithm(
+                SpeculativeConfig::supports_adaptive_target_verify(
                     options_.speculative_algorithm()))
             .adaptive_target_verify_cost_table(
                 options_.adaptive_target_verify_cost_table())

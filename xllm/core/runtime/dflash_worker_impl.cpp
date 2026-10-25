@@ -446,9 +446,9 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
        draft_args.model_type() == "DSparkDraftModel") &&
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
-  capacity.adaptive_dspark = options_.enable_adaptive_target_verify();
+  capacity.adaptive_target_verify = options_.enable_adaptive_target_verify();
   capacity.adaptive_min_gain = options_.adaptive_target_verify_min_gain();
-  capacity.startup_calibration = capacity.adaptive_dspark;
+  capacity.startup_calibration = capacity.adaptive_target_verify;
   capacity.calibration_leader = parallel_args_.rank() == 0;
   if (capacity.startup_calibration &&
       (!options_.enable_graph() || !options_.enable_schedule_overlap() ||

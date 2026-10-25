@@ -195,9 +195,10 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   // GLM5 KDA targets need fixed-width speculative decoding; adaptive pruning
   // resizes per-step draft widths, which the KDA handoff cannot follow.
   CHECK(!(is_glm5_next_target_model_type(args.model_type()) &&
-          options.enable_adaptive_spec_prune()))
+          (options.enable_adaptive_target_verify() ||
+           options.enable_adaptive_draft_step())))
       << "GLM5 KDA does not support adaptive speculative decode; disable "
-         "--enable_adaptive_spec_prune.";
+         "--enable_adaptive_target_verify and --enable_adaptive_draft_step.";
 
   py::gil_scoped_acquire gil;
   ensure_xllm_runtime_module();

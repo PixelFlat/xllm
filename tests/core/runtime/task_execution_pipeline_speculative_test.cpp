@@ -22,6 +22,7 @@ limitations under the License.
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -76,9 +77,9 @@ TEST(UnifiedBlockAdmissionTest, HonorsGraphSwitchAndExpandedBatchLimit) {
   EXPECT_FALSE(supports_unified_block_graph(capacity, 1, input));
   capacity.common.max_graph_batch_size = 8 * 9;
   EXPECT_TRUE(supports_unified_block_graph(capacity, 8, input));
-  capacity.adaptive_dspark = true;
+  capacity.adaptive_target_verify = true;
   EXPECT_FALSE(supports_unified_block_graph(capacity, 8, input));
-  capacity.adaptive_dspark = false;
+  capacity.adaptive_target_verify = false;
   EXPECT_FALSE(supports_unified_block_graph(capacity, 9, input));
   EXPECT_FALSE(supports_unified_block_graph(capacity, 0, input));
   EXPECT_FALSE(supports_unified_block_graph(
@@ -229,8 +230,8 @@ class CountingModel final : public CausalLM {
     const auto next =
         hidden.index_select(0, selected.to(torch::kInt64)).to(torch::kInt64) +
         logit_increments[call % logit_increments.size()];
-    auto output = torch::full({selected.numel(), 32}, -20.0, options_);
-    output.scatter_(/*dim=*/1, next, /*value=*/20.0);
+    auto output = torch::full({selected.numel(), 32}, -logit_peak, options_);
+    output.scatter_(/*dim=*/1, next, /*value=*/logit_peak);
     return output;
   }
 
@@ -281,6 +282,7 @@ class CountingModel final : public CausalLM {
   bool adaptive_unified_capable = true;
   torch::Tensor row_markov_increments;
   bool confidence_head = false;
+  double logit_peak = 20.0;
   float confidence_value = 0.0F;
   std::vector<torch::Tensor> confidence_hidden;
   std::vector<torch::Tensor> confidence_previous;
@@ -953,7 +955,7 @@ class SpeculativePipelineTest : public ::testing::Test {
                                  uint32_t draft_width = 7) {
     configure_dspark_batch_graphs();
     capacity_.num_speculative_tokens = draft_width;
-    capacity_.adaptive_dspark = true;
+    capacity_.adaptive_target_verify = true;
     capacity_.sparse_dsa_target = true;
     draft_->confidence_head = true;
     auto costs = std::make_shared<SpecCostProfileStore>();
@@ -3007,6 +3009,185 @@ TEST_F(SpeculativePipelineTest,
 }
 
 TEST_F(SpeculativePipelineTest,
+       AdaptiveMtpStartupCalibrationReportsRequestBucketsNotDraftRows) {
+  configure_adaptive_dspark(/*profiled=*/false, /*draft_width=*/5);
+  capacity_.kind = SpeculativeTaskKind::MTP;
+  capacity_.refresh_target_prefix = true;
+  capacity_.startup_calibration = true;
+  capacity_.adaptive_costs.reset();
+  draft_->block_draft = false;
+  draft_->confidence_head = false;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_batch_graphs();
+  const auto capabilities =
+      pipeline_->spec_calibration({SpecCalibrationAction::CAPABILITIES, {}});
+  ASSERT_TRUE(capabilities.has_value());
+  const auto geometry = nlohmann::json::parse(*capabilities);
+  EXPECT_EQ(geometry.at("draft_width"), 5);
+  EXPECT_EQ(geometry.at("request_buckets").get<std::vector<uint32_t>>(),
+            (std::vector<uint32_t>{1, 2, 4}));
+  EXPECT_TRUE(geometry.at("graph_coverage").empty());
+  for (const auto& bound : geometry.at("kv_bounds")) {
+    EXPECT_EQ(bound.at("max_kv_length"), 32);
+  }
+  EXPECT_TRUE(draft_->confidence_hidden.empty());
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveMtpLogitsPruneRaggedTargetWithoutConfidenceHeadOrBroadcast) {
+  configure_adaptive_dspark(/*profiled=*/true, /*draft_width=*/5);
+  capacity_.kind = SpeculativeTaskKind::MTP;
+  capacity_.refresh_target_prefix = true;
+  draft_->block_draft = false;
+  draft_->confidence_head = false;
+  draft_->logit_peak = 0.5;
+  RecordingSamples leader(device_);
+  capacity_.common.sampling_group = &leader;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  auto logprob_request = dspark_batch_input(3, /*decode=*/false);
+  logprob_request.sampling_params.logprobs = true;
+  EXPECT_FALSE(pipeline_->submit(logprob_request).status.ok());
+  EXPECT_TRUE(target_->forward_inputs.empty());
+  EXPECT_TRUE(draft_->forward_inputs.empty());
+  warmup_dspark_batch_graphs();
+  execute(dspark_batch_input(3, /*decode=*/false));
+  const size_t target_warmups = target_->graph_warmup_bindings.size();
+  const size_t draft_warmups = draft_->graph_warmup_bindings.size();
+  const size_t broadcasts = leader.broadcasts();
+  const auto first = pipeline_->submit(dspark_batch_input(3, /*decode=*/true));
+  ASSERT_TRUE(first.status.ok()) << first.status.message();
+  const auto second = pipeline_->submit(dspark_batch_input(
+      3, /*decode=*/true, /*placeholder=*/true, /*position=*/3));
+  ASSERT_TRUE(second.status.ok()) << second.status.message();
+  const auto first_result = pipeline_->take_result_async(first.task_id).get();
+  const auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(first_result.status.ok());
+  ASSERT_TRUE(second_result.status.ok());
+  ASSERT_EQ(first_result.output.spec_verify_layouts.size(), 3U);
+  EXPECT_EQ(first_result.output.spec_verify_layouts[0].verify_len, 5);
+  EXPECT_EQ(second_result.output.spec_verify_layouts[0].verify_len, 5);
+  const size_t draft_calls = draft_->forward_inputs.size();
+  const auto pruned = execute(dspark_batch_input(
+      3, /*decode=*/true, /*placeholder=*/false, /*position=*/14));
+  EXPECT_EQ(target_->forward_inputs.back().numel(), 4);
+  // All five sequential Draft forwards still execute, plus KV refresh. Only
+  // verification shrinks; this is independent of adaptive draft-step choice.
+  EXPECT_EQ(draft_->forward_inputs.size() - draft_calls, 6U);
+  ASSERT_EQ(pruned.spec_verify_layouts.size(), 3U);
+  EXPECT_EQ(make_spec_metrics(pruned.sample_output.next_tokens,
+                              pruned.spec_verify_layouts)
+                .num_draft_tokens,
+            1);
+  EXPECT_TRUE(torch::equal(pruned.sample_output.next_tokens,
+                           torch::tensor({{16, 17, -1, -1, -1, -1},
+                                          {18, -1, -1, -1, -1, -1},
+                                          {20, -1, -1, -1, -1, -1}},
+                                         torch::kInt64)));
+  // Refresh reads the correct per-request packed prefix, not Bx6 striding.
+  EXPECT_TRUE(torch::equal(draft_->forward_embeddings.back()
+                               .narrow(0, 0, 18)
+                               .view({3, 6, 1})
+                               .select(1, 0)
+                               .cpu(),
+                           torch::tensor({{15.0F}, {17.0F}, {19.0F}})));
+  EXPECT_TRUE(draft_->confidence_hidden.empty());
+  const double expected_probability = std::exp(1.0) / (std::exp(1.0) + 31.0);
+  for (uint32_t id = 1; id <= 3; ++id) {
+    const auto feedback =
+        TaskPipelineTestPeer::adaptive_confidence(*pipeline_, id);
+    for (uint32_t column = 0; column < 5; ++column) {
+      EXPECT_NEAR(feedback[column], expected_probability, 1e-5);
+    }
+  }
+  const auto& context = TaskPipelineTestPeer::mtp_context(*pipeline_);
+  EXPECT_FALSE(context.mtp_state_.repair_required.narrow(0, 1, 3)
+                   .cpu()
+                   .any()
+                   .item<bool>());
+  EXPECT_TRUE(torch::equal(
+      context.mtp_state_.hidden.narrow(0, 1, 3).cpu(),
+      torch::tensor(
+          {{{15.0F}, {16.0F}}, {{0.0F}, {17.0F}}, {{0.0F}, {19.0F}}})));
+  const auto following = execute(dspark_batch_input(
+      3, /*decode=*/true, /*placeholder=*/false, /*position=*/16));
+  EXPECT_EQ(following.sample_output.next_tokens[0][0].item<int64_t>(), 18);
+  EXPECT_EQ(following.sample_output.next_tokens[1][0].item<int64_t>(), 19);
+  EXPECT_EQ(following.sample_output.next_tokens[2][0].item<int64_t>(), 21);
+  EXPECT_EQ(leader.broadcasts(), broadcasts);
+  EXPECT_EQ(target_->graph_warmup_bindings.size(), target_warmups);
+  EXPECT_EQ(draft_->graph_warmup_bindings.size(), draft_warmups);
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveMtpRandomTargetConsensusPrecedesRaggedContextPublication) {
+  configure_adaptive_dspark(/*profiled=*/false, /*draft_width=*/5);
+  capacity_.kind = SpeculativeTaskKind::MTP;
+  capacity_.refresh_target_prefix = true;
+  draft_->block_draft = false;
+  draft_->confidence_head = false;
+  RecordingSamples leader(device_);
+  capacity_.common.sampling_group = &leader;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_batch_graphs();
+  execute(dspark_batch_input(3, /*decode=*/false));
+  const size_t broadcasts = leader.broadcasts();
+  leader.replace_target_draws(0);
+  auto request = dspark_batch_input(3, /*decode=*/true);
+  request.sampling_params.sampling_mode = SamplingMode::RANDOM;
+  request.sampling_params.temperatures = torch::tensor({0.5F, 0.7F, 1.0F});
+  const auto output = execute(request);
+  EXPECT_EQ(leader.broadcasts(), broadcasts + 1);
+  EXPECT_TRUE(torch::equal(output.sample_output.next_tokens.select(1, 0),
+                           torch::zeros({3}, torch::kInt64)));
+  EXPECT_TRUE(output.sample_output.next_tokens.narrow(1, 1, 5)
+                  .eq(-1)
+                  .all()
+                  .item<bool>());
+  const auto& context = TaskPipelineTestPeer::mtp_context(*pipeline_);
+  EXPECT_TRUE(torch::equal(context.tokens_.narrow(0, 1, 3).cpu(),
+                           torch::zeros({3}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(
+      context.mtp_state_.hidden.narrow(0, 1, 3).cpu(),
+      torch::tensor({{{0.0F}, {3.0F}}, {{0.0F}, {5.0F}}, {{0.0F}, {7.0F}}})));
+  EXPECT_TRUE(draft_->confidence_hidden.empty());
+}
+
+TEST_F(SpeculativePipelineTest,
+       AdaptiveMtpMixedTargetsUseRequestSamplingForBothCompiledWidths) {
+  for (const uint32_t draft_width : {5U, 7U}) {
+    SCOPED_TRACE(draft_width);
+    configure_adaptive_dspark(/*profiled=*/false, draft_width);
+    capacity_.kind = SpeculativeTaskKind::MTP;
+    capacity_.refresh_target_prefix = true;
+    draft_->block_draft = false;
+    draft_->confidence_head = false;
+    RecordingSamples leader(device_);
+    capacity_.common.sampling_group = &leader;
+    create();
+    ASSERT_NE(pipeline_, nullptr);
+    warmup_dspark_batch_graphs();
+    execute(dspark_batch_input(3, /*decode=*/false));
+    const size_t broadcasts = leader.broadcasts();
+    auto request = dspark_batch_input(3, /*decode=*/true);
+    request.sampling_params.sampling_mode = SamplingMode::MIXED;
+    request.sampling_params.do_sample =
+        torch::tensor({false, true, true}, torch::kBool);
+    request.sampling_params.temperatures = torch::tensor({0.0F, 0.5F, 0.7F});
+    const auto output = execute(request);
+    const auto expected =
+        torch::tensor({4, 6, 8}, torch::kInt64).unsqueeze(1) +
+        torch::arange(draft_width + 1, torch::kInt64).unsqueeze(0);
+    EXPECT_TRUE(torch::equal(output.sample_output.next_tokens, expected));
+    EXPECT_EQ(leader.broadcasts(), broadcasts + 1);
+    EXPECT_TRUE(draft_->confidence_hidden.empty());
+    pipeline_.reset();
+  }
+}
+
+TEST_F(SpeculativePipelineTest,
        AdaptiveDSparkRetiresLaggedFeedbackWithoutChangingQueuedPlans) {
   configure_adaptive_dspark();
   RecordingSamples leader(device_);
@@ -3515,7 +3696,7 @@ TEST_F(SpeculativePipelineTest,
       configure_adaptive_dspark();
     } else {
       configure_dspark_batch_graphs();
-      capacity_.adaptive_dspark = false;
+      capacity_.adaptive_target_verify = false;
     }
     capacity_.common.max_positions = 1024;
     capacity_.common.max_kv_seq_len = 1024;

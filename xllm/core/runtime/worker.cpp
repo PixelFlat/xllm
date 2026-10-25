@@ -77,13 +77,17 @@ Worker::Worker(const ParallelArgs& parallel_args,
          !ExecutionConfig::get_instance().disable_graph_warmup()))
       << "Adaptive MTP requires ordinary prewarmed Python graphs, async MTP "
          "task pipeline and DP=CP=1; unified MTP is not supported yet.";
-  CHECK(!options.enable_adaptive_target_verify() ||
-        (options.enable_speculative_decode() && enable_task_pipeline_ &&
-         SpeculativeConfig::supports_adaptive_target_verify(
-             options.speculative_algorithm()) &&
-         (options.num_speculative_tokens() == 5 ||
-          options.num_speculative_tokens() == 7)))
-      << "Adaptive speculative decoding requires DSpark Draft5/7 with task "
+  CHECK(
+      !options.enable_adaptive_target_verify() ||
+      (options.enable_speculative_decode() && enable_task_pipeline_ &&
+       SpeculativeConfig::supports_adaptive_target_verify(
+           options.speculative_algorithm()) &&
+       (!SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) ||
+        (options.enable_graph() && options.enable_schedule_overlap() &&
+         options.dp_size() == 1 && options.cp_size() == 1)) &&
+       (options.num_speculative_tokens() == 5 ||
+        options.num_speculative_tokens() == 7)))
+      << "Adaptive speculative decoding requires MTP/DSpark Draft5/7 with task "
          "pipeline; the legacy synchronous adaptive path is not supported.";
   if (enable_task_pipeline_) {
     CHECK(ModelConfig::is_python_model_impl(
@@ -142,7 +146,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
            (SpeculativeConfig::supports_task_pipeline(
                 options.speculative_algorithm()) &&
             (!options.enable_adaptive_target_verify() ||
-             (SpeculativeConfig::is_dspark_algorithm(
+             (SpeculativeConfig::supports_adaptive_target_verify(
                   options.speculative_algorithm()) &&
               options.enable_graph())))) &&
           !options.enable_prefill_piecewise_graph() &&
@@ -152,7 +156,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
           !LoadConfig::get_instance().enable_rolling_load() &&
           parallel_args.layerwise_split_size() == 1)
         << "Task pipeline requires Python LLM, fixed "
-           "MTP/DFlash/DFlash2/DSpark or adaptive DSpark graphs and "
+           "MTP/DFlash/DFlash2/DSpark or adaptive MTP/DSpark graphs and "
            "a layerwise split of one.";
     CHECK(options.host_blocks_factor() <= 1.0 ||
           (Platform::is_npu() && (!options.enable_speculative_decode() ||

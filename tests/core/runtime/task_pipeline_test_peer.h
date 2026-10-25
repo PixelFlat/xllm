@@ -45,6 +45,16 @@ struct TaskPipelineTestPeer {
       [](const TaskExecutionPipeline& pipeline) -> const auto& {
     return *pipeline.speculative_capacity_->adaptive_costs;
   };
+  static constexpr auto mtp_context =
+      [](const TaskExecutionPipeline& pipeline) -> const auto& {
+    return *pipeline.context_;
+  };
+  static constexpr auto adaptive_confidence =
+      [](const TaskExecutionPipeline& pipeline, uint32_t embedding_id) {
+        return pipeline.adaptive_verify_->histories.at(embedding_id)
+            .versions[0]
+            .confidence;
+      };
   static constexpr auto erase_adaptive_unified_binding =
       [](TaskExecutionPipeline& pipeline, uint32_t rows, uint32_t graph_rows) {
         const uint64_t key = (static_cast<uint64_t>(rows) << 32) | graph_rows;

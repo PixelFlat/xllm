@@ -84,7 +84,7 @@ void configure_profile_sampling(RequestSamplingParam& sampling,
                                 bool enable_task_pipeline) {
   if (enable_task_pipeline &&
       speculative_config.enable_adaptive_target_verify() &&
-      SpeculativeConfig::is_dspark_algorithm(
+      SpeculativeConfig::supports_adaptive_target_verify(
           speculative_config.speculative_algorithm())) {
     // Startup costs use a fixed greedy sampling policy. Serving may sample
     // random target tokens, whose extra sampler cost is not calibrated here.

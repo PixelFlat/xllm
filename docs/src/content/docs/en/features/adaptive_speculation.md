@@ -26,7 +26,7 @@ controls, rather than naming a speculative algorithm:
 | Control | Meaning | Current implementation and rationale |
 |:--------|:--------|:-------------------------------------|
 | `enable_adaptive_draft_step` | Change how many sequential draft forward steps are executed before verification. | MTP generates candidates sequentially, so a shorter depth avoids draft forward work as well as shortening verification. |
-| `enable_adaptive_target_verify` | Change how many already-generated candidates the target verifies. | DSpark generates a candidate block in one forward; pruning its low-confidence suffix reduces verification work without changing draft generation width. |
+| `enable_adaptive_target_verify` | Change how many already-generated candidates the target verifies. | DSpark uses its confidence head; MTP uses selected-token draft probabilities. Both keep draft generation width fixed and prune target work. |
 
 Both controls default to `false` and cannot currently be enabled together.
 An algorithm not listed above is not implicitly supported by the generic name.
@@ -110,6 +110,39 @@ Either section may be omitted to keep its defaults. Explicit sampling must fit
 the actual prewarmed graphs and KV capacity; it changes startup coverage/time,
 not the client's prompt or sampling parameters. Each depth gets its own measured
 costs, and loading precomputed `step_cost_models` is not supported by this option.
+
+## Adaptive target verification with MTP logits
+
+For a greedy MTP Draft5/7, `enable_adaptive_target_verify=true` executes all
+configured draft steps, then prunes verification using
+`exp(selected_logit - logsumexp(draft_logits))` as an acceptance proxy. This
+is not a measured target acceptance probability. It reuses the existing
+prefix-allocation, packing and commit kernels rather than another MTP-only
+pruning kernel.
+
+The Host chooses a padded target graph budget from feedback retired through
+round n-2 and full-cycle costs measured by the current MTP service. Current
+probabilities stay on Device for prefix allocation; their small asynchronous
+feedback copy shares normal result retirement, without a new draft-to-target
+Host wait. Packed Target hidden states are gathered by Device offsets before
+MTP context publication and prefix refresh.
+
+Use the MTP launch above with these settings instead of adaptive draft steps:
+
+```bash
+--num_speculative_tokens=5 --enable_adaptive_draft_step=false \
+--enable_adaptive_target_verify=true --enable_probabilistic_draft=false
+```
+
+This path requires ordinary Python GLM DSA ACL graphs, asynchronous scheduling,
+task pipeline and DP=CP=1. Greedy and random targets (including mixed batches)
+reuse the existing ragged verifier; the draft must remain greedy. Sampled
+target IDs reach TP consensus before prefix commitment or context publication.
+Unified MTP graphs and simultaneous adaptive draft steps are rejected before
+execution. Startup costs use a greedy target; random sampling adds sampler work
+that is not measured by that calibration. The `adaptive_target_verify_*` cost-table and
+startup calibration options below also apply; never reuse a DSpark cost table
+for MTP.
 
 ## Adaptive target verification (DSpark)
 

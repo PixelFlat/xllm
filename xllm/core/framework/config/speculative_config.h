@@ -79,7 +79,7 @@ class SpeculativeConfig final {
   }
 
   static bool supports_adaptive_target_verify(std::string_view algorithm) {
-    return is_dspark_algorithm(algorithm);
+    return is_dspark_algorithm(algorithm) || is_mtp_algorithm(algorithm);
   }
 
   static bool requires_aux_hidden_capture(std::string_view algorithm) {

@@ -335,7 +335,7 @@ class RecordingProfileEngine final : public Engine {
   std::vector<bool> observed_greedy_samples_;
 };
 
-TEST(GraphWarmupTest, OnlyAdaptiveDsparkPipelineUsesGreedySyntheticRequests) {
+TEST(GraphWarmupTest, AdaptiveVerifyPipelineUsesGreedySyntheticRequests) {
   ScopedDecodeGraphConfigSnapshot execution_snapshot;
   ScopedSpeculativeSamplingConfigSnapshot sampling_snapshot;
   ExecutionConfig::get_instance().enable_graph(false);
@@ -372,7 +372,7 @@ TEST(GraphWarmupTest, OnlyAdaptiveDsparkPipelineUsesGreedySyntheticRequests) {
 
         const bool expected_greedy =
             adaptive && pipeline &&
-            SpeculativeConfig::is_dspark_algorithm(algorithm);
+            SpeculativeConfig::supports_adaptive_target_verify(algorithm);
         ASSERT_EQ(engine.observed_greedy_samples().size(), 8);
         for (const bool greedy : engine.observed_greedy_samples()) {
           EXPECT_EQ(greedy, expected_greedy);
