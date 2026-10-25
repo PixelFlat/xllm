@@ -223,6 +223,27 @@ def _mega_gdn_mtp_decode_fake(
     return torch.empty_like(z)
 
 
+def _mega_gdn_mtp_decode_varlen_fake(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state: torch.Tensor,
+    read_state_indices: torch.Tensor,
+    write_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    fla_ssm_state_layout: bool,
+) -> None:
+    return None
+
+
 def _causal_conv1d_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1294,6 +1315,7 @@ register_fake("xllm_ops::chunk_gated_delta_rule", _chunk_gated_delta_rule_fake)
 register_fake("xllm_ops::mega_gdn_prefill", _mega_gdn_prefill_fake)
 register_fake("xllm_ops::mega_gdn_decode", _mega_gdn_decode_fake)
 register_fake("xllm_ops::mega_gdn_mtp_decode", _mega_gdn_mtp_decode_fake)
+register_fake("xllm_ops::mega_gdn_mtp_decode_varlen", _mega_gdn_mtp_decode_varlen_fake)
 register_fake("xllm_ops::causal_conv1d", _causal_conv1d_fake)
 register_fake("xllm_ops::causal_conv1d_qkv_prefill", _causal_conv1d_qkv_prefill_fake)
 register_fake(

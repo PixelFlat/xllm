@@ -293,6 +293,30 @@ def test_verify_graph_uses_owned_device_maps_without_host_lengths() -> None:
     assert actual.query_width == 8
 
 
+@pytest.mark.parametrize("packed_kernel", [False, True], ids=["dense", "varlen"])
+def test_verify_graph_requires_maps_only_for_dense_kernel(packed_kernel: bool) -> None:
+    graph = LinearVerifyGraphInputs(
+        torch.tensor([2, 1, 0], dtype=torch.int32),
+        torch.tensor([3, 5, 1], dtype=torch.int32),
+        8,
+        cu_seqlens=torch.tensor([0, 2, 5, 5], dtype=torch.int32) if packed_kernel else None,
+    )
+    metadata = SimpleNamespace(
+        slot_mapping=torch.arange(8, dtype=torch.int32),
+        is_dummy=False,
+        linear_verify_graph=graph,
+    )
+    if not packed_kernel:
+        with pytest.raises(ValueError, match="fixed request indices and token maps"):
+            _verify_builder().build(metadata)
+        return
+    actual = _verify_builder().build(metadata)
+    assert actual.state_indices is graph.state_indices
+    assert actual.num_accepted_tokens is graph.num_accepted_tokens
+    assert actual.cu_seqlens is graph.cu_seqlens
+    assert actual.packed_to_dense is None and actual.dense_to_packed is None
+
+
 def test_verify_routes_to_checkpointed_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = make_linear_config(
         linear_num_key_heads=1,
@@ -375,6 +399,68 @@ def test_gdn_adaptive_packed_padding_does_not_enter_live_prefixes(
     )
 
 
+@pytest.mark.parametrize("batch_size", [2, 32, 33, 64])
+def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
+    monkeypatch: pytest.MonkeyPatch, batch_size: int
+) -> None:
+    layer = NpuQwen3_5GatedDeltaNet(
+        make_linear_config(
+            linear_num_key_heads=1,
+            linear_num_value_heads=1,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+        ),
+        0,
+        torch.float32,
+        torch.device("cpu"),
+    )
+    token_count = batch_size * 2
+    hidden = torch.arange(1, token_count + 4, dtype=torch.float32).view(-1, 1).expand(-1, 128).clone()
+    hidden[token_count:].fill_(float("nan"))
+    monkeypatch.setattr(layer, "_project_prefill_inputs", lambda x: (x, x[:, :1], x[:, :1], x.unsqueeze(1)))
+    calls: list[tuple[int, int]] = []
+
+    def verify(
+        qkv: torch.Tensor,
+        z: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm: torch.Tensor,
+        reads: torch.Tensor,
+        writes: torch.Tensor,
+        accepted: torch.Tensor,
+        norm: torch.Tensor,
+        offsets: torch.Tensor,
+        out: torch.Tensor,
+        layout: bool,
+    ) -> None:
+        assert qkv.shape == hidden.shape
+        assert accepted.tolist() == [7] * reads.numel()
+        calls.append((int(offsets[0]), int(offsets[-1])))
+        for start, end in zip(offsets[:-1].tolist(), offsets[1:].tolist()):
+            out[start:end].copy_(z[start:end].cumsum(dim=0))
+
+    monkeypatch.setattr(kernels, "mega_gdn_mtp_decode_varlen", verify, raising=False)
+    metadata = GdnVerifyMetadata(
+        {0: SimpleNamespace(conv=torch.empty(0), ssm=torch.empty(0))},
+        torch.arange(1, batch_size + 1, dtype=torch.int32),
+        torch.full((batch_size,), 7, dtype=torch.int32),
+        8,
+        None,
+        None,
+        torch.arange(0, token_count + 1, 2, dtype=torch.int32),
+    )
+    actual = layer._verify(hidden, metadata)
+    expected = torch.zeros_like(hidden)
+    expected[:token_count] = hidden[:token_count].reshape(batch_size, 2, 128).cumsum(dim=1).reshape(-1, 128)
+    torch.testing.assert_close(actual, expected)
+    assert calls == [(start * 2, min(start + 32, batch_size) * 2) for start in range(0, batch_size, 32)]
+
+
 @pytest.mark.parametrize("key_heads,value_heads", [(1, 1), (4, 12)], ids=["minimal", "qwen38_tp4"])
 def test_npu_verify_rejection_matches_sequential_decode(key_heads: int, value_heads: int) -> None:
     pytest.importorskip("torch_npu")
@@ -439,8 +525,9 @@ def test_npu_verify_rejection_matches_sequential_decode(key_heads: int, value_he
         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
+@pytest.mark.parametrize("packed_kernel", [False, True], ids=["dense", "varlen"])
 @torch.inference_mode()
-def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection() -> None:
+def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection(packed_kernel: bool) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an Ascend NPU")
@@ -467,8 +554,9 @@ def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection() -> None:
         torch.zeros(3, device=device, dtype=torch.int32),
         torch.ones(3, device=device, dtype=torch.int32),
         8,
-        torch.full((8,), 24, device=device, dtype=torch.int64),
-        torch.full((24,), 8, device=device, dtype=torch.int64),
+        None if packed_kernel else torch.full((8,), 24, device=device, dtype=torch.int64),
+        None if packed_kernel else torch.full((24,), 8, device=device, dtype=torch.int64),
+        torch.zeros(4, device=device, dtype=torch.int32) if packed_kernel else None,
     )
     inputs = DSparkAdaptiveGraphInputs(
         torch.zeros(264, device=device, dtype=torch.uint8),
@@ -491,6 +579,7 @@ def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection() -> None:
         8,
         graph_inputs.packed_to_dense,
         graph_inputs.dense_to_packed,
+        graph_inputs.cu_seqlens,
     )
 
     def forward() -> torch.Tensor:
@@ -553,3 +642,172 @@ def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection() -> None:
                         expected[offsets[row] + step].copy_(output[row].reshape(-1))
                 checkpoints.append((reference_conv.clone(), reference_ssm.clone()))
             torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize("batch,key_heads,value_heads", [(2, 1, 1), (33, 4, 12), (64, 4, 12)])
+@torch.inference_mode()
+def test_npu_varlen_rejection_preserves_state_across_reordered_batches(
+    batch: int, key_heads: int, value_heads: int
+) -> None:
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an Ascend NPU")
+    from xllm.python.kernels_npu.gated_delta_net import mega_gdn_decode
+
+    torch.manual_seed(149)
+    device = torch.device("npu:0")
+    cfg = make_linear_config(
+        linear_num_key_heads=key_heads,
+        linear_num_value_heads=value_heads,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    layer = NpuQwen3_5GatedDeltaNet(cfg, 0, torch.bfloat16, device)
+    for parameter in layer.parameters():
+        parameter.normal_(std=0.1)
+    layer.norm_weight.fill_(1)
+    width, rows = 8, batch * 8
+    channels = (2 * key_heads + value_heads) * 128
+    hidden = torch.zeros(rows, cfg.hidden_size, dtype=torch.bfloat16, device=device)
+    inputs = DSparkAdaptiveGraphInputs(
+        torch.zeros(88 * batch, device=device, dtype=torch.uint8),
+        torch.tensor([batch], device=device, dtype=torch.int64),
+        torch.ones(batch, device=device, dtype=torch.int64),
+        torch.zeros(batch, device=device, dtype=torch.int32),
+        torch.ones(batch, device=device, dtype=torch.int32),
+        torch.zeros(batch, 1, device=device, dtype=torch.int32),
+        torch.arange(0, rows + 1, width, device=device, dtype=torch.int32),
+        torch.arange(batch, device=device, dtype=torch.int32).repeat_interleave(width),
+        torch.arange(width, device=device, dtype=torch.int32).repeat(batch),
+        128,
+        linear_state_indices=torch.arange(1, batch + 1, device=device, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(batch, device=device, dtype=torch.int32),
+    )
+    caches = [
+        SimpleNamespace(
+            conv=torch.zeros(batch + 1, width + 2, channels, device=device, dtype=torch.bfloat16),
+            ssm=torch.zeros((batch + 1) * width, value_heads, 128, 128, device=device),
+        )
+        for _ in range(2)
+    ]
+    graphs, outputs = [], []
+    for packed_kernel, cache in zip((False, True), caches):
+        graph_inputs = LinearVerifyGraphInputs(
+            torch.empty(batch, device=device, dtype=torch.int32),
+            torch.empty(batch, device=device, dtype=torch.int32),
+            width,
+            None if packed_kernel else torch.empty(rows, device=device, dtype=torch.int64),
+            None if packed_kernel else torch.empty(rows, device=device, dtype=torch.int64),
+            torch.empty(batch + 1, device=device, dtype=torch.int32) if packed_kernel else None,
+        )
+        metadata = GdnVerifyMetadata(
+            {0: cache},
+            graph_inputs.state_indices,
+            graph_inputs.num_accepted_tokens,
+            width,
+            graph_inputs.packed_to_dense,
+            graph_inputs.dense_to_packed,
+            graph_inputs.cu_seqlens,
+        )
+        stream = torch.npu.Stream(device=device)
+        stream.wait_stream(torch.npu.current_stream(device))
+        with torch.npu.stream(stream):
+            for _ in range(3):
+                PreparedAclGraphRunner._refresh_linear_verify_graph(inputs, graph_inputs, rows)
+                layer._verify(hidden, metadata)
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph, stream=stream):
+                PreparedAclGraphRunner._refresh_linear_verify_graph(inputs, graph_inputs, rows)
+                output = layer._verify(hidden, metadata)
+        torch.npu.current_stream(device).wait_stream(stream)
+        graphs.append(graph)
+        outputs.append(output)
+    torch.npu.synchronize()
+    for cache in caches:
+        cache.conv.zero_()
+        cache.ssm.zero_()
+    oracle_conv = torch.zeros(batch + 1, 3, channels, device=device, dtype=torch.bfloat16)
+    oracle_ssm = torch.zeros(batch + 1, value_heads, 128, 128, device=device)
+    committed_conv, committed_ssm = oracle_conv.clone(), oracle_ssm.clone()
+    accepted_by_slot = [1] * (batch + 1)
+    order = list(range(1, batch + 1))
+    schedules = (order, order[::-1], order[::2], order[1:] + order[:1], [], order[::-1])
+    for iteration, slots in enumerate(schedules):
+        lengths = [8 if iteration in (0, 2) else 2 if iteration == 1 else 1 + (slot + iteration) % 8 for slot in slots]
+        accepted = [min(length, (8, 7, 1, 5)[slot % 4]) for slot, length in zip(slots, lengths)]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        total = offsets[-1]
+        inputs.control.fill_(len(slots))
+        inputs.linear_state_indices.zero_()
+        inputs.num_accepted_tokens.fill_(1)
+        inputs.offsets.fill_(-99)
+        inputs.offsets[: len(offsets)].copy_(torch.tensor(offsets, device=device, dtype=torch.int32))
+        inputs.owners.fill_(-1)
+        inputs.columns.fill_(-1)
+        hidden.fill_(float("nan"))
+        hidden[:total].normal_(std=0.1)
+        if slots:
+            inputs.linear_state_indices[: len(slots)].copy_(torch.tensor(slots, device=device, dtype=torch.int32))
+            inputs.num_accepted_tokens[: len(slots)].copy_(
+                torch.tensor([accepted_by_slot[slot] for slot in slots], device=device, dtype=torch.int32)
+            )
+        for row, length in enumerate(lengths):
+            inputs.owners[offsets[row] : offsets[row + 1]].fill_(row)
+            inputs.columns[offsets[row] : offsets[row + 1]].copy_(torch.arange(length, device=device))
+        for graph in graphs:
+            graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+        assert outputs[1][total:].count_nonzero().item() == 0
+
+        qkv, a, b, z = layer._project_prefill_inputs(hidden)
+        expected = torch.zeros(rows, layer.value_dim, device=device, dtype=torch.bfloat16)
+        for column in range(max(lengths, default=0)):
+            active_rows = [row for row, length in enumerate(lengths) if column < length]
+            selected = torch.tensor([offsets[row] + column for row in active_rows], device=device)
+            state_ids = torch.tensor([slots[row] for row in active_rows], device=device, dtype=torch.int32)
+            for start in range(0, len(active_rows), 32):
+                selected_chunk = selected[start : start + 32]
+                state_chunk = state_ids[start : start + 32]
+                decoded = mega_gdn_decode(
+                    qkv.index_select(0, selected_chunk),
+                    z.index_select(0, selected_chunk),
+                    b.index_select(0, selected_chunk),
+                    a.index_select(0, selected_chunk),
+                    layer.conv1d_weight,
+                    oracle_conv,
+                    layer.A_log,
+                    layer.dt_bias,
+                    oracle_ssm,
+                    state_chunk,
+                    state_chunk,
+                    layer.norm_weight,
+                )
+                expected.index_copy_(0, selected_chunk, decoded.reshape(selected_chunk.numel(), -1))
+            for row in active_rows:
+                if column + 1 == accepted[row]:
+                    slot = slots[row]
+                    committed_conv[slot].copy_(oracle_conv[slot])
+                    committed_ssm[slot].copy_(oracle_ssm[slot])
+        torch.testing.assert_close(outputs[1], expected, atol=0.02, rtol=0.02)
+        for slot, count in zip(slots, accepted):
+            for cache in caches:
+                torch.testing.assert_close(
+                    cache.conv[slot, count - 1 : count + 2], committed_conv[slot], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    cache.ssm[slot * width + count - 1], committed_ssm[slot], atol=0.02, rtol=0.02
+                )
+            oracle_conv[slot].copy_(committed_conv[slot])
+            oracle_ssm[slot].copy_(committed_ssm[slot])
+            accepted_by_slot[slot] = count
+            # Only the accepted checkpoint and its three Conv history rows
+            # may be consumed next round, even after a much longer prefix.
+            conv_history = caches[1].conv[slot, count - 1 : count + 2].clone()
+            checkpoint = caches[1].ssm[slot * width + count - 1].clone()
+            caches[1].conv[slot].fill_(float("nan"))
+            caches[1].ssm[slot * width : (slot + 1) * width].fill_(float("nan"))
+            caches[1].conv[slot, count - 1 : count + 2].copy_(conv_history)
+            caches[1].ssm[slot * width + count - 1].copy_(checkpoint)

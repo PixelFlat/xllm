@@ -811,6 +811,43 @@ def test_prepared_decode_updates_captured_lists_without_mutating_snapshots() -> 
         assert prepared.actual_seq_kv is not captured_kv
 
 
+def test_recurrent_graph_host_bounds_refresh_without_device_readback_or_slot_aliasing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _ordinary_backend()
+    views = [_ordinary_metadata(paged=True), _ordinary_metadata(paged=True)]
+    states = []
+    for metadata in views:
+        metadata.is_chunked_prefill = False
+        metadata.linear_verify_graph = object()
+        metadata.block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        metadata.kv_seq_lens_host_values = [256, 256]
+        metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+        states.append(metadata.prepared_attention_state)
+
+    def reject_readback(self: torch.Tensor, *args: object, **kwargs: object) -> None:
+        raise AssertionError("graph Host bounds must not read Device values")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", reject_readback)
+    monkeypatch.setattr(torch.Tensor, "item", reject_readback)
+    monkeypatch.setattr(torch.Tensor, "tolist", reject_readback)
+    first_values, second_values = states[0].actual_seq_kv, states[1].actual_seq_kv
+    for first, second in (([130, 197], [63, 45]), ([255, 256], [9, 7]), ([6, 4], [128, 129])):
+        views[0].kv_seq_lens_host_values[:] = first
+        previous_second = second_values.copy()
+        backend.prepare(views[0], graph_mode=True)
+        assert first_values == first
+        assert second_values == previous_second
+        views[1].kv_seq_lens_host_values[:] = second
+        backend.prepare(views[1], graph_mode=True)
+        assert first_values == first
+        assert second_values == second
+        assert states[0].kv_capacity == states[1].kv_capacity == 256
+        assert states[0].actual_seq_kv is first_values
+        assert states[1].actual_seq_kv is second_values
+        assert first_values is not second_values
+
+
 @pytest.mark.parametrize("width", [1, 4, 8])
 @pytest.mark.parametrize("window", [None, 32])
 def test_block_attention_reads_accepted_device_lengths(width: int, window: int | None) -> None:

@@ -130,6 +130,45 @@ def mega_gdn_mtp_decode(
     )
 
 
+def mega_gdn_mtp_decode_varlen(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state: torch.Tensor,
+    read_state_indices: torch.Tensor,
+    write_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    fla_ssm_state_layout: bool = True,
+) -> None:
+    """Verify packed prefixes, preserving the fixed cache checkpoint stride."""
+    torch.ops.xllm_ops.mega_gdn_mtp_decode_varlen(
+        qkv,
+        z,
+        b,
+        a,
+        conv_weight,
+        conv_state,
+        a_log,
+        dt_bias,
+        ssm_state,
+        read_state_indices,
+        write_state_indices,
+        num_accepted_tokens,
+        norm_weight,
+        cu_seqlens,
+        out,
+        fla_ssm_state_layout,
+    )
+
+
 def fused_gdn_gating(
     a_log: torch.Tensor,
     a: torch.Tensor,
@@ -271,6 +310,7 @@ def chunk_gated_delta_rule(
 __all__ = [
     "mega_gdn_decode",
     "mega_gdn_mtp_decode",
+    "mega_gdn_mtp_decode_varlen",
     "mega_gdn_prefill",
     "fused_gdn_gating",
     "fused_sigmoid_gating_delta_rule_decode",

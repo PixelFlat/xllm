@@ -63,4 +63,45 @@ npu_mega_gdn_mtp_decode(const torch::Tensor& qkv,
   return {conv_out, conv_state_out, ssm_state_out, out};
 }
 
+void npu_mega_gdn_mtp_decode_varlen(const torch::Tensor& qkv,
+                                    const torch::Tensor& z,
+                                    const torch::Tensor& b,
+                                    const torch::Tensor& a,
+                                    const torch::Tensor& conv_weight,
+                                    torch::Tensor& conv_state,
+                                    const torch::Tensor& a_log,
+                                    const torch::Tensor& dt_bias,
+                                    torch::Tensor& ssm_state,
+                                    const torch::Tensor& read_state_indices,
+                                    const torch::Tensor& write_state_indices,
+                                    const torch::Tensor& num_accepted_tokens,
+                                    const torch::Tensor& norm_weight,
+                                    const torch::Tensor& cu_seqlens,
+                                    torch::Tensor& out,
+                                    bool fla_ssm_state_layout) {
+  // Different <=32-request chunks write disjoint packed rows of the same
+  // zero-initialized output. Untouched capacity rows must remain zero.
+  torch::Tensor conv_out = torch::empty_like(qkv);
+  EXEC_NPU_CMD(aclnnMegaGdnMtpDecodeVarlen,
+               qkv,
+               z,
+               b,
+               a,
+               conv_weight,
+               conv_state,
+               a_log,
+               dt_bias,
+               ssm_state,
+               read_state_indices,
+               write_state_indices,
+               num_accepted_tokens,
+               norm_weight,
+               cu_seqlens,
+               fla_ssm_state_layout,
+               conv_out,
+               conv_state,
+               ssm_state,
+               out);
+}
+
 }  // namespace xllm::kernel::npu

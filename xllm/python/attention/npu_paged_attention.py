@@ -185,6 +185,7 @@ class _PreparedPagedAttention:
     device_kv_lengths: torch.Tensor | None = None
     kv_capacity: int = 0
     query_lengths: list[int] | None = None
+    workspace_query_capacity: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +408,11 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         return True
 
     def prepare_metadata(
-        self, metadata: AttentionMetadata, *, device_kv_lengths: bool = False
+        self,
+        metadata: AttentionMetadata,
+        *,
+        device_kv_lengths: bool = False,
+        workspace_query_capacity: int = 0,
     ) -> _PreparedPagedAttention | _PreparedMlaAttention:
         """Prepare one Slot without Device work or active-state writes."""
         expanded = getattr(metadata, "expanded_decode_metadata", None)
@@ -513,6 +518,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 is_chunked_prefill=metadata.is_chunked_prefill,
             )
         if device_kv_lengths:
+            if workspace_query_capacity and workspace_query_capacity < batch_size:
+                raise ValueError("attention workspace query capacity must cover the prepared batch")
             lengths = device_lengths
             if (
                 block_table is None
@@ -536,7 +543,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             if kv_capacity == 0 or kv_capacity > block_table.shape[1] * self.page_size:
                 raise ValueError("prepared block attention exceeds block-table capacity")
             return _PreparedPagedAttention(
-                block_table, query_ends, actual_seq_q, actual_seq_kv, lengths, kv_capacity, widths
+                block_table,
+                query_ends,
+                actual_seq_q,
+                actual_seq_kv,
+                lengths,
+                kv_capacity,
+                widths,
+                workspace_query_capacity,
             )
         return _PreparedPagedAttention(block_table, query_ends, actual_seq_q, actual_seq_kv)
 
@@ -607,6 +621,14 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._actual_seq_lens = None if graph_mode else prepared.query_ends
             self._actual_seq_q = prepared.actual_seq_q
             self._actual_seq_kv = prepared.actual_seq_kv
+            if (
+                graph_mode
+                and prepared.device_kv_lengths is not None
+                and getattr(metadata, "linear_verify_graph", None) is not None
+            ):
+                # The Slot owns conservative Host bounds, not accepted Device
+                # lengths. Captured FIA tasks retain this entry-private list.
+                prepared.actual_seq_kv[:] = metadata.kv_seq_lens_host_values
             if graph_mode and prepared.device_kv_lengths is None:
                 self._prepare_paged_graph()
             else:
@@ -1891,6 +1913,99 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             self._block_attention_masks[policy] = mask
         return mask
 
+    def _bounded_paged_graph_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor,
+        prepared: _PreparedPagedAttention,
+        block_size: int,
+    ) -> torch.Tensor:
+        context = get_forward_context()
+        graph_context = context.acl_graph
+        assert graph_context is not None and context.execution_state is not None
+        workspace_rows = prepared.workspace_query_capacity or query.shape[0]
+
+        def _allocate_workspace() -> torch.Tensor:
+            # Startup visits small G first. Reserve the final row capacity
+            # immediately so later graphs reuse one stable scratch address.
+            workspace_query = query.new_empty((workspace_rows, *query.shape[1:]))
+            workspace_mask = mask.new_empty((workspace_rows, *mask.shape[1:]))
+            workspace_table = prepared.block_table.new_empty((workspace_rows, prepared.block_table.shape[1]))
+            return torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query=workspace_query,
+                key=key,
+                value=value,
+                atten_mask=workspace_mask,
+                block_table=workspace_table,
+                actual_seq_lengths=[prepared.query_lengths[0]] * workspace_rows,
+                actual_seq_lengths_kv=[prepared.kv_capacity] * workspace_rows,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                scale=self.scale,
+                input_layout="BNSD",
+                block_size=block_size,
+                sparse_mode=_SPARSE_MODE_NONE,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                softmax_lse_flag=False,
+            )
+
+        state = context.execution_state.paged_attention.get(query.shape[0])
+        if state is None:
+            state = PagedAttentionGraphState(
+                workspace=get_execution_workspace(
+                    ("BOUNDED_FIA_WORKSPACE", workspace_rows, prepared.kv_capacity),
+                    _allocate_workspace,
+                ),
+                output=get_execution_buffer(("BOUNDED_FIA_OUTPUT", query.shape[0]), lambda: torch.empty_like(query)),
+                lse=get_execution_buffer(
+                    ("BOUNDED_FIA_LSE", query.shape[0]),
+                    lambda: torch.empty(0, device=query.device, dtype=query.dtype),
+                ),
+                block_table=prepared.block_table,
+                query=prepared.query_lengths,
+                kv=prepared.actual_seq_kv,
+            )
+            context.execution_state.paged_attention[query.shape[0]] = state
+
+        def _update_bounded_fia_args() -> None:
+            torch.ops.npu.npu_fused_infer_attention_score.out(
+                query,
+                key,
+                value,
+                atten_mask=mask,
+                block_table=state.block_table,
+                actual_seq_lengths=state.query,
+                actual_seq_lengths_kv=state.kv,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                scale=self.scale,
+                input_layout="BNSD",
+                block_size=block_size,
+                sparse_mode=_SPARSE_MODE_NONE,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                softmax_lse_flag=False,
+                workspace=state.workspace,
+                out=[state.output, state.lse],
+            )
+
+        stream = graph_context.stream
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        torch.npu.graph_task_group_begin(stream)
+        try:
+            _update_bounded_fia_args()
+        except Exception:
+            torch.npu.graph_task_group_end(stream)
+            raise
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_context.tasks.append(AclGraphTask(event, handle, _update_bounded_fia_args))
+        return state.output
+
     def _prefill(
         self,
         q_3d: torch.Tensor,
@@ -1931,8 +2046,18 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 # causal masks. BNSD supports the explicit non-causal tail
                 # mask and the same paged KV without a Host length readback.
                 query = q_3d.view(len(widths), widths[0], self.num_heads, self.head_dim)
+                query = query.transpose(1, 2).contiguous()
+                if (
+                    getattr(metadata, "linear_verify_graph", None) is not None
+                    and in_acl_graph()
+                    and get_forward_context().acl_graph is not None
+                ):
+                    output = self._bounded_paged_graph_attention(
+                        query, k_flat, v_flat, atten_mask, prepared, block_size
+                    )
+                    return output.transpose(1, 2).reshape(num_tokens, self.num_heads * self.head_dim)
                 output, _ = torch.ops.npu.npu_fused_infer_attention_score(
-                    query.transpose(1, 2).contiguous(),
+                    query,
                     k_flat,
                     v_flat,
                     atten_mask=atten_mask,

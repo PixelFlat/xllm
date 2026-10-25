@@ -63,6 +63,9 @@ class GdnVerifyMetadata(GdnMetadata):
     # positions use the appended zero row at packed_token_count; padding in
     # packed_to_dense uses the appended zero row at batch_size * query_width.
     dense_to_packed: torch.Tensor | None = None
+    # Device prefix endpoints for the fused packed verifier. Cache strides
+    # and previous acceptance counts remain independent of current widths.
+    cu_seqlens: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

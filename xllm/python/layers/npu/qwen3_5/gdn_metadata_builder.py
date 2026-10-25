@@ -125,13 +125,23 @@ class Qwen3_5GdnMetadataBuilder:
                 raise ValueError("Qwen3.5 packed graph width must match the GDN checkpoint stride")
             batch_size = graph.state_indices.numel()
             token_count = metadata.slot_mapping.numel()
-            for tensor, count, dtype in (
+            if graph.cu_seqlens is not None and (
+                graph.cu_seqlens.shape != (batch_size + 1,)
+                or graph.cu_seqlens.dtype != torch.int32
+                or graph.cu_seqlens.device != device
+            ):
+                raise ValueError("Qwen3.5 packed graph requires device int32 request endpoints")
+            tensors = (
                 (graph.state_indices, batch_size, torch.int32),
                 (graph.num_accepted_tokens, batch_size, torch.int32),
-                (graph.packed_to_dense, token_count, torch.int64),
-                (graph.dense_to_packed, batch_size * graph.query_width, torch.int64),
-            ):
-                if tensor.shape != (count,) or tensor.dtype != dtype or tensor.device != device:
+            )
+            if graph.cu_seqlens is None:
+                tensors += (
+                    (graph.packed_to_dense, token_count, torch.int64),
+                    (graph.dense_to_packed, batch_size * graph.query_width, torch.int64),
+                )
+            for tensor, count, dtype in tensors:
+                if tensor is None or tensor.shape != (count,) or tensor.dtype != dtype or tensor.device != device:
                     raise ValueError("Qwen3.5 packed graph requires fixed request indices and token maps")
             return GdnVerifyMetadata(
                 self._state_caches,
@@ -140,6 +150,7 @@ class Qwen3_5GdnMetadataBuilder:
                 graph.query_width,
                 graph.packed_to_dense,
                 graph.dense_to_packed,
+                graph.cu_seqlens,
             )
         read_indices, write_indices = resolve_linear_state_io_indices(metadata)
         if read_indices is None or write_indices is None:

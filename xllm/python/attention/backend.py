@@ -95,19 +95,20 @@ def normalize_layer_caches(caches: Sequence[LayerCacheInput]) -> list[LayerCache
 
 @dataclass(frozen=True, slots=True)
 class LinearVerifyGraphInputs:
-    """Stable request checkpoints and packed-token maps for recurrent graphs.
+    """Stable request checkpoints and token layout for recurrent graphs.
 
-    Missing dense checkpoints index the appended zero row at the packed graph
-    capacity. Padding tokens index the zero row after the dense checkpoint
-    matrix. The graph refreshes values, never shapes or storage, before layers
+    Packed verifiers consume cu_seqlens without dense token maps. Dense
+    verifiers use the two maps, whose missing entries select appended zero
+    rows. The graph refreshes values, never shapes or storage, before layers
     consume this descriptor.
     """
 
     state_indices: torch.Tensor
     num_accepted_tokens: torch.Tensor
     query_width: int
-    packed_to_dense: torch.Tensor
-    dense_to_packed: torch.Tensor
+    packed_to_dense: torch.Tensor | None = None
+    dense_to_packed: torch.Tensor | None = None
+    cu_seqlens: torch.Tensor | None = None
 
 
 class AttentionMetadata(Protocol):

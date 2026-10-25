@@ -27,7 +27,7 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .gated_delta_net import mega_gdn_decode, mega_gdn_mtp_decode, mega_gdn_prefill
+    from .gated_delta_net import mega_gdn_decode, mega_gdn_mtp_decode, mega_gdn_mtp_decode_varlen, mega_gdn_prefill
 
 
 _EXPORTS = {
@@ -44,6 +44,7 @@ _EXPORTS = {
         "fused_sigmoid_gating_delta_rule_decode",
         "mega_gdn_decode",
         "mega_gdn_mtp_decode",
+        "mega_gdn_mtp_decode_varlen",
         "mega_gdn_prefill",
     ),
     "linear": (
@@ -230,6 +231,7 @@ __all__ = [
     "chunk_gated_delta_rule",
     "mega_gdn_decode",
     "mega_gdn_mtp_decode",
+    "mega_gdn_mtp_decode_varlen",
     "mega_gdn_prefill",
 ]
 _runtime_initialized = False

@@ -766,6 +766,14 @@ TORCH_LIBRARY(xllm_ops, m) {
       "write_state_indices, Tensor num_accepted_tokens, Tensor norm_weight, "
       "bool fla_ssm_state_layout) -> Tensor");
   m.def(
+      "mega_gdn_mtp_decode_varlen(Tensor qkv, Tensor z, Tensor b, Tensor a, "
+      "Tensor conv_weight, Tensor(a!) conv_state, Tensor a_log, Tensor "
+      "dt_bias, "
+      "Tensor(b!) ssm_state, Tensor read_state_indices, Tensor "
+      "write_state_indices, "
+      "Tensor num_accepted_tokens, Tensor norm_weight, Tensor cu_seqlens, "
+      "Tensor(c!) out, bool fla_ssm_state_layout) -> ()");
+  m.def(
       "causal_conv1d_prefill(Tensor x, Tensor weight, Tensor(a!) conv_state, "
       "Tensor state_indices, Tensor has_initial_state, "
       "Tensor query_start_loc) -> Tensor");
@@ -1022,6 +1030,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("mega_gdn_prefill", TORCH_FN(xllm::mega_gdn_prefill_npu));
   m.impl("mega_gdn_decode", TORCH_FN(xllm::mega_gdn_decode_npu));
   m.impl("mega_gdn_mtp_decode", TORCH_FN(xllm::mega_gdn_mtp_decode_npu));
+  m.impl("mega_gdn_mtp_decode_varlen",
+         TORCH_FN(xllm::kernel::npu::npu_mega_gdn_mtp_decode_varlen));
   m.impl("causal_conv1d_prefill", TORCH_FN(xllm::causal_conv1d_prefill_npu));
   m.impl("causal_conv1d_qkv_prefill",
          TORCH_FN(xllm::causal_conv1d_qkv_prefill_npu));

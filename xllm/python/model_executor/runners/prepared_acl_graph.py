@@ -39,10 +39,11 @@ class _PreparedBlockGraphEntry(AclGraphEntry):
 class _PreparedDSparkGraphEntry(AclGraphEntry):
     """Capture adaptive packing into the target's borrowed input views."""
 
-    __slots__ = ("dspark_adaptive", "source_block_table")
+    __slots__ = ("dspark_adaptive", "source_block_table", "kv_capacity")
 
     dspark_adaptive: DSparkAdaptiveGraphInputs
     source_block_table: torch.Tensor
+    kv_capacity: int
 
 
 def _dspark_graph_tensors(inputs: DSparkAdaptiveGraphInputs) -> tuple[torch.Tensor, ...]:
@@ -103,6 +104,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         self._device_kv_lengths = device_kv_lengths
         self.max_batch = (max_batch + dp_size - 1) // dp_size
         self._prepared_graphs: dict[tuple[object, ...], AclGraphEntry] = {}
+        self._shared_workspaces: dict[tuple[object, ...], object] = {}
         self.prepared_replays = 0
 
     @staticmethod
@@ -123,14 +125,20 @@ class PreparedAclGraphRunner(AclGraphRunner):
             metadata.q_seq_lens,
             getattr(metadata, "q_cu_seq_lens", None),
             metadata.kv_seq_lens,
-            getattr(metadata, "linear_state_indices", None),
-            getattr(metadata, "linear_state_read_indices", None),
-            getattr(metadata, "linear_state_write_indices", None),
-            getattr(metadata, "has_initial_state", None),
-            getattr(metadata, "num_accepted_tokens", None),
-            input_embedding,
-            mtp_topk_indices,
         )
+        packed_recurrent = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
+        # Packed graphs own full-capacity state in their descriptor. Native
+        # metadata may expose a different live-request prefix on each replay.
+        tensors += tuple(
+            None if packed_recurrent else getattr(metadata, name, None)
+            for name in (
+                "linear_state_indices",
+                "linear_state_read_indices",
+                "linear_state_write_indices",
+                "has_initial_state",
+                "num_accepted_tokens",
+            )
+        ) + (input_embedding, mtp_topk_indices)
         if dspark_adaptive is not None:
             tensors += _dspark_graph_tensors(dspark_adaptive)
         addresses = tuple(
@@ -328,7 +336,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if metadata.q_seq_lens.numel() != expected_rows or metadata.kv_seq_lens.numel() != expected_rows:
             raise ValueError("prepared ACL graph requires query and KV lengths per metadata row")
         state_rows = batch_size // self._spec_verify_width
-        for name in ("linear_state_indices", "linear_state_read_indices", "linear_state_write_indices"):
+        packed_recurrent = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
+        state_fields = (
+            ()
+            if packed_recurrent
+            else ("linear_state_indices", "linear_state_read_indices", "linear_state_write_indices")
+        )
+        for name in state_fields:
             indices = getattr(metadata, name, None)
             if indices is not None and (
                 indices.ndim != 1
@@ -355,7 +369,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 or not accepted.is_contiguous()
             ):
                 raise ValueError("prepared speculative verify graph requires final int32 accepted counts per sequence")
-        read_indices = getattr(metadata, "linear_state_read_indices", None)
+        read_indices = None if packed_recurrent else getattr(metadata, "linear_state_read_indices", None)
         write_indices = getattr(metadata, "linear_state_write_indices", None)
         if write_indices is None:
             write_indices = getattr(metadata, "linear_state_indices", None)
@@ -446,7 +460,12 @@ class PreparedAclGraphRunner(AclGraphRunner):
         entry.static_input_embedding = input_embedding
         entry.static_mtp_topk_indices = mtp_topk_indices
         entry.graph_tasks = []
-        entry.execution_state = AclGraphExecutionState({})
+        recurrent_verify = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
+        # Native Launch serializes these target graphs on one compute stream.
+        # Share scratch only; output buffers and Host task arguments stay private.
+        entry.execution_state = AclGraphExecutionState(
+            {}, shared_persistent_buffers=self._shared_workspaces if recurrent_verify else None
+        )
         entry.replay_logged = False
         mega_moe_token_mask = None
         if self._enable_mega_moe_token_mask:
@@ -465,11 +484,15 @@ class PreparedAclGraphRunner(AclGraphRunner):
             q_seq_lens=metadata.q_seq_lens,
             q_cu_seq_lens=metadata.q_cu_seq_lens,
             kv_seq_lens=metadata.kv_seq_lens,
-            linear_state_indices=getattr(metadata, "linear_state_indices", None),
-            linear_state_read_indices=getattr(metadata, "linear_state_read_indices", None),
-            linear_state_write_indices=getattr(metadata, "linear_state_write_indices", None),
-            has_initial_state=getattr(metadata, "has_initial_state", None),
-            num_accepted_tokens=getattr(metadata, "num_accepted_tokens", None),
+            linear_state_indices=None if recurrent_verify else getattr(metadata, "linear_state_indices", None),
+            linear_state_read_indices=(
+                None if recurrent_verify else getattr(metadata, "linear_state_read_indices", None)
+            ),
+            linear_state_write_indices=(
+                None if recurrent_verify else getattr(metadata, "linear_state_write_indices", None)
+            ),
+            has_initial_state=None if recurrent_verify else getattr(metadata, "has_initial_state", None),
+            num_accepted_tokens=None if recurrent_verify else getattr(metadata, "num_accepted_tokens", None),
             is_spec_verify=self._spec_verify_width > 1,
             kv_seq_lens_host_values=list(metadata.kv_seq_lens_host_values),
             dp_execution_token_counts=tuple(getattr(metadata, "dp_execution_token_counts", ())),
@@ -489,7 +512,6 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 if entry.static_metadata.linear_state_write_indices is not None
                 else entry.static_metadata.linear_state_indices
             )
-        recurrent_verify = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
         if recurrent_verify:
             # Every admitted request owns at least its anchor, so a G-row
             # graph can never contain more than G live recurrent states.
@@ -499,17 +521,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 state_indices=torch.zeros(capacity, dtype=torch.int32, device=self.device),
                 num_accepted_tokens=torch.ones(capacity, dtype=torch.int32, device=self.device),
                 query_width=width,
-                packed_to_dense=torch.full(
-                    (entry.batch_size,), capacity * width, dtype=torch.int64, device=self.device
-                ),
-                dense_to_packed=torch.full(
-                    (capacity * width,), entry.batch_size, dtype=torch.int64, device=self.device
-                ),
+                cu_seqlens=torch.zeros(capacity + 1, dtype=torch.int32, device=self.device),
             )
         if self._block_draft or self._device_kv_lengths or recurrent_verify:
             # Like the legacy DSpark runner, capture at least the startup
-            # 16-page context plus the query. Keep the FIA bound constant;
-            # live device lengths, not captured Host lists, mask the prefix.
+            # 16-page context plus the query. Table and mask capacities stay
+            # fixed; recurrent target tasks can refresh conservative Host
+            # scan bounds while Device lengths mask the exact prefix.
             page_size = self.attention_backend.page_size
             request_count = metadata.block_table.shape[0]
             query_width = entry.batch_size // request_count
@@ -535,8 +553,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 list(range(1, entry.batch_size + 1)) if recurrent_verify else list(metadata.q_cu_seq_lens_host_values)
             )
             static.kv_seq_lens_host_values = [pages * page_size] * request_count
+            if recurrent_verify:
+                entry.kv_capacity = pages * page_size
             static.is_chunked_prefill = self._block_draft
-            static.prepared_attention_state = self.attention_backend.prepare_metadata(static, device_kv_lengths=True)
+            workspace_options = {"workspace_query_capacity": self.max_batch} if recurrent_verify else {}
+            static.prepared_attention_state = self.attention_backend.prepare_metadata(
+                static, device_kv_lengths=True, **workspace_options
+            )
         if mega_moe_token_mask is not None:
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)
         self._prepare_graph_eplb_state(entry, eplb, metadata, first_capture=True)
@@ -619,13 +642,25 @@ class PreparedAclGraphRunner(AclGraphRunner):
         # Padding must select an explicit zero row, never a live request row.
         capacity = graph.state_indices.numel()
         rows = torch.arange(capacity, device=inputs.control.device)
-        columns = torch.arange(graph.query_width, device=inputs.control.device)
         live = inputs.control.to(torch.int32)
         active = rows < live
         writable = active & (inputs.control < 2**32)
         graph.state_indices.copy_(torch.where(writable, inputs.linear_state_indices[:capacity], 0))
         graph.num_accepted_tokens.copy_(torch.where(active, inputs.num_accepted_tokens[:capacity], 1))
-        offsets = inputs.offsets[: capacity + 1].to(torch.int64)
+        offsets = inputs.offsets[: capacity + 1]
+        if graph.cu_seqlens is not None:
+            endpoint = offsets.gather(0, live.to(torch.int64).reshape(1).clamp(max=capacity))
+            prefixes = torch.where(torch.arange(capacity + 1, device=offsets.device) <= live, offsets, endpoint)
+            # Capture-only rounds must not write multiple requests into slot
+            # zero. Replay refreshes this same storage with live endpoints.
+            graph.cu_seqlens.copy_(torch.where(inputs.control < 2**32, prefixes, 0))
+            # The fused packed verifier consumes endpoints directly. Building
+            # dense maps here would add unused device work to every replay.
+            return
+        if graph.dense_to_packed is None or graph.packed_to_dense is None:
+            raise ValueError("dense recurrent verification requires both token maps")
+        offsets = offsets.to(torch.int64)
+        columns = torch.arange(graph.query_width, device=inputs.control.device)
         widths = offsets[1:] - offsets[:-1]
         dense = offsets[:-1, None] + columns
         dense = torch.where(active[:, None] & (columns < widths[:, None]), dense, graph_rows)
@@ -683,6 +718,17 @@ class PreparedAclGraphRunner(AclGraphRunner):
     ) -> ModelExecutionOutput:
         # Only serialized Launch installs shared backend state. This path
         # selects entry-owned buffers and refreshes its captured Host lists.
+        if isinstance(entry, _PreparedDSparkGraphEntry) and entry.static_metadata.linear_verify_graph is not None:
+            bounds = metadata.kv_seq_lens_host_values
+            if (
+                bounds is None
+                or len(bounds) != entry.batch_size
+                or any(bound <= 0 or bound > entry.kv_capacity for bound in bounds)
+            ):
+                raise ValueError("adaptive target KV bounds must fit the warmed graph capacity")
+            # These conservative bounds precede Device acceptance. Keep the
+            # entry's list identity and maximum mask/workspace unchanged.
+            entry.static_metadata.kv_seq_lens_host_values[:] = bounds
         if entry.static_metadata.mega_moe_token_mask is not None:
             # Counts precede native Slot padding; execution counts are physical.
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)

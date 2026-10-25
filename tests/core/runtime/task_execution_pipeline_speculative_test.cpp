@@ -4184,6 +4184,93 @@ TEST_F(SpeculativePipelineTest,
   pipeline_.reset();
 }
 
+TEST_F(SpeculativePipelineTest,
+       AdaptiveDSparkRecurrentCountsFollowRequestsAcrossSlotsAndRowOrder) {
+  configure_adaptive_dspark(/*profiled=*/false);
+  capacity_.common.enable_mla = false;
+  capacity_.sparse_dsa_target = false;
+  capacity_.hybrid_recurrent_target = true;
+  target_cache_.emplace_back(LinearAttentionKVCacheTensors{
+      torch::zeros({5, 10, 1}, target_->options()),
+      torch::zeros({40, 1, 1, 1}, target_->options())});
+  TaskModel target{*target_, *target_executor_, target_cache_};
+  target.restore_request_state = [](const ModelParamsView& params) {
+    EXPECT_EQ(params.embedding.linear_state_indices.numel(),
+              params.embedding.linear_state_ids.size());
+  };
+  const Status status = TaskExecutionPipeline::create(
+      state_thread_,
+      std::move(target),
+      TaskModel{*draft_, *draft_executor_, draft_cache_},
+      capacity_,
+      pipeline_);
+  ASSERT_TRUE(status.ok()) << status.message();
+  const std::array<int32_t, 3> state_ids{4, 2, 1};
+  const auto recurrent_input =
+      [&](uint32_t rows, bool decode, bool placeholder = false) {
+        auto input = dspark_batch_input(rows, decode, placeholder);
+        for (uint32_t row = 0; row < rows; ++row) {
+          LinearStateCacheOp op;
+          op.linear_state_id = state_ids[row];
+          op.reset_requested = !decode;
+          input.input_params.embedding.linear_state_ids.emplace_back(
+              op.linear_state_id);
+          input.input_params.linear_state_cache_ops.emplace_back(op);
+        }
+        return input;
+      };
+  for (uint32_t rows = 1; rows <= 3; ++rows) {
+    execute(recurrent_input(rows, /*decode=*/false));
+    auto warmup = recurrent_input(rows, /*decode=*/true);
+    warmup.input_params.meta.is_graph_warmup = true;
+    execute(warmup);
+  }
+  execute(recurrent_input(3, /*decode=*/false));
+  target_->recurrent_accepted_counts.clear();
+  draft_->row_markov_increments =
+      torch::tensor({1, 2, 1}, target_->options().dtype(torch::kInt64));
+  const auto first = pipeline_->submit(recurrent_input(3, /*decode=*/true));
+  const auto second = pipeline_->submit(
+      recurrent_input(3, /*decode=*/true, /*placeholder=*/true));
+  ASSERT_TRUE(first.status.ok()) << first.status.message();
+  ASSERT_TRUE(second.status.ok()) << second.status.message();
+  const auto first_result = pipeline_->take_result_async(first.task_id).get();
+  const auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(first_result.status.ok()) << first_result.status.message();
+  ASSERT_TRUE(second_result.status.ok()) << second_result.status.message();
+  const auto expected = torch::tensor({8, 1, 8}, torch::kInt32);
+  ASSERT_EQ(target_->recurrent_accepted_counts.size(), 2U);
+  EXPECT_TRUE(
+      torch::equal(target_->recurrent_accepted_counts[0].narrow(0, 0, 3).cpu(),
+                   torch::ones({3}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      target_->recurrent_accepted_counts[1].narrow(0, 0, 3).cpu(), expected));
+  const auto lengths = [](const ForwardOutput& output) {
+    return output.sample_output.next_tokens.ge(0).sum(1).cpu().to(
+        torch::kInt32);
+  };
+  EXPECT_TRUE(torch::equal(lengths(first_result.output), expected));
+  EXPECT_TRUE(torch::equal(lengths(second_result.output), expected));
+
+  auto reordered = recurrent_input(3, /*decode=*/true, /*placeholder=*/true);
+  auto& embedding = reordered.input_params.embedding;
+  std::swap(embedding.embedding_ids[0], embedding.embedding_ids[1]);
+  std::swap(embedding.request_ids[0], embedding.request_ids[1]);
+  std::swap(embedding.linear_state_ids[0], embedding.linear_state_ids[1]);
+  std::swap(reordered.input_params.linear_state_cache_ops[0],
+            reordered.input_params.linear_state_cache_ops[1]);
+  auto& host = reordered.input_params.attention.host;
+  host.block_tables = host.block_tables.index_select(
+      0, torch::tensor({1, 0, 2}, torch::kInt64));
+  std::swap(host.new_cache_slots[0], host.new_cache_slots[1]);
+  execute(reordered);
+  ASSERT_EQ(target_->recurrent_accepted_counts.size(), 3U);
+  EXPECT_TRUE(
+      torch::equal(target_->recurrent_accepted_counts[2].narrow(0, 0, 3).cpu(),
+                   torch::tensor({1, 8, 8}, torch::kInt32)));
+  pipeline_.reset();
+}
+
 TEST_F(SpeculativePipelineTest, AdaptiveDSparkRejectsUnsupportedAdmission) {
   configure_adaptive_dspark();
   capacity_.sparse_dsa_target = false;

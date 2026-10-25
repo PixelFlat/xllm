@@ -201,6 +201,32 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         width = metadata.query_width
         state_cache = metadata.state_caches[self.layer_id]
 
+        if metadata.cu_seqlens is not None:
+            mixed_qkv, a, b, z = (tensor.contiguous() for tensor in self._project_prefill_inputs(hidden))
+            output = torch.zeros_like(z)
+            for start in range(0, batch_size, _MEGA_GDN_MAX_DECODE_BATCH_SIZE):
+                end = min(start + _MEGA_GDN_MAX_DECODE_BATCH_SIZE, batch_size)
+                indices = metadata.state_indices[start:end]
+                kernels.mega_gdn_mtp_decode_varlen(
+                    mixed_qkv,
+                    z,
+                    b,
+                    a,
+                    self.conv1d_weight,
+                    state_cache.conv,
+                    self.A_log,
+                    self.dt_bias,
+                    state_cache.ssm,
+                    indices,
+                    indices,
+                    metadata.num_accepted_tokens[start:end],
+                    self.norm_weight,
+                    metadata.cu_seqlens[start : end + 1],
+                    output,
+                    True,
+                )
+            return output.reshape(-1, self.value_dim)
+
         def _pad(tensor: torch.Tensor) -> torch.Tensor:
             if metadata.dense_to_packed is not None:
                 tensor = torch.cat((tensor, torch.zeros_like(tensor[:1])), dim=0)
