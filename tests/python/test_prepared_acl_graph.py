@@ -546,6 +546,7 @@ def test_varlen_verify_does_not_refresh_legacy_token_maps() -> None:
     assert graph.dense_to_packed.tolist() == [-99] * 24
 
 
+@torch.inference_mode()
 def test_recurrent_prepared_forward_fuses_state_refresh_with_input_packing(
     runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
