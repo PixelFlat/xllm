@@ -219,7 +219,6 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
                     self.dt_bias,
                     state_cache.ssm,
                     indices,
-                    indices,
                     metadata.num_accepted_tokens[start:end],
                     self.norm_weight,
                     metadata.cu_seqlens[start : end + 1],

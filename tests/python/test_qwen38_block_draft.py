@@ -399,6 +399,44 @@ def test_gdn_adaptive_packed_padding_does_not_enter_live_prefixes(
     )
 
 
+@pytest.mark.parametrize(
+    ("entrypoint", "error_type", "error_message"),
+    [
+        ("python", TypeError, "write_state_indices"),
+        ("native", RuntimeError, r"expected at most 15 argument\(s\) but received 16 argument\(s\)"),
+    ],
+)
+def test_varlen_gdn_accepts_only_one_state_index_mapping(
+    entrypoint: str, error_type: type[Exception], error_message: str
+) -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from xllm.python.kernels_npu.gated_delta_net import mega_gdn_mtp_decode_varlen
+
+    operator = mega_gdn_mtp_decode_varlen if entrypoint == "python" else torch.ops.xllm_ops.mega_gdn_mtp_decode_varlen
+    with FakeTensorMode():
+        arguments = dict(
+            qkv=torch.empty(4, 384, dtype=torch.bfloat16),
+            z=torch.empty(4, 1, 128, dtype=torch.bfloat16),
+            b=torch.empty(4, 1, dtype=torch.bfloat16),
+            a=torch.empty(4, 1, dtype=torch.bfloat16),
+            conv_weight=torch.empty(4, 384, dtype=torch.bfloat16),
+            conv_state=torch.empty(2, 10, 384, dtype=torch.bfloat16),
+            a_log=torch.empty(1),
+            dt_bias=torch.empty(1),
+            ssm_state=torch.empty(16, 1, 128, 128),
+            state_indices=torch.tensor([1, 0], dtype=torch.int32),
+            num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+            norm_weight=torch.empty(128, dtype=torch.bfloat16),
+            cu_seqlens=torch.tensor([0, 2, 4], dtype=torch.int32),
+            out=torch.empty(4, 1, 128, dtype=torch.bfloat16),
+            fla_ssm_state_layout=True,
+        )
+        assert operator(**arguments) is None
+        with pytest.raises(error_type, match=error_message):
+            operator(**arguments, write_state_indices=torch.tensor([0, 1], dtype=torch.int32))
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 17, 31, 32, 33, 64, 65, 127, 128])
 def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
     monkeypatch: pytest.MonkeyPatch, batch_size: int
@@ -430,8 +468,7 @@ def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
         a_log: torch.Tensor,
         dt_bias: torch.Tensor,
         ssm: torch.Tensor,
-        reads: torch.Tensor,
-        writes: torch.Tensor,
+        state_indices: torch.Tensor,
         accepted: torch.Tensor,
         norm: torch.Tensor,
         offsets: torch.Tensor,
@@ -439,7 +476,7 @@ def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
         layout: bool,
     ) -> None:
         assert qkv.shape == hidden.shape
-        assert accepted.tolist() == [7] * reads.numel()
+        assert accepted.tolist() == [7] * state_indices.numel()
         calls.append((int(offsets[0]), int(offsets[-1])))
         for start, end in zip(offsets[:-1].tolist(), offsets[1:].tolist()):
             out[start:end].copy_(z[start:end].cumsum(dim=0))

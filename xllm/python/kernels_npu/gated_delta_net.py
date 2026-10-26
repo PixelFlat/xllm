@@ -140,15 +140,14 @@ def mega_gdn_mtp_decode_varlen(
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     ssm_state: torch.Tensor,
-    read_state_indices: torch.Tensor,
-    write_state_indices: torch.Tensor,
+    state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     norm_weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
     out: torch.Tensor,
     fla_ssm_state_layout: bool = True,
 ) -> None:
-    """Verify packed prefixes, preserving the fixed cache checkpoint stride."""
+    """Verify packed prefixes in place in each request's unique state slot."""
     torch.ops.xllm_ops.mega_gdn_mtp_decode_varlen(
         qkv,
         z,
@@ -159,8 +158,7 @@ def mega_gdn_mtp_decode_varlen(
         a_log,
         dt_bias,
         ssm_state,
-        read_state_indices,
-        write_state_indices,
+        state_indices,
         num_accepted_tokens,
         norm_weight,
         cu_seqlens,
