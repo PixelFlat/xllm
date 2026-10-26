@@ -24,6 +24,9 @@ limitations under the License.
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <limits>
@@ -990,8 +993,20 @@ class JsonTaskTestWorker final : public UnifiedMtpWorkerImpl {
 class HybridBlockTaskTestWorker final : public DFlashWorkerImpl {
  public:
   explicit HybridBlockTaskTestWorker(const torch::Device& device)
-      : DFlashWorkerImpl(ParallelArgs(0, 1, 1, nullptr), device, options()) {
+      : HybridBlockTaskTestWorker(device, options()) {}
+
+  HybridBlockTaskTestWorker(const torch::Device& device,
+                            const runtime::Options& options)
+      : DFlashWorkerImpl(ParallelArgs(0, 1, 1, nullptr), device, options) {
     target_is_hybrid_recurrent_ = true;
+  }
+
+  const runtime::Options& outer_options() const { return options_; }
+  const runtime::Options& target_options() const {
+    return impl_.get()->*&HybridBlockTaskTestWorker::options_;
+  }
+  const runtime::Options& draft_options() const {
+    return draft_impl_.get()->*&HybridBlockTaskTestWorker::options_;
   }
 
   std::optional<ForwardOutput> step(const LlmForwardInput& input) override {
@@ -1012,6 +1027,93 @@ class HybridBlockTaskTestWorker final : public DFlashWorkerImpl {
     return result;
   }
 };
+
+class HybridBlockWorkerOptionsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "xllm_block_options_XXXXXX")
+            .string();
+    const char* directory = ::mkdtemp(pattern.data());
+    ASSERT_NE(directory, nullptr);
+    model_path_ = directory;
+  }
+
+  void TearDown() override {
+    if (!model_path_.empty()) {
+      std::filesystem::remove_all(model_path_);
+    }
+  }
+
+  bool write_model_type(const std::string& model_type) const {
+    std::ofstream config(model_path_ / "config.json");
+    config << nlohmann::json{{"model_type", model_type}};
+    return config.good();
+  }
+
+  runtime::Options options() const {
+    runtime::Options result;
+    result.model_path(model_path_.string())
+        .backend("llm")
+        .enable_schedule_overlap(true)
+        .enable_graph(true)
+        .enable_task_pipeline(true)
+        .speculative_algorithm("DSpark")
+        .num_speculative_tokens(7);
+    return result;
+  }
+
+  const torch::Device device_{"npu:0"};
+  std::filesystem::path model_path_;
+};
+
+TEST_F(HybridBlockWorkerOptionsTest,
+       FixedRecurrentLeavesKeepOrdinaryAclGraphs) {
+  for (const std::string model_type : {"qwen3_5", "qwen3_5_text"}) {
+    SCOPED_TRACE(model_type);
+    ASSERT_TRUE(write_model_type(model_type));
+    for (const std::string algorithm : {"DSpark", "DFlash2"}) {
+      SCOPED_TRACE(algorithm);
+      runtime::Options config = options();
+      config.speculative_algorithm(algorithm);
+      HybridBlockTaskTestWorker worker(device_, config);
+      EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+      EXPECT_TRUE(worker.outer_options().enable_schedule_overlap());
+      EXPECT_FALSE(worker.target_options().enable_task_pipeline());
+      EXPECT_FALSE(worker.draft_options().enable_task_pipeline());
+      EXPECT_TRUE(worker.target_options().enable_graph());
+      EXPECT_TRUE(worker.draft_options().enable_graph());
+      EXPECT_TRUE(worker.target_options().enable_graph_aux_hidden_states());
+      EXPECT_FALSE(worker.draft_options().enable_graph_aux_hidden_states());
+    }
+  }
+}
+
+TEST_F(HybridBlockWorkerOptionsTest,
+       AdaptiveRecurrentLeavesKeepPreparedGraphs) {
+  for (const std::string model_type : {"qwen3_5", "qwen3_5_text"}) {
+    SCOPED_TRACE(model_type);
+    ASSERT_TRUE(write_model_type(model_type));
+    runtime::Options config = options();
+    config.enable_adaptive_target_verify(true);
+    HybridBlockTaskTestWorker worker(device_, config);
+    EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.target_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.target_options().enable_graph());
+    EXPECT_TRUE(worker.draft_options().enable_graph());
+  }
+}
+
+TEST_F(HybridBlockWorkerOptionsTest, FullAttentionLeavesKeepPreparedGraphs) {
+  ASSERT_TRUE(write_model_type("qwen3"));
+  HybridBlockTaskTestWorker worker(device_, options());
+  EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.target_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.target_options().enable_graph());
+  EXPECT_TRUE(worker.draft_options().enable_graph());
+}
 
 // Supply a leader's values that differ from the local draws. Downstream model
 // inputs and the next round must use these values, including accepted length.

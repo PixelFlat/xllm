@@ -77,6 +77,11 @@ runtime::Options target_options(const runtime::Options& options) {
   opts.enable_schedule_overlap(false)
       .is_draft_engine(false)
       .enable_graph_aux_hidden_states(true);
+  if (uses_hybrid_worker_pipeline(options)) {
+    // The outer worker owns the pipeline; the recurrent target keeps its
+    // ordinary ACL runner, just like the draft leaf.
+    opts.enable_task_pipeline(false);
+  }
   return opts;
 }
 
