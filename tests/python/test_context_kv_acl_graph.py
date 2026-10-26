@@ -119,6 +119,76 @@ def test_borrowed_replay_uses_final_slot_views_and_never_captures_at_runtime(
         assert entry.graph.replay.call_count == 2
 
 
+def test_borrowed_context_captures_new_target_outputs_for_the_same_warmed_slot(
+    runner: ContextKvAclGraphRunner,
+) -> None:
+    hidden = torch.ones(3, 4)
+    positions = torch.arange(3, dtype=torch.int32)
+    slots = torch.tensor([2, -1, 4], dtype=torch.int32)
+    expected_slots = slots.clone()
+    original = runner.execute_borrowed(hidden, positions, slots, warmup=True)
+    snapshots = []
+
+    def write_context(new_hidden: torch.Tensor, _: torch.Tensor, writes: torch.Tensor, *args: object) -> torch.Tensor:
+        snapshots.append(writes.clone())
+        return new_hidden[:, :2].clone()
+
+    runner.model.write_context_kv.side_effect = write_context
+    wider_hidden = torch.full_like(hidden, 7)
+    output = runner.execute_borrowed(wider_hidden, positions, slots, warmup=False)
+    assert len(runner._borrowed_graphs) == 2
+    assert snapshots and all(torch.all(writes == -1) for writes in snapshots)
+    torch.testing.assert_close(slots, expected_slots)
+    torch.testing.assert_close(original, torch.ones(3, 2))
+    torch.testing.assert_close(output, torch.full((3, 2), 7.0))
+    assert torch.npu.graph.call_args.kwargs["capture_error_mode"] == "thread_local"
+    captures = torch.npu.graph.call_count
+    assert runner.execute_borrowed(hidden, positions, slots, warmup=False) is original
+    assert runner.execute_borrowed(wider_hidden, positions, slots, warmup=False) is output
+    assert torch.npu.graph.call_count == captures
+
+
+@pytest.mark.parametrize("change", ["positions", "slots", "hidden_stride", "rows"])
+def test_borrowed_context_new_outputs_require_a_warmed_slot_geometry(
+    runner: ContextKvAclGraphRunner, change: str
+) -> None:
+    hidden = torch.ones(3, 4)
+    positions = torch.arange(3, dtype=torch.int32)
+    slots = torch.arange(3, dtype=torch.int32)
+    runner.execute_borrowed(hidden, positions, slots, warmup=True)
+    hidden = hidden.clone()
+    if change == "positions":
+        positions = positions.clone()
+    elif change == "slots":
+        slots = slots.clone()
+    elif change == "hidden_stride":
+        hidden = torch.ones(3, 8)[:, ::2]
+    else:
+        hidden, positions, slots = hidden[:2], positions[:2], slots[:2]
+    captures = torch.npu.graph.call_count
+    forwards = runner.model.write_context_kv.call_count
+    with pytest.raises(RuntimeError, match="warmed Slot binding"):
+        runner.execute_borrowed(hidden, positions, slots, warmup=False)
+    assert torch.npu.graph.call_count == captures
+    assert runner.model.write_context_kv.call_count == forwards
+
+
+def test_borrowed_context_capture_failure_restores_slots_without_publishing_variant(
+    runner: ContextKvAclGraphRunner,
+) -> None:
+    hidden = torch.ones(3, 4)
+    positions = torch.arange(3, dtype=torch.int32)
+    slots = torch.arange(3, dtype=torch.int32)
+    runner.execute_borrowed(hidden, positions, slots, warmup=True)
+    expected_slots = slots.clone()
+    runner.model.write_context_kv.side_effect = RuntimeError("capture failed")
+    with pytest.raises(RuntimeError, match="capture failed"):
+        runner.execute_borrowed(hidden.clone(), positions, slots, warmup=False)
+    torch.testing.assert_close(slots, expected_slots)
+    assert len(runner._borrowed_graphs) == len(runner._borrowed_slot_bindings) == 1
+    assert runner.replays == 1
+
+
 def test_missing_startup_capture_is_not_a_runtime_fallback(runner: ContextKvAclGraphRunner) -> None:
     with pytest.raises(RuntimeError, match="startup warmup"):
         runner.execute(torch.ones(1, 4), torch.ones(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
@@ -162,9 +232,12 @@ def test_cache_rebinding_is_rejected(runner: ContextKvAclGraphRunner) -> None:
 
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("default_stream", [True, False], ids=["default_startup", "nondefault_startup"])
-def test_real_context_graph_matches_eager_and_preserves_masked_slots(default_stream: bool) -> None:
+def test_real_context_graph_matches_eager_and_preserves_masked_slots(
+    default_stream: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from xllm.python.models.qwen3_dspark import Qwen3DSparkForCausalLM
 
+    monkeypatch.setattr("xllm.python.model_executor.runners.acl_graph._GRAPH_POOL", None)
     torch.manual_seed(23)
     model = Qwen3DSparkForCausalLM(
         {
@@ -212,6 +285,10 @@ def test_real_context_graph_matches_eager_and_preserves_masked_slots(default_str
         borrowed_slots = torch.full((4,), -1, dtype=torch.int32, device="npu:0")
         graph_runner.execute_borrowed(borrowed_hidden, borrowed_positions, borrowed_slots, warmup=True)
         for iteration, rows in enumerate((4, 3, 4, 1, 3, 2)):
+            if iteration in (1, 3):
+                # A new Target KV variant retains its own hidden output, while
+                # native Slot positions and context-write slots stay fixed.
+                borrowed_hidden = borrowed_hidden.clone()
             hidden = torch.randn(rows, 128, dtype=torch.bfloat16, device="npu:0")
             positions = torch.arange(iteration, iteration + rows, dtype=torch.int32, device="npu:0")
             slots = torch.arange(2, rows + 2, dtype=torch.int32, device="npu:0")
@@ -238,4 +315,5 @@ def test_real_context_graph_matches_eager_and_preserves_masked_slots(default_str
             for actual_pair, expected_pair in zip(caches, reference_caches):
                 for actual_cache, expected_cache in zip(actual_pair, expected_pair):
                     torch.testing.assert_close(actual_cache, expected_cache)
+        assert len(graph_runner._borrowed_graphs) == 3
     assert graph_runner.replays == 13

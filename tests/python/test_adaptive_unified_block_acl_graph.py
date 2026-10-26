@@ -305,6 +305,7 @@ def cpu_recipe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(_AdaptiveUnifiedBlockAclGraph, "execute", replay)
     monkeypatch.setattr(_AdaptiveUnifiedBlockAclGraph, "close", lambda _: None)
     monkeypatch.setattr(torch.npu, "Stream", lambda **_: object())
+    monkeypatch.setattr(torch.npu, "current_stream", lambda *_: SimpleNamespace(wait_stream=lambda _: None))
     monkeypatch.setattr(torch.npu, "graph_pool_handle", lambda: (0, 0))
     return calls
 
@@ -375,7 +376,7 @@ def test_cpu_recipe_runs_confidence_pruning_before_target_and_commits_only_live_
     assert registry.cache_info()["size"] == 1
 
 
-def test_registry_requires_startup_binding_and_reuses_fixed_kv_bounds(cpu_recipe: list[str]) -> None:
+def test_registry_requires_startup_binding_and_grows_compact_kv_buckets(cpu_recipe: list[str]) -> None:
     registry = _registry("cpu", cpu_recipe)
     case = _case(3, 8)
     with pytest.raises(ValueError, match="not captured during startup"):
@@ -384,7 +385,7 @@ def test_registry_requires_startup_binding_and_reuses_fixed_kv_bounds(cpu_recipe
     registry.warmup(*case.arguments())
     runner = next(iter(registry.variants.values()))
     assert runner.draft_kv_bound == 512
-    assert runner.target_kv_bound == 513
+    assert runner.target_kv_bound == 1024
     for _, _, metadata in (case.target_binding, case.draft_binding):
         metadata.kv_seq_lens_host_values[:] = [128] * metadata.block_table.shape[0]
     _patch(case, 3, suppress=False)
@@ -394,12 +395,49 @@ def test_registry_requires_startup_binding_and_reuses_fixed_kv_bounds(cpu_recipe
     assert runner.target_metadata.block_table.data_ptr() == case.target_binding[2].block_table.data_ptr()
     assert runner.draft_metadata.block_table.shape[1] == 32
     case.target_binding[2].kv_seq_lens_host_values[:] = [514] * 8
-    with pytest.raises(ValueError, match="Target KV bound"):
-        registry.execute(*case.arguments())
+    _patch(case, 4, suppress=False)
+    registry.execute(*case.arguments())
+    assert registry.cache_info()["size"] == 1
     case.target_binding[2].kv_seq_lens_host_values[:] = [128] * 8
     case.draft_binding[2].kv_seq_lens_host_values[:] = [513] * 4
-    with pytest.raises(ValueError, match="Draft KV bound"):
+    original_slots = case.draft_binding[2].slot_mapping.clone()
+    original_control = case.inputs.control.clone()
+    registry.warmup(*case.arguments())
+    assert registry.cache_info()["size"] == 2
+    torch.testing.assert_close(case.draft_binding[2].slot_mapping, original_slots)
+    torch.testing.assert_close(case.inputs.control, original_control)
+    _patch(case, 5, suppress=False)
+    registry.execute(*case.arguments())
+    _check_outputs(case, 5)
+    case.draft_binding[2].kv_seq_lens_host_values[:] = [128] * 4
+    _patch(case, 6, suppress=False)
+    registry.execute(*case.arguments())
+    _check_outputs(case, 6)
+    assert registry.cache_info()["size"] == 2
+    case.target_binding[2].kv_seq_lens_host_values[:] = [1025] * 8
+    with pytest.raises(ValueError, match="block-table capacity"):
         registry.execute(*case.arguments())
+
+
+def test_runtime_unified_kv_capture_never_writes_live_caches(cpu_recipe: list[str]) -> None:
+    registry = _registry("cpu", cpu_recipe)
+    case = _case(3, 8)
+    _patch(case, 0, suppress=True)
+    registry.warmup(*case.arguments())
+    _patch(case, 1, suppress=False)
+    registry.execute(*case.arguments())
+    previous = registry.draft.context_cache.clone()
+    previous_draft = registry.draft.draft_cache.clone()
+    previous_control = case.inputs.control.clone()
+    previous_slots = case.draft_binding[2].slot_mapping.clone()
+    case.draft_binding[2].kv_seq_lens_host_values[:] = [513] * 4
+    registry.warmup(*case.arguments())
+    torch.testing.assert_close(registry.draft.context_cache, previous)
+    torch.testing.assert_close(registry.draft.draft_cache, previous_draft)
+    torch.testing.assert_close(case.inputs.control, previous_control)
+    torch.testing.assert_close(case.draft_binding[2].slot_mapping, previous_slots)
+    registry.execute(*case.arguments())
+    _check_outputs(case, 1)
 
 
 def test_mla_draft_uses_backend_metadata_with_live_device_kv_lengths(cpu_recipe: list[str]) -> None:
@@ -443,7 +481,7 @@ def test_registry_retains_two_slots_without_eviction_and_rejects_new_storage(cpu
         else:
             torch.testing.assert_close(cases[0].tokens, saved)
     assert registry.cache_info()["size"] == 2
-    assert registry.cache_info()["capacity"] == 128
+    assert registry.cache_info()["capacity"] == 128 * ((64).bit_length() + 1) ** 2
     with pytest.raises(ValueError, match="Slot capacity"):
         registry.warmup(*cases[2].arguments())
     changed = _case(3, 8)

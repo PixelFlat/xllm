@@ -4793,7 +4793,7 @@ TEST_F(SpeculativePipelineTest,
 }
 
 TEST_F(SpeculativePipelineTest,
-       DSparkGraphsRejectContextBeyondFirstWarmedCompactTable) {
+       DSparkGraphsAdmitContextBeyondFirstWarmedCompactTable) {
   for (const bool adaptive : {false, true}) {
     SCOPED_TRACE(adaptive);
     pipeline_.reset();
@@ -4810,8 +4810,6 @@ TEST_F(SpeculativePipelineTest,
     ASSERT_NE(pipeline_, nullptr);
     warmup_dspark_batch_graphs();
     execute(dspark_batch_input(1, /*decode=*/false));
-    const size_t target_forwards = target_->forward_inputs.size();
-    const size_t draft_forwards = draft_->forward_inputs.size();
     const size_t target_warmups = target_->graph_warmup_bindings.size();
     const size_t draft_warmups = draft_->graph_warmup_bindings.size();
 
@@ -4825,18 +4823,26 @@ TEST_F(SpeculativePipelineTest,
         torch::ones({1, 64}, torch::kInt32);
     outside.input_params.attention.host.new_cache_slots = {26};
     // KV=507 plus six later query rows crosses that 512-token bound.
-    const auto rejected = pipeline_->submit(outside);
-    EXPECT_FALSE(rejected.status.ok());
-    EXPECT_EQ(rejected.task_id, 0U);
-    EXPECT_EQ(target_->forward_inputs.size(), target_forwards);
-    EXPECT_EQ(draft_->forward_inputs.size(), draft_forwards);
-
-    // Repeating startup warmup with the same tensor binding must not pretend
-    // to enlarge a graph that the Python runner has already captured.
-    outside.input_params.meta.is_graph_warmup = true;
-    EXPECT_FALSE(pipeline_->submit(outside).status.ok());
+    // Native admission validates full Slot/model capacity, not the first
+    // compact graph. The Python executor owns lazy KV-variant capture on the
+    // serialized Launch thread; this fake executor only verifies admission.
+    const auto submitted = pipeline_->submit(outside);
+    ASSERT_TRUE(submitted.status.ok()) << submitted.status.message();
+    const auto result = pipeline_->take_result_async(submitted.task_id).get();
+    ASSERT_TRUE(result.status.ok()) << result.status.message();
+    EXPECT_TRUE(result.output.sample_output.next_tokens.defined());
     EXPECT_EQ(target_->graph_warmup_bindings.size(), target_warmups);
     EXPECT_EQ(draft_->graph_warmup_bindings.size(), draft_warmups);
+
+    auto overflow = outside.clone();
+    overflow.positions = torch::tensor({1020}, torch::kInt32);
+    overflow.input_params.attention.host.kv_seq_lens = {1021};
+    overflow.input_params.attention.host.new_cache_slots = {28};
+    const auto rejected = pipeline_->submit(overflow);
+    EXPECT_FALSE(rejected.status.ok());
+    EXPECT_EQ(rejected.task_id, 0U);
+
+    execute(dspark_batch_input(1, /*decode=*/false));
     const auto inside = execute(dspark_batch_input(1, /*decode=*/true));
     EXPECT_TRUE(torch::equal(
         inside.sample_output.next_tokens,

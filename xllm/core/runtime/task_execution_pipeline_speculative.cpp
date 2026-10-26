@@ -242,8 +242,8 @@ uint64_t dspark_graph_kv_capacity(const LlmTaskCapacity& capacity,
                                   int32_t maximum_kv_length) {
   // Match PreparedAclGraphRunner.warmup_prepared's compact block-draft
   // table: at least 16 context pages plus the query, then round to a power
-  // of two and clamp to the fixed Slot table width. Repeated warmup of the
-  // same binding does not enlarge the already captured Python table.
+  // of two and clamp to the fixed Slot table width. This records the startup
+  // capacity for calibration; serialized Launch may capture larger variants.
   const uint64_t page_size = capacity.logical_block_size;
   const uint64_t required_pages =
       (static_cast<uint64_t>(maximum_kv_length) + page_size - 1) / page_size;
@@ -1177,18 +1177,9 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
             ? task_graph_batch_size(invocation.input->model_params().parallel,
                                     invocation.graph_batch_sizes)
             : invocation.padded_batch_size;
-    const auto captured =
-        invocation.captured_graph_kv_capacities.find(graph_rows);
-    const int32_t maximum_kv_length = *std::max_element(
-        invocation.input->input_scratch_->planned_.kv_seq_lens.begin(),
-        invocation.input->input_scratch_->planned_.kv_seq_lens.end());
-    if ((!input.input_params.meta.is_graph_warmup &&
-         captured == invocation.captured_graph_kv_capacities.end()) ||
-        (captured != invocation.captured_graph_kv_capacities.end() &&
-         static_cast<uint64_t>(maximum_kv_length) > captured->second)) {
-      return invalid(
-          "DSpark graph task KV length exceeds its first warmed compact "
-          "Draft table; a wider startup graph binding is required.");
+    if (!input.input_params.meta.is_graph_warmup &&
+        !invocation.captured_graph_kv_capacities.contains(graph_rows)) {
+      return invalid("DSpark graph task requires a warmed Draft Slot binding.");
     }
   }
   if (slot.verify) {
@@ -1436,11 +1427,9 @@ Status TaskExecutionPipeline::plan_dp_adaptive_dspark(
   const auto captured =
       draft.captured_graph_kv_capacities.find(draft.padded_batch_size);
   if (!warmup && (draft.padded_batch_size == 0 ||
-                  captured == draft.captured_graph_kv_capacities.end() ||
-                  adaptive.max_kv_length > captured->second)) {
+                  captured == draft.captured_graph_kv_capacities.end())) {
     return invalid(
-        "Adaptive DSpark DP requires a prewarmed global Draft bucket and KV "
-        "bound.");
+        "Adaptive DSpark DP requires a prewarmed global Draft batch bucket.");
   }
   const std::span<const int64_t> candidates =
       warmup ? std::span<const int64_t>(graph_batch_sizes_)

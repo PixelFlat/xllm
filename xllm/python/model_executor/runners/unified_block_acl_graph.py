@@ -411,6 +411,7 @@ class _AdaptiveUnifiedBlockAclGraph(_BlockGraphLifecycle):
         dspark_adaptive: DSparkAdaptiveGraphInputs,
         context_slots: torch.Tensor,
         pages: int,
+        target_pages: int,
         activate_target: Callable[[], None],
         activate_draft: Callable[[], None],
         synchronize_tokens: Callable[[torch.Tensor], None],
@@ -429,7 +430,7 @@ class _AdaptiveUnifiedBlockAclGraph(_BlockGraphLifecycle):
         self.draft_width = dspark_adaptive.draft_width
         self.graph_rows = target_binding[0].numel()
         self.pages = pages
-        self.target_kv_bound = max(target_binding[2].kv_seq_lens_host_values)
+        self.target_kv_bound = target_pages * target.attention_backend.page_size
         self.draft_kv_bound = pages * draft.attention_backend.page_size
         self.activate_target = activate_target
         self.activate_draft = activate_draft
@@ -439,7 +440,10 @@ class _AdaptiveUnifiedBlockAclGraph(_BlockGraphLifecycle):
         # Packing writes the final Target table directly. A compact shadow here
         # would either retain stale rows or require another table copy.
         self.target_metadata = _metadata_view(target_binding[2])
-        self.target_metadata.kv_seq_lens_host_values = list(target_binding[2].kv_seq_lens_host_values)
+        self.target_metadata.kv_seq_lens_host_values = [self.target_kv_bound] * self.graph_rows
+        self.target_metadata.prepared_attention_state = self.target_backend.prepare_metadata(
+            self.target_metadata, device_kv_lengths=True
+        )
         self.draft_metadata = _metadata_view(draft_binding[2])
         self.draft_metadata.block_table = torch.empty(
             (draft_binding[2].block_table.shape[0], pages), dtype=torch.int32, device=draft_binding[0].device
@@ -550,7 +554,7 @@ class _AdaptiveUnifiedBlockAclGraph(_BlockGraphLifecycle):
 
 
 class AdaptiveUnifiedBlockGraphRegistry:
-    """Capture finite Slot/B/G bindings at startup; serving only replays them."""
+    """Keep warmed Slot/B/G bindings and lazily capture their compact KV buckets."""
 
     _MAX_SLOTS = 2
 
@@ -572,6 +576,8 @@ class AdaptiveUnifiedBlockGraphRegistry:
         self.stream = torch.npu.Stream(device=target.eager_runner.device)
         self.pool = torch.npu.graph_pool_handle()
         self.variants: dict[tuple[object, ...], _AdaptiveUnifiedBlockAclGraph] = {}
+        self._bindings: set[tuple[object, ...]] = set()
+        self._kv_variants: dict[tuple[object, ...], dict[tuple[int, int], _AdaptiveUnifiedBlockAclGraph]] = {}
         self._slots: dict[int, tuple[TensorDesc, ...]] = {}
         self._capacity = 0
         self._hits = 0
@@ -630,13 +636,42 @@ class AdaptiveUnifiedBlockGraphRegistry:
         )
 
     @staticmethod
+    def _kv_pages(binding: Binding, page_size: int) -> int:
+        metadata = binding[2]
+        bounds = metadata.kv_seq_lens_host_values
+        rows, columns = metadata.block_table.shape
+        if bounds is None or len(bounds) != rows or any(bound <= 0 for bound in bounds):
+            raise ValueError("Adaptive unified DSpark requires positive KV bounds per metadata row")
+        maximum = max(bounds)
+        if maximum > columns * page_size:
+            raise ValueError("Adaptive unified DSpark KV bound exceeds block-table capacity")
+        required = (maximum + page_size - 1) // page_size
+        return min(max(32, 1 << (required - 1).bit_length()), columns)
+
+    def _kv_binding(self, target_binding: Binding, draft_binding: Binding) -> tuple[int, int]:
+        return (
+            self._kv_pages(target_binding, self.target.attention_backend.page_size),
+            self._kv_pages(draft_binding, self.draft.attention_backend.page_size),
+        )
+
+    def _fitting_variant(
+        self, binding: tuple[object, ...], capacities: tuple[int, int]
+    ) -> _AdaptiveUnifiedBlockAclGraph | None:
+        variants = self._kv_variants.get(binding, {})
+        fitting = min(
+            (key for key in variants if key[0] >= capacities[0] and key[1] >= capacities[1]),
+            default=None,
+        )
+        return None if fitting is None else variants[fitting]
+
+    @staticmethod
     def _validate_kv_bounds(
         runner: _AdaptiveUnifiedBlockAclGraph, target_binding: Binding, draft_binding: Binding
     ) -> None:
         if max(target_binding[2].kv_seq_lens_host_values) > runner.target_kv_bound:
-            raise ValueError("Adaptive unified DSpark Target KV bound exceeds its startup binding")
+            raise ValueError("Adaptive unified DSpark Target KV bound exceeds its graph capacity")
         if max(draft_binding[2].kv_seq_lens_host_values) > runner.draft_kv_bound:
-            raise ValueError("Adaptive unified DSpark Draft KV bound exceeds its startup binding")
+            raise ValueError("Adaptive unified DSpark Draft KV bound exceeds its graph capacity")
 
     def warmup(
         self,
@@ -647,9 +682,12 @@ class AdaptiveUnifiedBlockGraphRegistry:
         dspark_adaptive: DSparkAdaptiveGraphInputs,
         context_slots: torch.Tensor,
     ) -> None:
-        key = self._binding(target_binding, draft_binding, tokens, lengths, dspark_adaptive, context_slots)
-        if key in self.variants:
-            self._validate_kv_bounds(self.variants[key], target_binding, draft_binding)
+        binding = self._binding(target_binding, draft_binding, tokens, lengths, dspark_adaptive, context_slots)
+        target_pages, pages = self._kv_binding(target_binding, draft_binding)
+        key = binding + ((target_pages, pages),)
+        existing = self._fitting_variant(binding, (target_pages, pages))
+        if existing is not None:
+            self._validate_kv_bounds(existing, target_binding, draft_binding)
             return
         capacity = dspark_adaptive.anchors.numel()
         maximum = self.target.prepared_graph_runner.max_batch
@@ -662,17 +700,19 @@ class AdaptiveUnifiedBlockGraphRegistry:
             raise ValueError("Adaptive unified DSpark exceeds its native Slot capacity")
         if slot in self._slots and self._slots[slot] != identity:
             raise ValueError("Adaptive unified DSpark Slot storage changed after startup binding")
-        limit = self._MAX_SLOTS * sum(
+        shape_limit = self._MAX_SLOTS * sum(
             len(_verify_buckets(batch, maximum, dspark_adaptive.draft_width)) for batch in range(1, capacity + 1)
         )
+        # Capacities are power-of-two page buckets, including a truncated last
+        # bucket. Retain old variants while their borrowed outputs may be live.
+        kv_limit = (
+            max(target_binding[2].block_table.shape[1], draft_binding[2].block_table.shape[1]).bit_length() + 1
+        ) ** 2
+        limit = shape_limit * kv_limit
         if self._capacity and self._capacity != limit:
             raise ValueError("Adaptive unified DSpark request capacity changed after startup")
         if len(self.variants) >= limit:
             raise ValueError("Adaptive unified DSpark exceeds its finite startup variant capacity")
-        page_size = self.draft.attention_backend.page_size
-        upper = max(draft_binding[2].kv_seq_lens_host_values)
-        required_pages = (upper + page_size - 1) // page_size
-        pages = min(max(32, 1 << (required_pages - 1).bit_length()), draft_binding[2].block_table.shape[1])
         runner = _AdaptiveUnifiedBlockAclGraph(
             self.target,
             self.draft,
@@ -683,6 +723,7 @@ class AdaptiveUnifiedBlockGraphRegistry:
             dspark_adaptive,
             context_slots,
             pages,
+            target_pages,
             self.activate_target,
             self.activate_draft,
             self.synchronize_tokens,
@@ -690,11 +731,21 @@ class AdaptiveUnifiedBlockGraphRegistry:
             self.pool,
         )
         started = perf_counter()
-        self.capture(runner)
+        saved_control = dspark_adaptive.control.clone()
+        saved_slots = draft_binding[2].slot_mapping.clone()
+        dspark_adaptive.control.bitwise_or_(2**32)
+        try:
+            self.capture(runner)
+        finally:
+            torch.npu.current_stream(tokens.device).wait_stream(self.stream)
+            dspark_adaptive.control.copy_(saved_control)
+            draft_binding[2].slot_mapping.copy_(saved_slots)
         self._capture_seconds += perf_counter() - started
         self._slots[slot] = identity
         self._capacity = limit
         self.variants[key] = runner
+        self._kv_variants.setdefault(binding, {})[(target_pages, pages)] = runner
+        self._bindings.add(binding)
         logger.info(
             "Adaptive DSpark whole-round graph captured: B=%d Draft=%d G=%d pages=%d cache=%s",
             tokens.shape[0],
@@ -713,11 +764,15 @@ class AdaptiveUnifiedBlockGraphRegistry:
         dspark_adaptive: DSparkAdaptiveGraphInputs,
         context_slots: torch.Tensor,
     ) -> torch.Tensor:
-        key = self._binding(target_binding, draft_binding, tokens, lengths, dspark_adaptive, context_slots)
-        runner = self.variants.get(key)
+        binding = self._binding(target_binding, draft_binding, tokens, lengths, dspark_adaptive, context_slots)
+        if binding not in self._bindings:
+            raise ValueError("Adaptive unified DSpark binding was not captured during startup warmup")
+        capacities = self._kv_binding(target_binding, draft_binding)
+        runner = self._fitting_variant(binding, capacities)
         if runner is None:
             self._misses += 1
-            raise ValueError("Adaptive unified DSpark binding was not captured during startup warmup")
+            self.warmup(target_binding, draft_binding, tokens, lengths, dspark_adaptive, context_slots)
+            runner = self.variants[binding + (capacities,)]
         self._validate_kv_bounds(runner, target_binding, draft_binding)
         self._hits += 1
         return runner.execute()
@@ -737,4 +792,6 @@ class AdaptiveUnifiedBlockGraphRegistry:
         for runner in self.variants.values():
             runner.close()
         self.variants.clear()
+        self._bindings.clear()
+        self._kv_variants.clear()
         self._slots.clear()

@@ -69,7 +69,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
     Regular warmup Tasks populate the cache before serving admits a bucket.
     Native Slots own bucket selection and padding. Launch looks up the captured
     binding, uses the caller's task stream and returns a borrowed output whose
-    readers must retire before reuse. A missing binding never captures at runtime.
+    readers must retire before reuse. New Slot bindings require warmup; a warmed
+    block binding may acquire larger compact KV variants on serialized Launch.
+    Ordinary device-length decode retains its startup-only capacity tiers.
 
     Block drafts contain one complete equal-width query per request row.
     Native padding must use reserved cache rows with valid device KV lengths;
@@ -92,6 +94,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
         device_kv_lengths: bool = False,
     ) -> None:
         super().__init__(model, attention_backend, device)
+        # Launch serializes captures, but native Prepare can still allocate
+        # another Slot's inputs on its own thread/stream.
+        self._capture_error_mode = "thread_local"
         self.dp_size = dp_size
         self.dp_rank = dp_rank
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
@@ -104,6 +109,8 @@ class PreparedAclGraphRunner(AclGraphRunner):
         self._device_kv_lengths = device_kv_lengths
         self.max_batch = (max_batch + dp_size - 1) // dp_size
         self._prepared_graphs: dict[tuple[object, ...], AclGraphEntry] = {}
+        self._prepared_bindings: set[tuple[object, ...]] = set()
+        self._prepared_kv_graphs: dict[tuple[object, ...], dict[int, AclGraphEntry]] = {}
         self._shared_workspaces: dict[tuple[object, ...], object] = {}
         self.prepared_replays = 0
 
@@ -162,6 +169,67 @@ class PreparedAclGraphRunner(AclGraphRunner):
             else ("adaptive_dspark", dspark_adaptive.block_size, dspark_adaptive.draft_width)
         )
         return addresses + dspark_binding + ((counts, phases) if len(counts) > 1 else ())
+
+    def _kv_page_capacity(
+        self, input_ids: torch.Tensor, metadata: AttentionMetadata, dspark_adaptive: DSparkAdaptiveGraphInputs | None
+    ) -> int:
+        if self._device_kv_lengths:
+            return kv_capacity_bucket(
+                metadata.kv_seq_lens_host_values,
+                self.attention_backend.page_size,
+                metadata.block_table.shape[1],
+            )
+        recurrent = dspark_adaptive is not None and dspark_adaptive.linear_state_indices is not None
+        if not self._block_draft and not recurrent:
+            return 0
+        page_size = self.attention_backend.page_size
+        bounds = metadata.kv_seq_lens_host_values
+        request_count, table_width = metadata.block_table.shape
+        if bounds is None or len(bounds) != request_count or any(bound <= 0 for bound in bounds):
+            raise ValueError("prepared graph requires a positive KV bound per metadata row")
+        query_width = input_ids.numel() // request_count
+        upper = max(bounds)
+        if self.dp_size > 1:
+            global_bounds = getattr(metadata, "dp_global_kv_max_seq_lens", ())
+            if len(global_bounds) != self.dp_size or any(bound < 0 for bound in global_bounds):
+                raise ValueError("prepared block DP graphs require complete global KV bounds")
+            # The scheduler's pending anchor can advance by one whole block.
+            # Every DP rank, including an empty shard, selects from this same
+            # Host upper bound before entering collective capture or replay.
+            if max(global_bounds) > table_width * page_size:
+                raise ValueError("prepared block DP KV bounds exceed block-table capacity")
+            global_upper = min(max(global_bounds) + 2 * query_width, table_width * page_size)
+            if upper > global_upper:
+                raise ValueError("prepared block KV bound exceeds the shared DP upper bound")
+            upper = global_upper
+        if upper > table_width * page_size:
+            raise ValueError("prepared graph KV bounds exceed block-table capacity")
+        required_pages = (upper + page_size - 1) // page_size
+        minimum_pages = 16 + (query_width + page_size - 1) // page_size
+        return min(1 << (max(required_pages, minimum_pages) - 1).bit_length(), table_width)
+
+    def _graph_binding(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
+        mtp_topk_indices: torch.Tensor | None = None,
+        *,
+        dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
+    ) -> tuple[object, ...]:
+        binding = self._prepared_binding(
+            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+        )
+        pages = self._kv_page_capacity(input_ids, metadata, dspark_adaptive)
+        if self._device_kv_lengths:
+            return (*binding, pages)
+        return binding + (("kv_pages", pages),) if pages else binding
+
+    def _fitting_kv_entry(self, binding: tuple[object, ...], pages: int) -> AclGraphEntry | None:
+        variants = self._prepared_kv_graphs.get(binding, {})
+        fitting = min((capacity for capacity in variants if capacity >= pages), default=None)
+        return None if fitting is None else variants[fitting]
 
     def _validate_dspark_graph_inputs(
         self,
@@ -400,19 +468,29 @@ class PreparedAclGraphRunner(AclGraphRunner):
         self._validate_prepared_input(
             input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
         )
-        binding = self._prepared_binding(
+        slot_binding = self._prepared_binding(
             input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
         )
-        capacity_pages = kv_capacity_buckets(metadata.block_table.shape[1]) if self._device_kv_lengths else (0,)
+        capacity_pages = (
+            kv_capacity_buckets(metadata.block_table.shape[1])
+            if self._device_kv_lengths
+            else (self._kv_page_capacity(input_ids, metadata, dspark_adaptive),)
+        )
         previous_count = len(self._prepared_graphs)
         for pages in capacity_pages:
+            binding = slot_binding
+            if self._device_kv_lengths:
+                binding = (*binding, pages)
+            elif pages:
+                binding = binding + (("kv_pages", pages),)
             self._warmup_prepared_entry(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
                 mtp_topk_indices,
-                binding=(*binding, pages) if self._device_kv_lengths else binding,
+                binding=binding,
+                slot_binding=slot_binding,
                 capacity_pages=pages,
                 eplb=eplb,
                 dspark_adaptive=dspark_adaptive,
@@ -438,11 +516,15 @@ class PreparedAclGraphRunner(AclGraphRunner):
         mtp_topk_indices: torch.Tensor | None,
         *,
         binding: tuple[object, ...],
+        slot_binding: tuple[object, ...],
         capacity_pages: int,
         eplb: EplbRuntimeState | None,
         dspark_adaptive: DSparkAdaptiveGraphInputs | None,
     ) -> None:
         if binding in self._prepared_graphs:
+            return
+        pages = capacity_pages
+        if pages and not self._device_kv_lengths and self._fitting_kv_entry(slot_binding, pages) is not None:
             return
         self._initialize_task_updates()
         if dspark_adaptive is not None:
@@ -526,17 +608,10 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if self._block_draft or self._device_kv_lengths or recurrent_verify:
             # Like the legacy DSpark runner, capture at least the startup
             # 16-page context plus the query. Table and mask capacities stay
-            # fixed; recurrent target tasks can refresh conservative Host
-            # scan bounds while Device lengths mask the exact prefix.
+            # fixed within each KV variant; recurrent target tasks refresh
+            # conservative Host bounds while Device lengths mask the prefix.
             page_size = self.attention_backend.page_size
             request_count = metadata.block_table.shape[0]
-            query_width = entry.batch_size // request_count
-            if self._device_kv_lengths:
-                pages = capacity_pages
-            else:
-                required_pages = (max(metadata.kv_seq_lens_host_values) + page_size - 1) // page_size
-                minimum_pages = 16 + (query_width + page_size - 1) // page_size
-                pages = min(1 << (max(required_pages, minimum_pages) - 1).bit_length(), metadata.block_table.shape[1])
             static = entry.static_metadata
             # Multiple narrowed rows are strided. Allocate only this small
             # metadata table at warmup; refresh it inside the captured forward
@@ -564,8 +639,34 @@ class PreparedAclGraphRunner(AclGraphRunner):
             self._fill_mega_moe_token_mask(entry, metadata.raw_dp_execution_token_counts)
         self._prepare_graph_eplb_state(entry, eplb, metadata, first_capture=True)
         self._prepare_attention(entry, entry.static_metadata)
-        self._capture(entry, torch.npu.current_stream(self.device))
+        # Runtime capture runs on serialized Launch, never on native Prepare.
+        # Its eager warmup rounds must not overwrite accepted KV or recurrent
+        # state. Replay observes restored live inputs through the same addresses.
+        saved_slots = metadata.slot_mapping.clone() if self._block_draft else None
+        saved_control = dspark_adaptive.control.clone() if dspark_adaptive is not None else None
+        if saved_slots is not None:
+            metadata.slot_mapping.fill_(-1)
+        if saved_control is not None:
+            dspark_adaptive.control.bitwise_or_(2**32)
+        try:
+            self._capture(entry, torch.npu.current_stream(self.device))
+        finally:
+            if saved_slots is not None:
+                metadata.slot_mapping.copy_(saved_slots)
+            if saved_control is not None:
+                dspark_adaptive.control.copy_(saved_control)
         self._prepared_graphs[binding] = entry
+        self._prepared_bindings.add(slot_binding)
+        if pages:
+            self._prepared_kv_graphs.setdefault(slot_binding, {})[pages] = entry
+        if self._block_draft or recurrent_verify:
+            logger.info(
+                "Python prepared ACL KV bucket captured: model=%s rows=%d pages=%d capacity=%d",
+                type(self.model).__name__,
+                entry.batch_size,
+                pages,
+                pages * page_size,
+            )
 
     def _resolve_entry(
         self,
@@ -576,25 +677,38 @@ class PreparedAclGraphRunner(AclGraphRunner):
         mtp_topk_indices: torch.Tensor | None = None,
         *,
         dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
+        eplb: EplbRuntimeState | None = None,
     ) -> AclGraphEntry:
         self._validate_prepared_input(
             input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
         )
-        binding = self._prepared_binding(
+        slot_binding = self._prepared_binding(
             input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
         )
-        if self._device_kv_lengths:
-            pages = kv_capacity_bucket(
-                metadata.kv_seq_lens_host_values,
-                self.attention_backend.page_size,
-                metadata.block_table.shape[1],
-            )
-            binding = (*binding, pages)
-        entry = self._prepared_graphs.get(binding)
-        if entry is None:
-            # Native admission already selected a captured bucket for every
-            # rank. A missing Slot binding is an error, never a local fallback.
+        if slot_binding not in self._prepared_bindings:
             raise RuntimeError("prepared ACL replay requires a warmed Slot binding")
+        pages = self._kv_page_capacity(input_ids, metadata, dspark_adaptive)
+        binding = slot_binding
+        if self._device_kv_lengths:
+            binding = (*binding, pages)
+        elif pages:
+            binding = binding + (("kv_pages", pages),)
+        entry = self._prepared_graphs.get(binding)
+        if entry is None and pages and not self._device_kv_lengths:
+            entry = self._fitting_kv_entry(slot_binding, pages)
+        if entry is None:
+            if not pages or self._device_kv_lengths:
+                raise RuntimeError("prepared ACL replay requires a warmed Slot binding")
+            self.warmup_prepared(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                mtp_topk_indices,
+                dspark_adaptive=dspark_adaptive,
+                eplb=eplb,
+            )
+            entry = self._prepared_graphs[binding]
         return entry
 
     def _forward_static(self, entry: AclGraphEntry) -> ModelExecutionOutput:
@@ -694,7 +808,13 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if layer_synchronizer is not None:
             raise ValueError("prepared ACL replay does not support layer synchronization")
         entry = self._resolve_entry(
-            input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
+            input_ids,
+            positions,
+            metadata,
+            input_embedding,
+            mtp_topk_indices,
+            dspark_adaptive=dspark_adaptive,
+            eplb=eplb,
         )
         return self._execute_entry(entry, input_ids, metadata, input_embedding, mtp_topk_indices, eplb=eplb)
 
@@ -709,12 +829,10 @@ class PreparedAclGraphRunner(AclGraphRunner):
         *,
         eplb: EplbRuntimeState | None = None,
     ) -> ModelExecutionOutput | None:
-        """Return None only when the query exceeds the captured block capacity."""
+        """Replay the request's compact KV bucket, capturing it once if needed."""
         if layer_synchronizer is not None:
             raise ValueError("prepared ACL replay does not support layer synchronization")
-        entry = self._resolve_entry(input_ids, positions, metadata, input_embedding, mtp_topk_indices)
-        if max(metadata.kv_seq_lens_host_values) > entry.static_metadata.kv_seq_lens_host_values[0]:
-            return None
+        entry = self._resolve_entry(input_ids, positions, metadata, input_embedding, mtp_topk_indices, eplb=eplb)
         return self._execute_entry(entry, input_ids, metadata, input_embedding, mtp_topk_indices, eplb=eplb)
 
     def _execute_entry(
@@ -768,6 +886,6 @@ class PreparedAclGraphRunner(AclGraphRunner):
         return entry.static_output
 
     def can_execute_block(self, input_ids: torch.Tensor, positions: torch.Tensor, metadata: AttentionMetadata) -> bool:
-        """Only declared out-of-capacity queries use eager; missing bindings fail."""
+        """Resolve a warmed Slot's KV graph; invalid inputs never select eager."""
         entry = self._resolve_entry(input_ids, positions, metadata)
         return max(metadata.kv_seq_lens_host_values) <= entry.static_metadata.kv_seq_lens_host_values[0]
