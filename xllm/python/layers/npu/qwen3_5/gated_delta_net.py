@@ -38,6 +38,7 @@ from xllm.python.model_executor.forward_context import get_execution_context
 from xllm.python.model_loader import ParallelLoadContext, ScopedWeightLoader
 
 _MEGA_GDN_MAX_DECODE_BATCH_SIZE = 32
+_MEGA_GDN_MAX_VARLEN_BATCH_SIZE = 128
 _MEGA_GDN_FIXED_RMS_NORM_EPS = 1e-6
 _SUPPORTED_MEGA_PREFILL_HEAD_COUNTS = frozenset((1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64))
 
@@ -204,8 +205,8 @@ class NpuQwen3_5GatedDeltaNet(nn.Module):
         if metadata.cu_seqlens is not None:
             mixed_qkv, a, b, z = (tensor.contiguous() for tensor in self._project_prefill_inputs(hidden))
             output = torch.zeros_like(z)
-            for start in range(0, batch_size, _MEGA_GDN_MAX_DECODE_BATCH_SIZE):
-                end = min(start + _MEGA_GDN_MAX_DECODE_BATCH_SIZE, batch_size)
+            for start in range(0, batch_size, _MEGA_GDN_MAX_VARLEN_BATCH_SIZE):
+                end = min(start + _MEGA_GDN_MAX_VARLEN_BATCH_SIZE, batch_size)
                 indices = metadata.state_indices[start:end]
                 kernels.mega_gdn_mtp_decode_varlen(
                     mixed_qkv,

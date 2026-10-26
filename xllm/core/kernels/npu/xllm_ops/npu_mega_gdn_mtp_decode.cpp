@@ -79,7 +79,7 @@ void npu_mega_gdn_mtp_decode_varlen(const torch::Tensor& qkv,
                                     const torch::Tensor& cu_seqlens,
                                     torch::Tensor& out,
                                     bool fla_ssm_state_layout) {
-  // Different <=32-request chunks write disjoint packed rows of the same
+  // Different request chunks write disjoint packed rows of the same
   // zero-initialized output. Untouched capacity rows must remain zero.
   torch::Tensor conv_out = torch::empty_like(qkv);
   EXEC_NPU_CMD(aclnnMegaGdnMtpDecodeVarlen,

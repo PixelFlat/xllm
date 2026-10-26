@@ -60,11 +60,17 @@ def build_dspark_pack_verify_inputs_kernel(
         owners_handle: T.handle,
         columns_handle: T.handle,
         control_handle: T.handle,
+        state_indices_handle: T.handle,
+        accepted_handle: T.handle,
+        graph_state_indices_handle: T.handle,
+        graph_accepted_handle: T.handle,
+        cu_seqlens_handle: T.handle,
         batch_size: T.int32,
         capacity: T.int32,
         table_columns: T.int32,
         block_size: T.int32,
         copy_cores: T.int32,
+        linear_capacity: T.int32,
     ):
         # Guarded shape expressions avoid duplicate inferred shape parameters;
         # exact dynamic spans still equal the caller-validated tensor storage.
@@ -88,6 +94,17 @@ def build_dspark_pack_verify_inputs_kernel(
         owners = T.match_buffer(owners_handle, (T.Select(capacity > 0, capacity, 0),), "int32")
         columns = T.match_buffer(columns_handle, (T.Select(capacity > 0, capacity, 0),), "int32")
         control = T.match_buffer(control_handle, (1,), "int64")
+        state_indices = T.match_buffer(state_indices_handle, (T.Select(linear_capacity > 0, batch_size, 0),), "int32")
+        accepted = T.match_buffer(accepted_handle, (T.Select(linear_capacity > 0, batch_size, 0),), "int32")
+        graph_state_indices = T.match_buffer(
+            graph_state_indices_handle, (T.Select(linear_capacity > 0, linear_capacity, 0),), "int32"
+        )
+        graph_accepted = T.match_buffer(
+            graph_accepted_handle, (T.Select(linear_capacity > 0, linear_capacity, 0),), "int32"
+        )
+        cu_seqlens = T.match_buffer(
+            cu_seqlens_handle, (T.Select(linear_capacity > 0, linear_capacity + 1, 0),), "int32"
+        )
         with T.Kernel(copy_cores, is_npu=True) as (core, vid), T.Scope("V"):
             if vid == 0:
                 # Kernel IDs are INT64 in this backend. Keep buffer/index
@@ -139,6 +156,31 @@ def build_dspark_pack_verify_inputs_kernel(
                         offsets_ub[row + 1] = total
                 if task == 0:
                     T.copy(offsets_ub, offsets[0 : active_rows + 1])
+                    if linear_capacity > 0:
+                        # Reuse the authoritative prefix scan, without a
+                        # second kernel or Device-to-Host acceptance readback.
+                        state_indices_ub = T.alloc_ub((batch_tile,), "int32")
+                        accepted_ub = T.alloc_ub((batch_tile,), "int32")
+                        endpoints_ub = T.alloc_ub((offset_tile,), "int32")
+                        T.copy(state_indices[0:linear_capacity], state_indices_ub)
+                        T.copy(accepted[0:linear_capacity], accepted_ub)
+                        T.barrier_all()
+                        for row in T.serial(linear_capacity):
+                            if row >= active_rows:
+                                state_indices_ub[row] = 0
+                                accepted_ub[row] = 1
+                            if suppress_kv_writes != 0:
+                                state_indices_ub[row] = 0
+                        for row in T.serial(linear_capacity + 1):
+                            if suppress_kv_writes != 0:
+                                endpoints_ub[row] = 0
+                            elif row <= active_rows:
+                                endpoints_ub[row] = offsets_ub[row]
+                            else:
+                                endpoints_ub[row] = total
+                        T.copy(state_indices_ub, graph_state_indices[0:linear_capacity])
+                        T.copy(accepted_ub, graph_accepted[0:linear_capacity])
+                        T.copy(endpoints_ub, cu_seqlens[0 : linear_capacity + 1])
                 # The wrapper caps the mixed-grid count to the device's actual
                 # AI core count. Persistent groups cover G without oversubscribing
                 # the launch grid or recopying immutable base metadata per group.

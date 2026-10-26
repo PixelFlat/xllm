@@ -87,6 +87,32 @@ void dspark_pack_verify_inputs_graph(const torch::Tensor& anchors,
                                      int64_t block_size,
                                      int64_t draft_width = 7);
 
+// Pack request-scoped GDN state and prefix endpoints in the same launch as
+// the token/page metadata. Capture-only calls suppress recurrent writes too.
+void dspark_pack_recurrent_verify_inputs_graph(
+    const torch::Tensor& anchors,
+    const torch::Tensor& arena,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& base_kv_lengths,
+    const torch::Tensor& base_block_table,
+    const torch::Tensor& control,
+    torch::Tensor& offsets,
+    torch::Tensor& tokens,
+    torch::Tensor& positions,
+    torch::Tensor& kv_seq_lens,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& block_table,
+    torch::Tensor& q_seq_lens,
+    torch::Tensor& owners,
+    torch::Tensor& columns,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& accepted,
+    torch::Tensor& graph_state_indices,
+    torch::Tensor& graph_accepted,
+    torch::Tensor& cu_seqlens,
+    int64_t block_size,
+    int64_t draft_width = 7);
+
 // Exact greedy verification at each request's own cut boundary. Proposals,
 // widths and packed target IDs must already agree across sampling ranks.
 // Results [B,draft_width+1], accepted lengths [B] and context slots [G] are

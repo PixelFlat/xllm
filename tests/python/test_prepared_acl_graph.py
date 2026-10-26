@@ -546,6 +546,42 @@ def test_varlen_verify_does_not_refresh_legacy_token_maps() -> None:
     assert graph.dense_to_packed.tolist() == [-99] * 24
 
 
+def test_recurrent_prepared_forward_fuses_state_refresh_with_input_packing(
+    runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner.max_batch = 8
+    runner.attention_backend.is_mla = False
+    runner.attention_backend.page_size = runner.attention_backend.logical_page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"), table_width=128)
+    inputs = replace(
+        inputs,
+        linear_state_indices=torch.ones(3, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs)
+    entry = next(iter(runner._prepared_graphs.values()))
+    graph = entry.static_metadata.linear_verify_graph
+    fused = Mock()
+    legacy_pack = Mock(side_effect=AssertionError("legacy pack must not run"))
+    legacy_refresh = Mock(side_effect=AssertionError("unfused metadata must not run"))
+    monkeypatch.setattr(torch.ops.xllm_ops, "dspark_allocate_verify_prefixes_graph", Mock())
+    monkeypatch.setattr(torch.ops.xllm_ops, "dspark_pack_recurrent_verify_inputs_graph", fused)
+    monkeypatch.setattr(torch.ops.xllm_ops, "dspark_pack_verify_inputs_graph", legacy_pack)
+    monkeypatch.setattr(runner, "_refresh_linear_verify_graph", legacy_refresh)
+    with patch.object(AclGraphRunner, "_forward_static", return_value=torch.empty(0)):
+        runner._forward_static(entry)
+    fused.assert_called_once()
+    arguments = fused.call_args.args
+    assert arguments[15] is inputs.linear_state_indices
+    assert arguments[16] is inputs.num_accepted_tokens
+    assert arguments[17] is graph.state_indices
+    assert arguments[18] is graph.num_accepted_tokens
+    assert arguments[19] is graph.cu_seqlens
+    legacy_pack.assert_not_called()
+    legacy_refresh.assert_not_called()
+
+
 def test_recurrent_prepared_graph_binds_request_state_and_compact_device_lengths(
     runner: PreparedAclGraphRunner,
 ) -> None:

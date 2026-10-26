@@ -703,6 +703,15 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor(f!) block_table, Tensor(g!) q_seq_lens, Tensor(h!) owners, "
       "Tensor(i!) columns, int block_size, int draft_width=7) -> ()");
   m.def(
+      "dspark_pack_recurrent_verify_inputs_graph(Tensor anchors, Tensor arena, "
+      "Tensor base_positions, Tensor base_kv_lengths, Tensor base_block_table, "
+      "Tensor control, Tensor(a!) offsets, Tensor(b!) tokens, "
+      "Tensor(c!) positions, Tensor(d!) kv_seq_lens, Tensor(e!) slot_mapping, "
+      "Tensor(f!) block_table, Tensor(g!) q_seq_lens, Tensor(h!) owners, "
+      "Tensor(i!) columns, Tensor state_indices, Tensor accepted, "
+      "Tensor(j!) graph_state_indices, Tensor(k!) graph_accepted, "
+      "Tensor(l!) cu_seqlens, int block_size, int draft_width=7) -> ()");
+  m.def(
       "dspark_greedy_verify_commit(Tensor proposals, Tensor target_tokens, "
       "Tensor widths, Tensor offsets, Tensor owners, Tensor columns, "
       "Tensor source_slots, Tensor(a!) result_tokens, "
@@ -1008,6 +1017,9 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl(
       "dspark_pack_verify_inputs_graph",
       TORCH_FN(xllm::kernel::npu::tilelang::dspark_pack_verify_inputs_graph));
+  m.impl("dspark_pack_recurrent_verify_inputs_graph",
+         TORCH_FN(xllm::kernel::npu::tilelang::
+                      dspark_pack_recurrent_verify_inputs_graph));
   m.impl("dspark_greedy_verify_commit",
          TORCH_FN(xllm::kernel::npu::tilelang::dspark_greedy_verify_commit));
   m.impl("mtp_greedy_commit",

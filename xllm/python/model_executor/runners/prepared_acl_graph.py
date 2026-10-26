@@ -604,7 +604,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
             torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(
                 inputs.arena, inputs.control, entry.batch_size, inputs.draft_width
             )
-            torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(
+            pack_inputs = (
                 inputs.anchors,
                 inputs.arena,
                 inputs.base_positions,
@@ -620,14 +620,25 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 metadata.q_seq_lens,
                 inputs.owners,
                 inputs.columns,
-                inputs.block_size,
-                inputs.draft_width,
             )
+            graph = metadata.linear_verify_graph
+            if graph is not None and graph.cu_seqlens is not None:
+                torch.ops.xllm_ops.dspark_pack_recurrent_verify_inputs_graph(
+                    *pack_inputs,
+                    inputs.linear_state_indices,
+                    inputs.num_accepted_tokens,
+                    graph.state_indices,
+                    graph.num_accepted_tokens,
+                    graph.cu_seqlens,
+                    inputs.block_size,
+                    inputs.draft_width,
+                )
+            else:
+                torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(*pack_inputs, inputs.block_size, inputs.draft_width)
+                if graph is not None:
+                    self._refresh_linear_verify_graph(inputs, graph, entry.batch_size)
             if metadata.block_table.data_ptr() != entry.source_block_table.data_ptr():
                 metadata.block_table.copy_(entry.source_block_table[:, : metadata.block_table.shape[1]])
-            graph = metadata.linear_verify_graph
-            if graph is not None:
-                self._refresh_linear_verify_graph(inputs, graph, entry.batch_size)
         if isinstance(entry, _PreparedBlockGraphEntry):
             table = entry.static_metadata.block_table
             if table.data_ptr() != entry.source_block_table.data_ptr():

@@ -399,7 +399,7 @@ def test_gdn_adaptive_packed_padding_does_not_enter_live_prefixes(
     )
 
 
-@pytest.mark.parametrize("batch_size", [2, 32, 33, 64])
+@pytest.mark.parametrize("batch_size", [1, 2, 17, 31, 32, 33, 64, 65, 127, 128])
 def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
     monkeypatch: pytest.MonkeyPatch, batch_size: int
 ) -> None:
@@ -458,7 +458,7 @@ def test_varlen_gdn_verifies_packed_rows_without_dense_padding(
     expected = torch.zeros_like(hidden)
     expected[:token_count] = hidden[:token_count].reshape(batch_size, 2, 128).cumsum(dim=1).reshape(-1, 128)
     torch.testing.assert_close(actual, expected)
-    assert calls == [(start * 2, min(start + 32, batch_size) * 2) for start in range(0, batch_size, 32)]
+    assert calls == [(0, token_count)]
 
 
 @pytest.mark.parametrize("key_heads,value_heads", [(1, 1), (4, 12)], ids=["minimal", "qwen38_tp4"])
@@ -644,7 +644,9 @@ def test_npu_packed_gdn_graph_replays_ragged_prefixes_after_rejection(packed_ker
             torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
-@pytest.mark.parametrize("batch,key_heads,value_heads", [(2, 1, 1), (33, 4, 12), (64, 4, 12)])
+@pytest.mark.parametrize(
+    "batch,key_heads,value_heads", [(2, 1, 1), (17, 4, 12), (33, 4, 12), (64, 4, 12), (65, 4, 12), (128, 4, 12)]
+)
 @torch.inference_mode()
 def test_npu_varlen_rejection_preserves_state_across_reordered_batches(
     batch: int, key_heads: int, value_heads: int

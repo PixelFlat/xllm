@@ -423,9 +423,10 @@ def _check_native_pack(
 @pytest.mark.parametrize("graph_rows", [4, 8])
 @pytest.mark.parametrize("suppress", [False, True])
 @pytest.mark.parametrize("draft_width", [5, 7])
+@pytest.mark.parametrize("recurrent", [False, True])
 @torch.inference_mode()
 def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
-    batch_size: int, graph_rows: int, suppress: bool, draft_width: int
+    batch_size: int, graph_rows: int, suppress: bool, draft_width: int, recurrent: bool
 ) -> None:
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
@@ -449,7 +450,7 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
     offsets = torch.full((capacity + 1,), -99, dtype=torch.int32, device="npu:0")
     outputs = create_verify_buffers(graph_rows, table_width, "npu:0")
     torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(arena, control, graph_rows, draft_width)
-    torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(
+    pack_inputs = (
         inputs["anchors"],
         arena,
         inputs["base_positions"],
@@ -465,9 +466,18 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
         outputs.q_seq_lens,
         outputs.owners,
         outputs.columns,
-        16,
-        draft_width,
     )
+    if recurrent:
+        states = torch.tensor([11, 3, 19], dtype=torch.int32, device="npu:0")
+        accepted = torch.tensor([2, draft_width + 1, 1], dtype=torch.int32, device="npu:0")
+        graph_states = torch.full_like(states, -99)
+        graph_accepted = torch.full_like(accepted, -99)
+        endpoints = torch.full_like(offsets, -99)
+        torch.ops.xllm_ops.dspark_pack_recurrent_verify_inputs_graph(
+            *pack_inputs, states, accepted, graph_states, graph_accepted, endpoints, 16, draft_width
+        )
+    else:
+        torch.ops.xllm_ops.dspark_pack_verify_inputs_graph(*pack_inputs, 16, draft_width)
     budget = min(draft_width * batch_size, graph_rows - batch_size)
     widths, reference_offsets = _allocation(confidence, budget)
     arena_actual = arena.cpu()
@@ -477,6 +487,16 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
     arena_host[width_offset : width_offset + 4 * batch_size].copy_(widths.view(torch.uint8).flatten())
     torch.testing.assert_close(arena_actual, arena_host, rtol=0, atol=0)
     torch.testing.assert_close(offsets[: batch_size + 1].cpu(), reference_offsets)
+    if recurrent:
+        assert graph_states.cpu().tolist() == (
+            [0] * capacity if suppress else [11, 3, 19][:batch_size] + [0] * (capacity - batch_size)
+        )
+        assert graph_accepted.cpu().tolist() == [2, draft_width + 1, 1][:batch_size] + [1] * (capacity - batch_size)
+        assert endpoints.cpu().tolist() == (
+            [0] * (capacity + 1)
+            if suppress
+            else reference_offsets.tolist() + [int(reference_offsets[-1])] * (capacity - batch_size)
+        )
     reference = create_verify_buffers(graph_rows, table_width, "cpu")
     pack_verify_inputs(
         **{name: tensor.cpu()[:batch_size].contiguous() for name, tensor in inputs.items()},
@@ -490,6 +510,91 @@ def test_native_dspark_graph_ops_use_live_compact_arena_and_full_table(
         reference.slot_mapping.fill_(-1)
     for actual, expected in zip(_output_tensors(outputs), _output_tensors(reference)):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("capacity,graph_rows", [(3, 2), (33, 64), (64, 256), (128, 512)])
+@torch.inference_mode()
+def test_recurrent_pack_graph_replays_request_growth_shrink_and_suppression(capacity: int, graph_rows: int) -> None:
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    device = torch.device("npu:0")
+    width, table_width = 7, 3
+    request_capacity = min(capacity, graph_rows)
+    inputs = _native_inputs(capacity, device, table_width, width)
+    arena = torch.zeros(88 * capacity, dtype=torch.uint8, device=device)
+    control = torch.zeros(1, dtype=torch.int64, device=device)
+    offsets = torch.empty(capacity + 1, dtype=torch.int32, device=device)
+    outputs = create_verify_buffers(graph_rows, table_width, device)
+    states = torch.arange(capacity, 0, -1, dtype=torch.int32, device=device)
+    accepted = torch.arange(capacity, dtype=torch.int32, device=device) % 8 + 1
+    graph_states = torch.empty(request_capacity, dtype=torch.int32, device=device)
+    graph_accepted = torch.empty_like(graph_states)
+    endpoints = torch.empty(request_capacity + 1, dtype=torch.int32, device=device)
+
+    def operation() -> None:
+        torch.ops.xllm_ops.dspark_allocate_verify_prefixes_graph(arena, control, graph_rows, width)
+        torch.ops.xllm_ops.dspark_pack_recurrent_verify_inputs_graph(
+            inputs["anchors"],
+            arena,
+            inputs["base_positions"],
+            inputs["base_kv_lengths"],
+            inputs["base_block_table"],
+            control,
+            offsets,
+            outputs.tokens,
+            outputs.positions,
+            outputs.kv_seq_lens,
+            outputs.slot_mapping,
+            outputs.block_table,
+            outputs.q_seq_lens,
+            outputs.owners,
+            outputs.columns,
+            states,
+            accepted,
+            graph_states,
+            graph_accepted,
+            endpoints,
+            16,
+            width,
+        )
+
+    stream = torch.npu.Stream(device=device)
+    stream.wait_stream(torch.npu.current_stream(device))
+    with torch.npu.stream(stream):
+        operation()
+        operation()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream):
+            operation()
+    torch.npu.current_stream(device).wait_stream(stream)
+    torch.npu.synchronize()
+    pointers = tuple(tensor.data_ptr() for tensor in (graph_states, graph_accepted, endpoints))
+    for live, suppress in ((request_capacity, False), (1, False), (0, False), (request_capacity, True), (2, False)):
+        live = min(live, request_capacity)
+        confidence = torch.full((live, width), 0.7)
+        proposals = inputs["proposals"].cpu()[:live].contiguous()
+        packed_arena = torch.full((88 * capacity,), 199, dtype=torch.uint8)
+        packed_arena[: live * width * 8].copy_(proposals.view(torch.uint8).flatten())
+        packed_arena[live * width * 8 : live * width * 12].copy_(confidence.view(torch.uint8).flatten())
+        arena.copy_(packed_arena)
+        control.fill_(live | (int(suppress) << 32))
+        graph_states.fill_(-99)
+        graph_accepted.fill_(-99)
+        endpoints.fill_(-99)
+        graph.replay()
+        torch.npu.synchronize()
+        _, expected_offsets = _allocation(confidence, min(live * width, graph_rows - live))
+        assert graph_states.cpu().tolist() == (
+            [0] * request_capacity if suppress else states.cpu().tolist()[:live] + [0] * (request_capacity - live)
+        )
+        assert graph_accepted.cpu().tolist() == accepted.cpu().tolist()[:live] + [1] * (request_capacity - live)
+        assert endpoints.cpu().tolist() == (
+            [0] * (request_capacity + 1)
+            if suppress
+            else expected_offsets.tolist() + [int(expected_offsets[-1])] * (request_capacity - live)
+        )
+        assert pointers == tuple(tensor.data_ptr() for tensor in (graph_states, graph_accepted, endpoints))
 
 
 @pytest.mark.parametrize("batch_size", [0, 1, 2, 3, 8, 16, 32, 64, 128])
