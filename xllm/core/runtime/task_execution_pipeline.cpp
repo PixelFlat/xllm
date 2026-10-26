@@ -257,28 +257,44 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
   if (recurrent) {
     const size_t rows = host.q_seq_lens.size();
     const auto& ops = params.linear_state_cache_ops;
-    if (!speculative || linear_ids.size() != rows ||
-        std::any_of(
-            linear_ids.begin(),
-            linear_ids.end(),
-            [&](int32_t id) { return id < (meta.is_graph_warmup ? 0 : 1); }) ||
-        (linear_indices.defined() &&
-         (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
-          linear_indices.numel() != static_cast<int64_t>(rows) ||
-          !std::equal(linear_ids.begin(),
+    constexpr const char* kInvalidState =
+        "Recurrent task requires aligned CPU request state.";
+    if (!speculative || linear_ids.size() != rows) {
+      return invalid(kInvalidState);
+    }
+    const int32_t min_state_id = meta.is_graph_warmup ? 0 : 1;
+    if (std::any_of(linear_ids.begin(),
+                    linear_ids.end(),
+                    [min_state_id](int32_t id) { return id < min_state_id; })) {
+      return invalid(kInvalidState);
+    }
+    if (linear_indices.defined()) {
+      if (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
+          linear_indices.numel() != static_cast<int64_t>(rows)) {
+        return invalid(kInvalidState);
+      }
+      if (!std::equal(linear_ids.begin(),
                       linear_ids.end(),
-                      int_span(linear_indices).begin()))) ||
-        (!ops.empty() &&
-         (ops.size() != rows ||
-          !std::equal(ops.begin(),
+                      int_span(linear_indices).begin())) {
+        return invalid(kInvalidState);
+      }
+    }
+    if (!ops.empty()) {
+      if (ops.size() != rows) {
+        return invalid(kInvalidState);
+      }
+      if (!std::equal(ops.begin(),
                       ops.end(),
                       linear_ids.begin(),
                       [](const LinearStateCacheOp& op, int32_t id) {
                         return op.linear_state_id == id;
-                      }))) ||
-        (!params.linear_state_validity_mask.empty() &&
-         params.linear_state_validity_mask.size() != rows)) {
-      return invalid("Recurrent task requires aligned CPU request state.");
+                      })) {
+        return invalid(kInvalidState);
+      }
+    }
+    if (!params.linear_state_validity_mask.empty() &&
+        params.linear_state_validity_mask.size() != rows) {
+      return invalid(kInvalidState);
     }
     if (meta.batch_forward_type.is_decode() &&
         std::any_of(ops.begin(), ops.end(), [](const LinearStateCacheOp& op) {
@@ -287,21 +303,26 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
       return invalid(
           "Recurrent Decode cannot directly read a Prefill checkpoint.");
     }
-  } else if (!capacity.model.enable_linear_attention &&
-             ((!linear_ids.empty() &&
-               (linear_ids.size() != host.q_seq_lens.size() ||
-                !std::all_of(
-                    linear_ids.begin(), linear_ids.end(), inactive))) ||
-              (linear_indices.defined() &&
-               (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
-                linear_indices.numel() !=
-                    static_cast<int64_t>(host.q_seq_lens.size()) ||
-                !std::all_of(int_span(linear_indices).begin(),
-                             int_span(linear_indices).end(),
-                             inactive))))) {
-    return Status(
-        StatusCode::INVALID_ARGUMENT,
-        "Task pipeline does not support active linear-attention state.");
+  } else if (!capacity.model.enable_linear_attention) {
+    constexpr const char* kInvalidState =
+        "Task pipeline does not support active linear-attention state.";
+    if (!linear_ids.empty()) {
+      if (linear_ids.size() != host.q_seq_lens.size() ||
+          !std::all_of(linear_ids.begin(), linear_ids.end(), inactive)) {
+        return invalid(kInvalidState);
+      }
+    }
+    if (linear_indices.defined()) {
+      if (!is_cpu_int_tensor(linear_indices, /*dimensions=*/1) ||
+          linear_indices.numel() !=
+              static_cast<int64_t>(host.q_seq_lens.size())) {
+        return invalid(kInvalidState);
+      }
+      const auto indices = int_span(linear_indices);
+      if (!std::all_of(indices.begin(), indices.end(), inactive)) {
+        return invalid(kInvalidState);
+      }
+    }
   }
   const auto& tokens = source.host_token_ids();
   if (!source.transfer_kv_infos.empty() &&

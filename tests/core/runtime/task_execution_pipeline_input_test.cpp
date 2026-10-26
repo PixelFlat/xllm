@@ -192,6 +192,69 @@ TEST_F(TaskExecutionPipelineInputTest,
 }
 
 TEST_F(TaskExecutionPipelineInputTest,
+       RecurrentAdmissionRejectsMalformedIndicesBeforeReadingValues) {
+  auto source = ordinary_input();
+  auto& embedding = source.input_params.embedding;
+  embedding.linear_state_ids = {1};
+  ASSERT_TRUE(validate_input(source, {}, /*recurrent=*/true).ok());
+  for (const auto& indices : {torch::tensor({1}, torch::kFloat32),
+                              torch::tensor({{1}}, torch::kInt32),
+                              torch::empty({0}, torch::kInt32),
+                              torch::tensor({1, 2}, torch::kInt32)}) {
+    SCOPED_TRACE(indices);
+    embedding.linear_state_indices = indices;
+    const Status status = validate_input(source, {}, /*recurrent=*/true);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.message(),
+              "Recurrent task requires aligned CPU request state.");
+  }
+  embedding.linear_state_indices = torch::tensor({1}, torch::kInt32);
+  EXPECT_TRUE(validate_input(source, {}, /*recurrent=*/true).ok());
+}
+
+TEST_F(TaskExecutionPipelineInputTest,
+       RecurrentAdmissionRejectsMisalignedStateRows) {
+  auto source = ordinary_input();
+  auto& params = source.input_params;
+  params.embedding.linear_state_ids = {1, 2};
+  EXPECT_FALSE(validate_input(source, {}, /*recurrent=*/true).ok());
+  params.embedding.linear_state_ids = {1};
+  LinearStateCacheOp op;
+  op.linear_state_id = 1;
+  params.linear_state_cache_ops = {op, op};
+  const Status status = validate_input(source, {}, /*recurrent=*/true);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.message(),
+            "Recurrent task requires aligned CPU request state.");
+  params.linear_state_cache_ops = {op};
+  EXPECT_TRUE(validate_input(source, {}, /*recurrent=*/true).ok());
+}
+
+TEST_F(TaskExecutionPipelineInputTest,
+       OrdinaryAdmissionRejectsMalformedInactiveIndicesBeforeReadingValues) {
+  auto source = ordinary_input();
+  auto& embedding = source.input_params.embedding;
+  embedding.linear_state_ids = {-1};
+  for (const auto& indices : {torch::tensor({-1}, torch::kFloat32),
+                              torch::tensor({{-1}}, torch::kInt32),
+                              torch::empty({0}, torch::kInt32),
+                              torch::tensor({-1, -1}, torch::kInt32),
+                              torch::tensor({1}, torch::kInt32),
+                              torch::tensor({-2}, torch::kInt32)}) {
+    SCOPED_TRACE(indices);
+    embedding.linear_state_indices = indices;
+    const Status status = validate_input(source);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.message(),
+              "Task pipeline does not support active linear-attention state.");
+  }
+  embedding.linear_state_indices = torch::tensor({-1}, torch::kInt32);
+  EXPECT_TRUE(validate_input(source).ok());
+  embedding.linear_state_ids.clear();
+  EXPECT_TRUE(validate_input(source).ok());
+}
+
+TEST_F(TaskExecutionPipelineInputTest,
        RecurrentDecodeRejectsDirectPrefillCheckpointReads) {
   auto source = ordinary_input(1, BatchForwardType::DECODE);
   auto& params = source.input_params;
