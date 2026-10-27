@@ -210,9 +210,6 @@ bool adaptive_target_sampling(const SamplingParameters& sampling) {
   if (sampling.logprobs || sampling.max_top_logprobs != 0 ||
       sampling.use_beam_search || sampling.is_embeddings ||
       sampling.num_return_sequences != 0 || sampling.acc_logprob.defined() ||
-      sampling.min_token_positions.defined() ||
-      sampling.min_tokens_remaining.defined() ||
-      sampling.min_token_ids.defined() ||
       (sampling.filter_mask.defined() && sampling.filter_mask.numel() != 0) ||
       (sampling.filter_bitmask.defined() &&
        sampling.filter_bitmask.numel() != 0) ||
@@ -924,6 +921,11 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     return invalid(
         "Adaptive DSpark unified graphs require greedy target sampling; "
         "disable unified graphs for positive or mixed temperatures.");
+  }
+  if (adaptive_verify_ && speculative_capacity_->unified_graph &&
+      input.sampling_params.min_token_ids.defined()) {
+    return invalid(
+        "Adaptive minimum-length sampling requires split target/draft graphs.");
   }
 
   const auto& c = speculative_capacity_->common;
@@ -2579,10 +2581,6 @@ Status TaskExecutionPipeline::prepare_speculative(
                                       ? slot.validate_input->tokens().numel()
                                       : slot.rows * width);
     }
-    // Refresh before the by-value snapshot: min_tokens_remaining must
-    // reflect the device-side positions after the last accepted block, not
-    // the batch-build-time estimate.
-    slot.target_prefill->refresh_min_tokens();
     const auto& base = slot.target_prefill->sampling_params();
     for (uint32_t step = 0; step < draft_calls(slot); ++step) {
       auto& invocation = *slot.drafts[step];
@@ -3085,6 +3083,9 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
     context_gather(*slot.state);
     apply_bootstrap(slot);
   }
+  // The Slot may never have run Prefill. Read the published request position,
+  // after its producing Task, rather than stale or unbound prefill positions.
+  slot.target_prefill->refresh_min_tokens(slot.state->state_.positions);
   if (slot.verify && block_draft()) {
     launch_packed_verify(slot);
     return;
@@ -3502,14 +3503,15 @@ void TaskExecutionPipeline::launch_packed_verify(SpeculativeSlot& slot) {
     return;
   }
   const auto& sampling = slot.target_prefill->sampling_params();
-  if (sampling.sampling_mode == SamplingMode::GREEDY) {
+  if (sampling.sampling_mode == SamplingMode::GREEDY &&
+      !sampling.min_token_ids.defined()) {
     torch::argmax_out(slot.target_tokens,
                       slot.target_logits,
                       /*dim=*/-1,
                       /*keepdim=*/false);
   } else {
     slot.target_tokens.copy_(spec_verify::rejection_sample_ragged(
-        slot.target_logits, sampling, adaptive.owners));
+        slot.target_logits, sampling, adaptive.owners, adaptive.columns));
   }
   // A sampled target must agree across TP ranks before prefix acceptance and
   // context-KV writes, not merely synchronize the final returned tokens.

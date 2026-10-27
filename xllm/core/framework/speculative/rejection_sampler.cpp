@@ -114,8 +114,17 @@ SampleOutput rejection_sample(const SamplingParameters& params,
         expand_batch_to_tokens(params.logits_bias, num_val_tokens));
   }
   if (params.min_token_ids.defined()) {
-    apply_min_token_block(
-        grouped_logits, params.min_token_ids, params.min_tokens_remaining);
+    CHECK(params.min_tokens_remaining.defined());
+    CHECK_EQ(params.min_tokens_remaining.numel(), batch_size);
+    // The verifier owns candidate/bonus offsets. Expand compact controls,
+    // not logits, before calling the ordinary row-wise processor.
+    const torch::Tensor columns =
+        torch::arange(num_val_tokens, params.min_tokens_remaining.options());
+    const torch::Tensor remaining =
+        (params.min_tokens_remaining.unsqueeze(1) - columns).reshape({-1});
+    const torch::Tensor ids =
+        params.min_token_ids.repeat_interleave(num_val_tokens, /*dim=*/0);
+    apply_min_token_block(target_logits, ids, remaining);
   }
   if (params.repetition_penalties.defined()) {
     apply_repetition_penalties(

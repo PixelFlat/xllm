@@ -1264,6 +1264,14 @@ void SlotBuffer::refresh_min_tokens() {
   }
   const auto selected_positions = positions().index_select(
       /*dim=*/0, params.selected_token_idxes.to(torch::kInt64));
+  refresh_min_tokens(selected_positions);
+}
+
+void SlotBuffer::refresh_min_tokens(const torch::Tensor& selected_positions) {
+  auto& params = sampling_params_;
+  if (!params.min_token_positions.defined()) {
+    return;
+  }
   torch::sub_out(params.min_tokens_remaining,
                  params.min_token_positions,
                  selected_positions);

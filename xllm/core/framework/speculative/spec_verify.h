@@ -73,12 +73,14 @@ SampleOutput run_rejection_sampling(SamplingParameters sampling_params,
 // Packed verification for a deterministic (point-mass) draft: sample each
 // target row, then let the caller commit the prefix matching its proposals.
 // owners maps packed rows to requests; -1 padding borrows request zero's
-// parameters and must never be committed. Penalties, constraints, seeded
-// sampling and logprobs are not supported.
+// parameters and must never be committed. Minimum-length controls additionally
+// require columns: each packed row's prediction offset within its request.
+// Penalties, other constraints, seeded sampling and logprobs are unsupported.
 torch::Tensor rejection_sample_ragged(
     torch::Tensor& target_logits,
     const SamplingParameters& request_sampling,
-    const torch::Tensor& owners);
+    const torch::Tensor& owners,
+    const torch::Tensor& columns = {});
 
 }  // namespace spec_verify
 

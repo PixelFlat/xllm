@@ -109,5 +109,15 @@ TEST(LogitsProcessorTest, RepetitionPenaltyPreservesBlockedTokens) {
   EXPECT_EQ(logits[0][2].item<float>(), -4.0F);
 }
 
+TEST(LogitsProcessorTest, MinimumLengthPreservesPaddingAndDisabledRequests) {
+  auto logits = torch::tensor({{4.0F, 3.0F, 2.0F}, {4.0F, 3.0F, 2.0F}});
+  apply_min_token_block(logits,
+                        torch::tensor({{0, -1}, {1, -1}}, torch::kLong),
+                        torch::tensor({1, 0}, torch::kLong));
+  EXPECT_EQ(logits[0][0].item<float>(), -INFINITY);
+  EXPECT_EQ(logits[0][1].item<float>(), 3.0F);
+  EXPECT_TRUE(torch::equal(logits[1], torch::tensor({4.0F, 3.0F, 2.0F})));
+}
+
 }  // namespace
 }  // namespace xllm

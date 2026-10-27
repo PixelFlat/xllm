@@ -4480,6 +4480,83 @@ TEST_P(RecurrentBlockPipelineTest,
   pipeline_.reset();
 }
 
+TEST_P(RecurrentBlockPipelineTest,
+       MinimumLengthFollowsPublishedRequestPositions) {
+  const bool adaptive = std::get<0>(GetParam());
+  const uint32_t draft_width = std::get<1>(GetParam());
+  if (adaptive) {
+    configure_adaptive_dspark(/*profiled=*/false, draft_width);
+  } else {
+    configure_dspark_batch_graphs();
+    capacity_.num_speculative_tokens = draft_width;
+  }
+  if (std::get<2>(GetParam())) {
+    capacity_.kind = SpeculativeTaskKind::DFLASH2;
+    capacity_.selector_top_k = 1;
+  }
+  capacity_.common.enable_mla = false;
+  capacity_.sparse_dsa_target = false;
+  capacity_.hybrid_recurrent_target = true;
+  target_cache_.emplace_back(LinearAttentionKVCacheTensors{
+      torch::zeros({5, 10, 1}, target_->options()),
+      torch::zeros({40, 1, 1, 1}, target_->options())});
+  TaskModel target{*target_, *target_executor_, target_cache_};
+  target.restore_request_state = [](const ModelParamsView&) {};
+  ASSERT_TRUE(TaskExecutionPipeline::create(
+                  state_thread_,
+                  std::move(target),
+                  TaskModel{*draft_, *draft_executor_, draft_cache_},
+                  capacity_,
+                  pipeline_)
+                  .ok());
+  const auto request = [&](bool decode, bool minimum) {
+    auto value = dspark_batch_input(3, decode, /*placeholder=*/decode);
+    for (int32_t row = 0; row < 3; ++row) {
+      LinearStateCacheOp op;
+      op.linear_state_id = row + 1;
+      op.reset_requested = !decode;
+      value.input_params.embedding.linear_state_ids.emplace_back(row + 1);
+      value.input_params.linear_state_cache_ops.emplace_back(op);
+    }
+    if (minimum) {
+      value.sampling_params.min_token_positions =
+          torch::tensor({3, 3, 20}, torch::kLong);
+      // Deliberately stale host estimates: ordered device context is the
+      // authority after accepted tokens are published by an earlier Slot.
+      value.sampling_params.min_tokens_remaining =
+          torch::tensor({100, 100, 100}, torch::kLong);
+      value.sampling_params.min_token_ids =
+          torch::tensor({{4, -1}, {7, -1}, {8, -1}}, torch::kLong);
+    }
+    return value;
+  };
+  execute(request(/*decode=*/false, /*minimum=*/false));
+  auto warmup = request(/*decode=*/true, /*minimum=*/false);
+  warmup.input_params.meta.is_graph_warmup = true;
+  execute(warmup);
+  execute(request(/*decode=*/false, /*minimum=*/true));
+  const auto first =
+      pipeline_->submit(request(/*decode=*/true, /*minimum=*/true));
+  const auto second =
+      pipeline_->submit(request(/*decode=*/true, /*minimum=*/true));
+  ASSERT_TRUE(first.status.ok()) << first.status.message();
+  ASSERT_TRUE(second.status.ok()) << second.status.message();
+  const auto first_result = pipeline_->take_result_async(first.task_id).get();
+  const auto second_result = pipeline_->take_result_async(second.task_id).get();
+  ASSERT_TRUE(first_result.status.ok()) << first_result.status.message();
+  ASSERT_TRUE(second_result.status.ok()) << second_result.status.message();
+  const auto first_tokens = first_result.output.sample_output.next_tokens.cpu();
+  EXPECT_EQ(first_tokens[0][0].item<int64_t>(), 0);
+  EXPECT_EQ(first_tokens[1][0].item<int64_t>(), 6);
+  EXPECT_EQ(first_tokens[1][1].item<int64_t>(), 7);
+  EXPECT_EQ(first_tokens[2][0].item<int64_t>(), 0);
+  const auto second_tokens =
+      second_result.output.sample_output.next_tokens.cpu();
+  EXPECT_EQ(second_tokens[0][0].item<int64_t>(), 1);
+  EXPECT_EQ(second_tokens[1][0].item<int64_t>(), 6 + draft_width + 1);
+  EXPECT_EQ(second_tokens[2][0].item<int64_t>(), 1);
+}
+
 INSTANTIATE_TEST_SUITE_P(FixedAndAdaptive,
                          RecurrentBlockPipelineTest,
                          ::testing::Values(std::make_tuple(false, 5U, false),

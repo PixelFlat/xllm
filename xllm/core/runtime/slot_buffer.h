@@ -150,6 +150,8 @@ class SlotBuffer final {
   void patch_previous_tokens(const torch::Tensor& previous_tokens);
   // Run on the ordered task stream after device positions are patched.
   void refresh_min_tokens();
+  // Speculative decode binds sampling to request context, not a prefill input.
+  void refresh_min_tokens(const torch::Tensor& selected_positions);
 
   const torch::Tensor& tokens() const { return tokens_; }
   const torch::Tensor& positions() const { return positions_; }

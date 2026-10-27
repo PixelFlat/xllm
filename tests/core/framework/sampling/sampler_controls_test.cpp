@@ -209,6 +209,116 @@ TEST(RaggedRejectionSamplerTest, IgnoresNonfiniteUncommittedPaddingLogits) {
   EXPECT_TRUE(logits[1].eq(0).all().item<bool>());
 }
 
+TEST(RaggedRejectionSamplerTest, MinimumLengthUsesOwnersAndCandidateOffsets) {
+  const auto owners = torch::tensor({1, 0, 1, 0, -1}, torch::kInt);
+  const auto columns = torch::tensor({0, 0, 2, 1, -1}, torch::kInt);
+  for (const auto mode :
+       {SamplingMode::GREEDY, SamplingMode::RANDOM, SamplingMode::MIXED}) {
+    auto requests = testutil::make_sampling_params(2, mode);
+    requests.min_token_positions = torch::tensor({8, 9}, torch::kLong);
+    requests.min_tokens_remaining = torch::tensor({1, 2}, torch::kLong);
+    requests.min_token_ids = torch::tensor({{0, -1}, {0, -1}}, torch::kLong);
+    if (mode != SamplingMode::GREEDY) {
+      requests.top_k = torch::ones({2}, torch::kLong);
+    }
+    if (mode == SamplingMode::MIXED) {
+      requests.do_sample = torch::tensor({false, true}, torch::kBool);
+    }
+    auto logits = torch::tensor({{10.0F, 5.0F, 0.0F}}).repeat({5, 1});
+    const auto sampled =
+        spec_verify::rejection_sample_ragged(logits, requests, owners, columns);
+    EXPECT_TRUE(torch::equal(sampled.narrow(0, 0, 4),
+                             torch::tensor({1, 1, 0, 0}, torch::kLong)));
+    EXPECT_TRUE(logits[4].eq(0).all().item<bool>());
+    EXPECT_TRUE(torch::equal(requests.min_tokens_remaining,
+                             torch::tensor({1, 2}, torch::kLong)));
+  }
+}
+
+TEST(RejectionSamplerControlsTest,
+     MinimumLengthMatchesRaggedOffsetsIncludingBonus) {
+  const auto expected = torch::tensor({{0, 0, 0, 0},
+                                       {1, 0, 0, 0},
+                                       {1, 1, 0, 0},
+                                       {1, 1, 1, 2},
+                                       {1, 1, 1, 1},
+                                       {1, 1, 1, 1},
+                                       {0, 0, 0, 0}},
+                                      torch::kLong);
+  const auto remaining = torch::tensor({0, 1, 2, 3, 4, 5, 5}, torch::kLong);
+  const auto stop_ids = torch::tensor(
+      {{0, -1}, {0, -1}, {0, -1}, {0, 2}, {0, 2}, {0, 2}, {-1, -1}},
+      torch::kLong);
+  const auto owners = torch::arange(7, torch::kInt).repeat_interleave(4);
+  const auto columns = torch::arange(4, torch::kInt).repeat({7});
+  for (const auto mode :
+       {SamplingMode::GREEDY, SamplingMode::RANDOM, SamplingMode::MIXED}) {
+    auto params = testutil::make_sampling_params(7, mode);
+    params.min_token_positions = torch::full({7}, 100, torch::kLong);
+    params.min_tokens_remaining = remaining.clone();
+    params.min_token_ids = stop_ids.clone();
+    if (mode != SamplingMode::GREEDY) {
+      params.top_k = torch::ones({7}, torch::kLong);
+    }
+    if (mode == SamplingMode::MIXED) {
+      params.do_sample = torch::tensor(
+          {false, true, false, true, false, true, false}, torch::kBool);
+    }
+    auto logits = torch::tensor({{10.0F, 5.0F, 0.0F}}).repeat({28, 1});
+    logits.view({7, 4, 3}).narrow(0, 3, 3).select(2, 2).fill_(20);
+    auto ragged_logits = logits.clone();
+    const auto fixed = rejection_sample(
+        params, DraftProposal(expected.narrow(1, 0, 3).clone()), logits);
+    const auto ragged = spec_verify::rejection_sample_ragged(
+        ragged_logits, params, owners, columns);
+    EXPECT_TRUE(torch::equal(fixed.next_tokens, expected));
+    EXPECT_TRUE(torch::equal(ragged.view({7, 4}), expected));
+    EXPECT_TRUE(torch::equal(params.min_tokens_remaining, remaining));
+    EXPECT_TRUE(torch::equal(params.min_token_ids, stop_ids));
+  }
+}
+
+TEST(RejectionSamplerControlsTest, MinimumLengthRejectsEarlyDraftEos) {
+  for (const auto mode :
+       {SamplingMode::GREEDY, SamplingMode::RANDOM, SamplingMode::MIXED}) {
+    auto params = testutil::make_sampling_params(2, mode);
+    params.min_tokens_remaining = torch::tensor({1, 0}, torch::kLong);
+    params.min_token_ids = torch::tensor({{0, -1}, {0, -1}}, torch::kLong);
+    if (mode != SamplingMode::GREEDY) {
+      params.top_k = torch::ones({2}, torch::kLong);
+    }
+    if (mode == SamplingMode::MIXED) {
+      params.do_sample = torch::tensor({false, true}, torch::kBool);
+    }
+    auto logits = torch::tensor({{10.0F, 5.0F, 0.0F}}).repeat({6, 1});
+    const auto result = rejection_sample(
+        params, DraftProposal(torch::zeros({2, 2}, torch::kLong)), logits);
+    EXPECT_TRUE(
+        torch::equal(result.next_tokens,
+                     torch::tensor({{1, -1, -1}, {0, 0, 0}}, torch::kLong)));
+  }
+}
+
+TEST(RejectionSamplerControlsTest, MinimumLengthWithoutDraftsUsesBonusRow) {
+  for (const auto mode :
+       {SamplingMode::GREEDY, SamplingMode::RANDOM, SamplingMode::MIXED}) {
+    auto params = testutil::make_sampling_params(2, mode);
+    params.min_tokens_remaining = torch::tensor({1, 0}, torch::kLong);
+    params.min_token_ids = torch::tensor({{0, -1}, {0, -1}}, torch::kLong);
+    if (mode != SamplingMode::GREEDY) {
+      params.top_k = torch::ones({2}, torch::kLong);
+    }
+    if (mode == SamplingMode::MIXED) {
+      params.do_sample = torch::tensor({false, true}, torch::kBool);
+    }
+    auto logits = torch::tensor({{10.0F, 5.0F, 0.0F}}).repeat({2, 1});
+    const auto result = rejection_sample(
+        params, DraftProposal(torch::empty({2, 0}, torch::kLong)), logits);
+    EXPECT_TRUE(torch::equal(result.next_tokens,
+                             torch::tensor({{1}, {0}}, torch::kLong)));
+  }
+}
+
 TEST(RaggedRejectionSamplerTest, ClippingPreservesTwoTokenJointDistribution) {
   torch::manual_seed(1059);
   constexpr int64_t kTrials = 6000;
