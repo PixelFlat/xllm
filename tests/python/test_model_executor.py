@@ -2082,12 +2082,16 @@ class _PreparedStubAttentionBackend(StubAttentionBackend):
 
 @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_text"])
 @pytest.mark.parametrize("adaptive", [False, True])
-def test_recurrent_dspark_uses_prepared_graph_without_requiring_clipping(model_type: str, adaptive: bool) -> None:
+@pytest.mark.parametrize("draft_width", [3, 5, 6, 7, 16])
+def test_recurrent_dspark_uses_prepared_graph_without_requiring_clipping(
+    model_type: str, adaptive: bool, draft_width: int
+) -> None:
     config = {
         "model_type": model_type,
         "is_block_diffusion_algorithm": True,
         "enable_adaptive_target_verify": adaptive,
         "enable_task_pipeline": True,
+        "num_speculative_tokens": draft_width,
         "python_graph_backend": "aclgraph",
         "max_position_embeddings": 128,
         "kv_split_size": 1,
@@ -2100,10 +2104,12 @@ def test_recurrent_dspark_uses_prepared_graph_without_requiring_clipping(model_t
             return_value=_PreparedStubAttentionBackend(),
         ),
     ):
-        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4, num_decoding_tokens=8)
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4, num_decoding_tokens=draft_width + 1)
     assert executor.supports_prepared_metadata
     assert executor.prepared_graph_runner is not None
     assert executor.decode_graph_runner is None
+    assert executor.prepared_graph_runner._spec_verify_width == (1 if adaptive else draft_width + 1)
+    assert executor.prepared_graph_runner._device_kv_lengths is not adaptive
     cache = torch.empty(2, 4, 2, 64)
     executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, q_cu_seq_lens_host_values=[8])

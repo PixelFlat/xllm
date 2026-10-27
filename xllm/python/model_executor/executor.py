@@ -408,6 +408,9 @@ class ModelExecutor:
             and dp_size == 1
             and cp_size == 1
         )
+        self._prepared_fixed_recurrent_target = self._prepared_recurrent_target and not config.get(
+            "enable_adaptive_target_verify", False
+        )
         self._prepared_block_draft = is_block_draft_model(config)
         self._prepared_dspark = is_dspark_draft_model(config)
         # DSpark drafts and DFlash2 write their own context-KV via the shared
@@ -551,8 +554,12 @@ class ModelExecutor:
                     dp_rank,
                     enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                     block_draft=self._prepared_block_draft,
-                    spec_verify_width=self.num_speculative_tokens + 1 if self._prepared_qwen_mtp_target else 1,
-                    device_kv_lengths=self._prepared_qwen_mtp_target or self._prepared_qwen_mtp_draft,
+                    spec_verify_width=self.num_speculative_tokens + 1
+                    if self._prepared_qwen_mtp_target or self._prepared_fixed_recurrent_target
+                    else 1,
+                    device_kv_lengths=self._prepared_qwen_mtp_target
+                    or self._prepared_qwen_mtp_draft
+                    or self._prepared_fixed_recurrent_target,
                 )
             else:
                 if self._independent_block_draft:
@@ -917,6 +924,13 @@ class ModelExecutor:
             )
         else:
             metadata.prepared_attention_state = self.attention_backend.prepare_metadata(metadata)
+
+    def get_prepared_aux_hidden_states(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        if self.prepared_graph_runner is None:
+            raise RuntimeError("prepared ACL graph runner is not enabled")
+        return self.prepared_graph_runner.get_prepared_aux_hidden_states(input_ids, positions, metadata)
 
     def warmup_prepared_graph(
         self,

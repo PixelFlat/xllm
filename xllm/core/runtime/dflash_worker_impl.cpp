@@ -63,8 +63,8 @@ bool uses_prepared_dflash2_graphs(const runtime::Options& options) {
   if (!options.enable_task_pipeline() || !Platform::is_npu() ||
       !SpeculativeConfig::is_dflash2_algorithm(
           options.speculative_algorithm()) ||
-      (options.num_speculative_tokens() != 5 &&
-       options.num_speculative_tokens() != 7)) {
+      options.num_speculative_tokens() < 1 ||
+      options.num_speculative_tokens() > 16) {
     return false;
   }
   const std::string model_type =

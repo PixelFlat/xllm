@@ -803,6 +803,11 @@ class PreparedTestExecutor final : public ExecutorImpl {
                   const ModelParamsView& params) override {
     auto* counting = dynamic_cast<CountingModel*>(model_);
     const auto& adaptive = params.graph.dspark_adaptive;
+    if (!adaptive.arena.defined() && params.is_spec_verify &&
+        params.num_accepted_tokens.defined()) {
+      counting->recurrent_accepted_counts.emplace_back(
+          params.num_accepted_tokens.clone());
+    }
     if (adaptive.arena.defined()) {
       if (adaptive.num_accepted_tokens.defined()) {
         counting->recurrent_accepted_counts.emplace_back(
@@ -1109,13 +1114,13 @@ TEST_F(HybridBlockWorkerOptionsTest,
 }
 
 TEST_F(HybridBlockWorkerOptionsTest,
-       WiderDflash2RecurrentLeavesKeepOrdinaryAclGraphs) {
+       WiderDflash2RecurrentLeavesKeepPreparedGraphs) {
   ASSERT_TRUE(write_model_type("qwen3_5_text"));
   auto config = options();
   config.speculative_algorithm("DFlash2").num_speculative_tokens(15);
   HybridBlockTaskTestWorker worker(device_, config);
-  EXPECT_FALSE(worker.target_options().enable_task_pipeline());
-  EXPECT_FALSE(worker.draft_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.target_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
   EXPECT_TRUE(worker.target_options().enable_graph());
   EXPECT_TRUE(worker.draft_options().enable_graph());
   EXPECT_EQ(worker.draft_options().num_decoding_tokens(), 16);
@@ -4264,7 +4269,7 @@ TEST_P(RecurrentBlockPipelineTest,
   target.restore_request_state = [&](const ModelParamsView& params) {
     EXPECT_EQ(params.embedding.linear_state_indices.numel(),
               params.embedding.linear_state_ids.size());
-    EXPECT_EQ(params.embedding.linear_state_ids.size(),
+    EXPECT_GE(params.embedding.linear_state_ids.size(),
               params.linear_state_validity_mask.size());
     if (warming_graph) {
       EXPECT_TRUE(params.linear_state_cache_ops.empty());
@@ -4293,10 +4298,10 @@ TEST_P(RecurrentBlockPipelineTest,
       unsupported_dp,
       pipeline_);
   EXPECT_FALSE(dp_status.ok());
-  EXPECT_EQ(
-      dp_status.message(),
-      "Recurrent block drafts require prepared Draft5/7 graphs, request state "
-      "restoration and DP=CP=1 without unified graphs.");
+  EXPECT_EQ(dp_status.message(),
+            "Recurrent block drafts require prepared Draft1..16 graphs, "
+            "request state "
+            "restoration and DP=CP=1 without unified graphs.");
   const Status status = TaskExecutionPipeline::create(
       state_thread_,
       std::move(target),
@@ -4340,6 +4345,10 @@ TEST_P(RecurrentBlockPipelineTest,
   restored_decodes = 0;
   execute(recurrent_input(3, /*decode=*/false));
   const auto result = execute(recurrent_input(3, /*decode=*/true));
+  if (!adaptive) {
+    EXPECT_TRUE(target_->adaptive_forward_bindings.empty());
+    EXPECT_EQ(target_->forward_inputs.back().numel() % width, 0);
+  }
   if (!adaptive) {
     ASSERT_TRUE(result.logprobs);
     EXPECT_EQ(result.sample_output.logprobs.size(0), 3);
@@ -4561,10 +4570,14 @@ INSTANTIATE_TEST_SUITE_P(FixedAndAdaptive,
                          RecurrentBlockPipelineTest,
                          ::testing::Values(std::make_tuple(false, 5U, false),
                                            std::make_tuple(false, 7U, false),
+                                           std::make_tuple(false, 3U, false),
+                                           std::make_tuple(false, 6U, false),
                                            std::make_tuple(true, 5U, false),
                                            std::make_tuple(true, 7U, false),
                                            std::make_tuple(false, 5U, true),
-                                           std::make_tuple(false, 7U, true)));
+                                           std::make_tuple(false, 7U, true),
+                                           std::make_tuple(false, 3U, true),
+                                           std::make_tuple(false, 6U, true)));
 
 TEST_F(SpeculativePipelineTest, AdaptiveDSparkRejectsUnsupportedAdmission) {
   configure_adaptive_dspark();

@@ -55,6 +55,15 @@ def test_prepared_capacity_selects_warmed_slot_owned_tables(
     assert runner._capture.call_count == 6
     assert len(runner._prepared_graphs) == 6
     entries = list(runner._prepared_graphs.values())
+    for entry in entries:
+        entry.static_output = (torch.empty(2, 4), torch.empty(2, 8))
+    for tokens, positions, metadata in bindings:
+        outputs = runner.get_prepared_aux_hidden_states(tokens, positions, metadata)
+        expected = [entry.static_output[1] for entry in entries if entry.static_input_ids is tokens]
+        assert len(outputs) == 3
+        assert [output.data_ptr() for output in outputs] == [output.data_ptr() for output in expected]
+        with pytest.raises(RuntimeError, match="warmed Slot binding"):
+            runner.get_prepared_aux_hidden_states(tokens.clone(), positions, metadata)
     assert len({entry.static_metadata.block_table.data_ptr() for entry in entries}) == 6
     for entry in entries:
         table = entry.static_metadata.block_table
@@ -1259,7 +1268,7 @@ def test_prepared_gdn_rejects_nonfinal_state_views_before_capture(runner: Prepar
     runner.attention_backend.prepare.assert_not_called()
 
 
-@pytest.mark.parametrize("draft_tokens", [1, 2, 3, 8, 16])
+@pytest.mark.parametrize("draft_tokens", [1, 2, 3, 5, 6, 7, 8, 16])
 def test_prepared_verify_binds_logical_accepted_counts_without_host_reads(
     runner: PreparedAclGraphRunner, draft_tokens: int
 ) -> None:

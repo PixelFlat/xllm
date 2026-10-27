@@ -316,9 +316,10 @@ Status TaskExecutionPipeline::create(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   auto prepared_capacity = capacity;
   if (prepared_capacity.hybrid_recurrent_target) {
-    // Packed block graphs bind request state through their descriptor, not
-    // through the fixed-width recurrent MTP Slot layout.
-    prepared_capacity.common.model.enable_linear_attention = false;
+    // Fixed blocks share the ordinary recurrent Slot layout. Only adaptive
+    // verification binds request state through a packed graph descriptor.
+    prepared_capacity.common.model.enable_linear_attention =
+        !capacity.adaptive_target_verify;
   }
   const auto& common = prepared_capacity.common;
   const uint64_t width =
@@ -326,6 +327,7 @@ Status TaskExecutionPipeline::create(
   const uint64_t rows =
       static_cast<uint64_t>(common.model.max_sequences) * width;
   if (common.model.enable_linear_attention &&
+      !capacity.hybrid_recurrent_target &&
       (capacity.kind != SpeculativeTaskKind::MTP ||
        capacity.num_speculative_tokens == 0 ||
        capacity.num_speculative_tokens > 16 || common.dp_size != 1 ||
@@ -377,12 +379,12 @@ Status TaskExecutionPipeline::create(
         capacity.kind != SpeculativeTaskKind::DFLASH2) ||
        !Platform::is_npu() || common.max_graph_batch_size == 0 ||
        common.model.max_sequences > 128 ||
-       (capacity.num_speculative_tokens != 5 &&
-        capacity.num_speculative_tokens != 7) ||
-       capacity.unified_graph || common.dp_size != 1 ||
-       common.cp_sampling_group != nullptr || !target.restore_request_state)) {
+       capacity.num_speculative_tokens == 0 ||
+       capacity.num_speculative_tokens > 16 || capacity.unified_graph ||
+       common.dp_size != 1 || common.cp_sampling_group != nullptr ||
+       !target.restore_request_state)) {
     return invalid(
-        "Recurrent block drafts require prepared Draft5/7 graphs, request "
+        "Recurrent block drafts require prepared Draft1..16 graphs, request "
         "state "
         "restoration and DP=CP=1 without unified graphs.");
   }
@@ -579,7 +581,7 @@ Status TaskExecutionPipeline::initialize_speculative() {
         slot->draft_prefix_indices = torch::arange(count, indices);
       }
     }
-    if (adaptive_verify_ || speculative_capacity_->hybrid_recurrent_target) {
+    if (adaptive_verify_) {
       slot->target_token_storage =
           torch::empty({expanded}, options.dtype(torch::kInt64));
       slot->verify = std::make_unique<SpeculativeSlot::PackedVerify>();
@@ -1209,13 +1211,6 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     if (adaptive_verify_) {
       return plan_adaptive_verify(slot, input);
     }
-    // Fixed recurrent tasks use the same packed graph, but always verify all
-    // proposals. No confidence head, feedback history or cost planner runs.
-    slot.verify->plan = {
-        slot.rows * speculative_capacity_->num_speculative_tokens,
-        slot.target_padded_batch_size};
-    slot.verify->max_kv_length = dspark_local_kv_bound(
-        slot.upper_kv_lengths, speculative_capacity_->num_speculative_tokens);
   }
   return Status();
 }
@@ -1679,7 +1674,7 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
     }
     return Status();
   }
-  if (adaptive_verify_ || speculative_capacity_->hybrid_recurrent_target) {
+  if (adaptive_verify_) {
     // Scheduler startup runs Prefill warmup before the Decode bucket sweep.
     // Preserve its normal context/bootstrap execution; only Decode owns the
     // prepared block-draft/verify bindings and their adaptive cost
@@ -1750,11 +1745,12 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   // different draft buckets. Always visit the draft bindings independently.
   if (!block_draft()) {
     warmup_draft_graphs(input);
-  } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
+  } else if ((speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
+              speculative_capacity_->hybrid_recurrent_target) &&
              padded_batch_size != 0) {
     // Prefill and idle warmup do not plan the expanded decode bindings.
-    // DSpark owns an N-wide chunked-prefill binding, not the target's padded
-    // (N+1)-wide decode shape. Capture the final Slot views independently.
+    // Drafts own non-causal query blocks (N rows for DSpark, N+1 for DFlash2),
+    // independently of the target's padded (N+1)-wide verification shape.
     for (auto& task_slot : slots_) {
       auto& slot = *task_slot->speculative;
       auto& binding = *slot.drafts.front()->input;
@@ -1798,14 +1794,24 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
       auto& context_params = target_input.model_params();
       const bool was_warmup = context_params.meta.is_graph_warmup;
       context_params.meta.is_graph_warmup = true;
-      auto context_output = draft_->model.write_context_kv(
-          slot.target_output.aux_hidden_states.narrow(0, 0, context_rows),
-          target_input.positions().narrow(0, 0, context_rows),
-          context_slots,
-          draft_->kv_caches,
-          context_params);
+      std::vector<torch::Tensor> context_outputs{
+          slot.target_output.aux_hidden_states};
+      if (auto* python = executor_.python_impl(); python != nullptr) {
+        // KV tiers own distinct output buffers. Warm every borrowed address,
+        // not just the tier selected by the synthetic startup sequence.
+        context_outputs = python->get_prepared_aux_hidden_states(
+            target_input.tokens(), target_input.positions(), context_params);
+      }
+      for (const auto& hidden : context_outputs) {
+        const auto context_output = draft_->model.write_context_kv(
+            hidden.narrow(0, 0, context_rows),
+            target_input.positions().narrow(0, 0, context_rows),
+            context_slots,
+            draft_->kv_caches,
+            context_params);
+        CHECK(context_output.hidden_states.defined());
+      }
       context_params.meta.is_graph_warmup = was_warmup;
-      CHECK(context_output.hidden_states.defined());
       auto& captured = invocation.captured_graph_batch_sizes;
       const auto draft_bucket =
           std::lower_bound(captured.begin(), captured.end(), draft_rows);
@@ -2575,11 +2581,12 @@ Status TaskExecutionPipeline::prepare_speculative(
     slot.accepted_mask = prefix(slot.accepted_mask_storage, slot.rows * width)
                              .view({slot.rows, width});
     if (block_draft()) {
-      slot.context_slots = prefix(slot.context_slots_storage,
-                                  slot.verify || speculative_capacity_->kind ==
-                                                     SpeculativeTaskKind::DSPARK
-                                      ? slot.validate_input->tokens().numel()
-                                      : slot.rows * width);
+      slot.context_slots = prefix(
+          slot.context_slots_storage,
+          slot.verify || speculative_capacity_->hybrid_recurrent_target ||
+                  speculative_capacity_->kind == SpeculativeTaskKind::DSPARK
+              ? slot.validate_input->tokens().numel()
+              : slot.rows * width);
     }
     const auto& base = slot.target_prefill->sampling_params();
     for (uint32_t step = 0; step < draft_calls(slot); ++step) {
@@ -2801,6 +2808,11 @@ Status TaskExecutionPipeline::prepare_recurrent_state(
         return id < (warmup ? 0 : 1) || id >= state_capacity;
       })) {
     return invalid("Recurrent DSpark state slot is outside allocated cache.");
+  }
+  if (slot.decode && !slot.verify) {
+    // prepare_model_state already bound the complete fixed-width bucket,
+    // including padding state zero. Do not shrink its graph inputs to live B.
+    return Status();
   }
   auto& recurrent = *slot.recurrent;
   recurrent.host_state_indices.zero_();
@@ -3185,6 +3197,9 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
     prefix(validate.model_params().num_accepted_tokens, slot.rows)
         .copy_(slot.state->state_.accepted_lengths);
   }
+  if (slot.recurrent) {
+    restore_request_state_(validate.model_params());
+  }
   validate.tokens()
       .narrow(/*dim=*/0, /*start=*/0, slot.rows * width)
       .view({slot.rows, width})
@@ -3197,7 +3212,8 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   slot.target_output.hidden_states = slot.target_output.hidden_states.narrow(
       /*dim=*/0, /*start=*/0, slot.rows * width);
   if (block_draft()) {
-    if (speculative_capacity_->kind != SpeculativeTaskKind::DSPARK) {
+    if (speculative_capacity_->kind != SpeculativeTaskKind::DSPARK &&
+        !speculative_capacity_->hybrid_recurrent_target) {
       slot.target_output.aux_hidden_states =
           slot.target_output.aux_hidden_states.narrow(
               /*dim=*/0, /*start=*/0, slot.rows * width);
@@ -3650,7 +3666,8 @@ void TaskExecutionPipeline::launch_speculative(uint32_t slot_id) {
   c10::DeviceGuard device_guard(device_.unwrap());
   auto guard = task_stream_.set_stream_guard();
   CHECK(task_stream_.wait_event(slots_[slot_id]->input_ready));
-  if (capacity_.model.enable_linear_attention && slot.rows != 0) {
+  if (capacity_.model.enable_linear_attention && !slot.recurrent &&
+      slot.rows != 0) {
     // launch() has already waited for Host KV reloads, including Conv/SSM.
     // Reset/restore and all recurrent forwards share this ordered stream.
     auto& params = slot.target_prefill->model_params();

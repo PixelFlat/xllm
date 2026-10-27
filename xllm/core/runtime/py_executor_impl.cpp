@@ -599,6 +599,18 @@ void PyExecutorImpl::warmup_prepared_graph(const torch::Tensor& tokens,
       **graph_kwargs);
 }
 
+std::vector<torch::Tensor> PyExecutorImpl::get_prepared_aux_hidden_states(
+    const torch::Tensor& tokens,
+    const torch::Tensor& positions,
+    const ModelParamsView& params) {
+  CHECK(params.python_attention_metadata != nullptr);
+  py::gil_scoped_acquire gil;
+  return py_executor_
+      .attr("get_prepared_aux_hidden_states")(
+          tokens, positions, params.python_attention_metadata->value())
+      .cast<std::vector<torch::Tensor>>();
+}
+
 ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                 const torch::Tensor& positions,
                                 std::vector<KVCache>& kv_caches,
