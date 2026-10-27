@@ -400,8 +400,10 @@ class ModelExecutor:
         self._prepared_recurrent_target = (
             current_platform.is_npu()
             and config.get("model_type") in ("qwen3_5", "qwen3_5_text")
-            and config.get("enable_adaptive_target_verify", False)
             and config.get("enable_task_pipeline", False)
+            and (
+                config.get("enable_adaptive_target_verify", False) or config.get("is_block_diffusion_algorithm", False)
+            )
             and graph_backend == "aclgraph"
             and dp_size == 1
             and cp_size == 1
@@ -472,7 +474,11 @@ class ModelExecutor:
                 or self._prepared_qwen_mtp_draft
                 or self._prepared_recurrent_target
                 or (self._prepared_block_draft and graph_backend in _DISABLED_GRAPH_BACKENDS)
-                or (self._prepared_dspark and config.get("enable_task_pipeline", False) and graph_backend == "aclgraph")
+                or (
+                    (self._prepared_dspark or self._independent_block_draft)
+                    and config.get("enable_task_pipeline", False)
+                    and graph_backend == "aclgraph"
+                )
             )
             and prepared_kv
             and graph_backend in (*_DISABLED_GRAPH_BACKENDS, "aclgraph")
@@ -530,19 +536,21 @@ class ModelExecutor:
             if config.get("enable_task_pipeline", False):
                 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
-                if not self._supports_prepared_metadata or (self._prepared_block_draft and not self._prepared_dspark):
+                if not self._supports_prepared_metadata or (
+                    self._prepared_block_draft and not (self._prepared_dspark or self._independent_block_draft)
+                ):
                     raise ValueError("prepared ACL graphs require a supported target or MTP model")
                 self.prepared_graph_runner = PreparedAclGraphRunner(
                     execution_model,
                     self.attention_backend,
                     device,
-                    local_graph_sequence_capacity * self._context_kv_draft_width * dp_size
+                    local_graph_sequence_capacity * self._context_kv_query_width * dp_size
                     if self.context_kv_graph_runner is not None
                     else max_graph_tokens,
                     dp_size,
                     dp_rank,
                     enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
-                    block_draft=self._prepared_dspark,
+                    block_draft=self._prepared_block_draft,
                     spec_verify_width=self.num_speculative_tokens + 1 if self._prepared_qwen_mtp_target else 1,
                     device_kv_lengths=self._prepared_qwen_mtp_target or self._prepared_qwen_mtp_draft,
                 )
@@ -1045,7 +1053,7 @@ class ModelExecutor:
             if enable_graph and layer_synchronizer is None:
                 if self.prepared_graph_runner is None:
                     raise RuntimeError("prepared ACL graph runner is not enabled")
-                if self._prepared_dspark:
+                if self._prepared_block_draft:
                     output = self.prepared_graph_runner.execute_block(
                         input_ids, positions, metadata, input_embedding, layer_synchronizer, mtp_topk_indices, eplb=eplb
                     )

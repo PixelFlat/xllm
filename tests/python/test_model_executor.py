@@ -2080,6 +2080,37 @@ class _PreparedStubAttentionBackend(StubAttentionBackend):
         return SimpleNamespace(source=metadata.q_cu_seq_lens_host_values, device_kv_lengths=device_kv_lengths)
 
 
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_text"])
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_recurrent_dspark_uses_prepared_graph_without_requiring_clipping(model_type: str, adaptive: bool) -> None:
+    config = {
+        "model_type": model_type,
+        "is_block_diffusion_algorithm": True,
+        "enable_adaptive_target_verify": adaptive,
+        "enable_task_pipeline": True,
+        "python_graph_backend": "aclgraph",
+        "max_position_embeddings": 128,
+        "kv_split_size": 1,
+    }
+    with (
+        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+        patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
+        patch(
+            "xllm.python.model_executor.executor._create_attention_backend",
+            return_value=_PreparedStubAttentionBackend(),
+        ),
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4, num_decoding_tokens=8)
+    assert executor.supports_prepared_metadata
+    assert executor.prepared_graph_runner is not None
+    assert executor.decode_graph_runner is None
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, q_cu_seq_lens_host_values=[8])
+    executor.prepare_metadata(metadata)
+    assert metadata.prepared_attention_state.device_kv_lengths
+
+
 def test_executor_prepares_private_metadata_after_cache_binding() -> None:
     backend = _PreparedStubAttentionBackend()
     with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
@@ -2740,10 +2771,13 @@ def test_prepared_dspark_whitelist_matches_all_dspark_model_types(model_type: st
     assert executor.context_kv_graph_runner is None
 
 
-def test_prepared_dspark_graph_keeps_block_width_and_explicit_capacity_admission() -> None:
+@pytest.mark.parametrize("model_type,query_width", [("DSparkDraftModel", 3), ("DFlash2DraftModel", 8)])
+def test_prepared_block_graph_keeps_query_width_and_explicit_capacity_admission(
+    model_type: str, query_width: int
+) -> None:
     config = _classify(
         {
-            "model_type": "DSparkDraftModel",
+            "model_type": model_type,
             "enable_task_pipeline": True,
             "python_graph_backend": "aclgraph",
             "num_speculative_tokens": 3,
@@ -2752,18 +2786,20 @@ def test_prepared_dspark_graph_keeps_block_width_and_explicit_capacity_admission
     with patch(
         "xllm.python.model_executor.executor._create_attention_backend", return_value=_PreparedStubAttentionBackend()
     ):
-        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=1)
+        model = _FakeModel()
+        model.cfg = SimpleNamespace(block_size=8)
+        executor = ModelExecutor(model, config, max_seqs_per_batch=1)
     assert executor.supports_prepared_metadata
     assert executor.decode_graph_runner is None
-    assert executor.prepared_graph_runner.max_batch == 3
+    assert executor.prepared_graph_runner.max_batch == query_width
     assert executor.prepared_graph_runner._block_draft
     executor._kv_bound = True
     executor.prepared_graph_runner = MagicMock()
     executor.context_kv_graph_runner = MagicMock()
     executor.eager_runner = MagicMock()
     metadata = SimpleNamespace(prepared_attention_state=object(), is_prefill=False, is_chunked_prefill=True)
-    tokens = torch.arange(3, dtype=torch.int32)
-    positions = torch.arange(3, dtype=torch.int32)
+    tokens = torch.arange(query_width, dtype=torch.int32)
+    positions = torch.arange(query_width, dtype=torch.int32)
     output = executor.execute(tokens, positions, metadata, enable_graph=True, is_graph_warmup=True)
     assert output is executor.prepared_graph_runner.execute_block.return_value
     executor.prepared_graph_runner.execute_block.assert_called_once_with(

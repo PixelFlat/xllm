@@ -108,7 +108,10 @@ struct MtpContextPublication {
 // Fixed storage for the forwards in one speculative round. No scheduler,
 // streams or independently retiring execution object lives here.
 struct TaskExecutionPipeline::SpeculativeSlot {
-  struct Adaptive {
+  struct PackedVerify {
+    // Fixed recurrent verification uses the full-width plan without confidence
+    // evaluation, calibration or adaptive feedback. Both modes borrow this
+    // packed graph layout and the same request-scoped recurrent kernel.
     VerifyBudgetPlan plan;
     uint64_t generation = 0;
     uint32_t max_kv_length = 0;
@@ -186,7 +189,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   bool decode = false;
   // Immutable until this Slot retires; capacity remains the maximum depth.
   uint32_t draft_steps = 0;
-  std::unique_ptr<Adaptive> adaptive;
+  std::unique_ptr<PackedVerify> verify;
   std::unique_ptr<Recurrent> recurrent;
   bool run_models = false;
   torch::Tensor dummy_hidden;
@@ -255,8 +258,6 @@ struct TaskExecutionPipeline::AdaptiveVerifyState {
   std::optional<SpecCalibrationPoint> calibration_point;
   std::unique_ptr<SpecCalibrationSession> calibration_session;
   bool startup_calibration_complete = false;
-  // EMBEDDING-row keyed, updated and gathered only on the FIFO task stream.
-  torch::Tensor accepted_lengths;
 };
 
 }  // namespace xllm

@@ -348,20 +348,21 @@ class TaskExecutionPipeline final {
   void launch_decode(SpeculativeSlot& slot);
   bool launch_unified_block(SpeculativeSlot& slot);
   void launch_block_draft(SpeculativeSlot& slot);
+  void finish_fixed_verify(SpeculativeSlot& slot);
   void generate_adaptive_dspark_proposals(SpeculativeSlot& slot,
                                           const torch::Tensor& anchors);
-  void launch_adaptive_verify(SpeculativeSlot& slot);
+  void launch_packed_verify(SpeculativeSlot& slot);
   Status plan_adaptive_verify(SpeculativeSlot& slot,
                               const LlmForwardInput& input);
   Status plan_dp_adaptive_dspark(SpeculativeSlot& slot,
                                  const LlmForwardInput& input);
-  Status warmup_adaptive_verify_graphs(const LlmForwardInput& input);
+  Status warmup_packed_verify_graphs(const LlmForwardInput& input);
   Status warmup_adaptive_unified_graphs(const LlmForwardInput& input);
   std::vector<SpecCalibrationGraphCoverage> adaptive_verify_graph_coverage()
       const;
-  void bind_adaptive_verify_views(SpeculativeSlot& slot);
-  void bind_adaptive_verify_graph_input(SpeculativeSlot& slot,
-                                        bool suppress_kv_writes);
+  void bind_packed_verify_views(SpeculativeSlot& slot);
+  void bind_packed_verify_graph_input(SpeculativeSlot& slot,
+                                      bool suppress_kv_writes);
   std::optional<std::string> spec_calibration_impl(
       const SpecCalibrationCommand& command);
   std::optional<std::string> draft_step_calibration_capabilities() const;
@@ -389,6 +390,8 @@ class TaskExecutionPipeline final {
   std::unique_ptr<SpeculativeTaskCapacity> speculative_capacity_;
   struct AdaptiveVerifyState;
   std::unique_ptr<AdaptiveVerifyState> adaptive_verify_;
+  // Embedding-row keyed; shared by both fixed and adaptive recurrent tasks.
+  torch::Tensor recurrent_accepted_lengths_;
   WorkerImpl* worker_pipeline_ = nullptr;
   std::unique_ptr<TaskModel> draft_;
   torch::ScalarType hidden_dtype_ = torch::kFloat32;

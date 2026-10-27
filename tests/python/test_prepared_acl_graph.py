@@ -952,7 +952,7 @@ def test_block_replay_failure_propagates(
 
 
 @pytest.mark.parametrize("request_count", [2, 3, 4])
-@pytest.mark.parametrize("query_width", [1, 3, 7])
+@pytest.mark.parametrize("query_width", [1, 3, 7, 8])
 @pytest.mark.parametrize("dp_size", [1, 2])
 def test_block_graph_binds_isolated_request_rows_without_recapture(
     runner: PreparedAclGraphRunner, request_count: int, query_width: int, dp_size: int
@@ -1619,7 +1619,7 @@ def test_prepared_executor_obeys_admission_and_propagates_replay_failure(runner:
     executor = object.__new__(ModelExecutor)
     executor._kv_bound = True
     executor._prepared_mtp = False
-    executor._prepared_dspark = False
+    executor._prepared_block_draft = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
     executor.context_kv_graph_runner = None

@@ -70,7 +70,7 @@ struct TaskPipelineTestPeer {
         uint32_t erased = 0;
         for (auto& task_slot : pipeline.slots_) {
           erased += static_cast<uint32_t>(
-              task_slot->speculative->adaptive->unified_graph_bindings.erase(
+              task_slot->speculative->verify->unified_graph_bindings.erase(
                   key));
         }
         return erased;

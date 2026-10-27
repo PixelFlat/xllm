@@ -36,6 +36,7 @@ limitations under the License.
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -436,6 +437,24 @@ class CountingModel final : public CausalLM {
     return bias;
   }
 
+  DFlash2CandidateOutput dflash2_candidates(
+      const torch::Tensor& hidden_states,
+      const torch::Tensor& unary_logits,
+      const torch::Tensor& anchor_token_ids) override {
+    dflash2_hidden.emplace_back(hidden_states.clone());
+    const int64_t rows = anchor_token_ids.numel();
+    const int64_t steps = unary_logits.size(1);
+    const auto columns =
+        torch::arange(1, steps + 1, anchor_token_ids.options());
+    const auto increment =
+        row_markov_increments.defined()
+            ? row_markov_increments.to(anchor_token_ids.options())
+            : torch::ones_like(anchor_token_ids);
+    auto ids = anchor_token_ids.view({rows, 1}) +
+               increment.view({rows, 1}) * columns.view({1, steps});
+    return {ids.unsqueeze(-1), torch::zeros({rows, steps, 1, 1}, options_)};
+  }
+
   bool has_dspark_confidence_head() const override { return confidence_head; }
   torch::Tensor dspark_confidence_probs(
       const torch::Tensor& hidden,
@@ -486,6 +505,7 @@ class CountingModel final : public CausalLM {
   std::vector<bool> context_cache_bound;
   bool adaptive_unified_capable = true;
   torch::Tensor row_markov_increments;
+  std::vector<torch::Tensor> dflash2_hidden;
   bool confidence_head = false;
   double logit_peak = 20.0;
   float confidence_value = 0.0F;
@@ -1068,25 +1088,37 @@ class HybridBlockWorkerOptionsTest : public ::testing::Test {
 };
 
 TEST_F(HybridBlockWorkerOptionsTest,
-       FixedRecurrentLeavesKeepOrdinaryAclGraphs) {
+       FixedDflash2RecurrentLeavesKeepPreparedGraphs) {
   for (const std::string model_type : {"qwen3_5", "qwen3_5_text"}) {
     SCOPED_TRACE(model_type);
     ASSERT_TRUE(write_model_type(model_type));
-    for (const std::string algorithm : {"DSpark", "DFlash2"}) {
-      SCOPED_TRACE(algorithm);
-      runtime::Options config = options();
-      config.speculative_algorithm(algorithm);
-      HybridBlockTaskTestWorker worker(device_, config);
-      EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
-      EXPECT_TRUE(worker.outer_options().enable_schedule_overlap());
-      EXPECT_FALSE(worker.target_options().enable_task_pipeline());
-      EXPECT_FALSE(worker.draft_options().enable_task_pipeline());
-      EXPECT_TRUE(worker.target_options().enable_graph());
-      EXPECT_TRUE(worker.draft_options().enable_graph());
-      EXPECT_TRUE(worker.target_options().enable_graph_aux_hidden_states());
-      EXPECT_FALSE(worker.draft_options().enable_graph_aux_hidden_states());
-    }
+    runtime::Options config = options();
+    config.speculative_algorithm("DFlash2");
+    HybridBlockTaskTestWorker worker(device_, config);
+    EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.outer_options().enable_schedule_overlap());
+    EXPECT_TRUE(worker.target_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.target_options().enable_graph());
+    EXPECT_TRUE(worker.draft_options().enable_graph());
+    EXPECT_TRUE(worker.target_options().enable_graph_aux_hidden_states());
+    EXPECT_FALSE(worker.draft_options().enable_graph_aux_hidden_states());
+    EXPECT_EQ(worker.draft_options().num_decoding_tokens(), 8);
+    EXPECT_EQ(worker.draft_options().num_speculative_tokens(), 0);
   }
+}
+
+TEST_F(HybridBlockWorkerOptionsTest,
+       WiderDflash2RecurrentLeavesKeepOrdinaryAclGraphs) {
+  ASSERT_TRUE(write_model_type("qwen3_5_text"));
+  auto config = options();
+  config.speculative_algorithm("DFlash2").num_speculative_tokens(15);
+  HybridBlockTaskTestWorker worker(device_, config);
+  EXPECT_FALSE(worker.target_options().enable_task_pipeline());
+  EXPECT_FALSE(worker.draft_options().enable_task_pipeline());
+  EXPECT_TRUE(worker.target_options().enable_graph());
+  EXPECT_TRUE(worker.draft_options().enable_graph());
+  EXPECT_EQ(worker.draft_options().num_decoding_tokens(), 16);
 }
 
 TEST_F(HybridBlockWorkerOptionsTest,
@@ -1098,6 +1130,21 @@ TEST_F(HybridBlockWorkerOptionsTest,
     config.enable_adaptive_target_verify(true);
     HybridBlockTaskTestWorker worker(device_, config);
     EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.target_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.target_options().enable_graph());
+    EXPECT_TRUE(worker.draft_options().enable_graph());
+  }
+}
+
+TEST_F(HybridBlockWorkerOptionsTest,
+       FixedDsparkRecurrentLeavesKeepPreparedGraphs) {
+  for (const std::string model_type : {"qwen3_5", "qwen3_5_text"}) {
+    SCOPED_TRACE(model_type);
+    ASSERT_TRUE(write_model_type(model_type));
+    HybridBlockTaskTestWorker worker(device_, options());
+    EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
+    EXPECT_TRUE(worker.outer_options().enable_schedule_overlap());
     EXPECT_TRUE(worker.target_options().enable_task_pipeline());
     EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
     EXPECT_TRUE(worker.target_options().enable_graph());
@@ -4183,10 +4230,26 @@ TEST_F(SpeculativePipelineTest,
   pipeline_.reset();
 }
 
-TEST_F(SpeculativePipelineTest,
-       AdaptiveDSparkRecurrentTasksPrepareAndRestoreRequestState) {
-  configure_adaptive_dspark(/*profiled=*/false);
+class RecurrentBlockPipelineTest
+    : public SpeculativePipelineTest,
+      public ::testing::WithParamInterface<std::tuple<bool, uint32_t, bool>> {};
+
+TEST_P(RecurrentBlockPipelineTest,
+       RecurrentTasksPrepareAndRestoreRequestState) {
+  const bool adaptive = std::get<0>(GetParam());
+  const uint32_t width = std::get<1>(GetParam()) + 1;
+  if (adaptive) {
+    configure_adaptive_dspark(/*profiled=*/false, width - 1);
+  } else {
+    configure_dspark_batch_graphs();
+    capacity_.num_speculative_tokens = width - 1;
+  }
   capacity_.common.model.enable_linear_attention = true;
+  const bool dflash2 = std::get<2>(GetParam());
+  if (dflash2) {
+    capacity_.kind = SpeculativeTaskKind::DFLASH2;
+    capacity_.selector_top_k = 1;
+  }
   capacity_.common.enable_mla = false;
   capacity_.sparse_dsa_target = false;
   capacity_.hybrid_recurrent_target = true;
@@ -4230,9 +4293,10 @@ TEST_F(SpeculativePipelineTest,
       unsupported_dp,
       pipeline_);
   EXPECT_FALSE(dp_status.ok());
-  EXPECT_EQ(dp_status.message(),
-            "Recurrent DSpark requires adaptive prepared graphs, request state "
-            "restoration and DP=CP=1 without unified graphs.");
+  EXPECT_EQ(
+      dp_status.message(),
+      "Recurrent block drafts require prepared Draft5/7 graphs, request state "
+      "restoration and DP=CP=1 without unified graphs.");
   const Status status = TaskExecutionPipeline::create(
       state_thread_,
       std::move(target),
@@ -4245,6 +4309,10 @@ TEST_F(SpeculativePipelineTest,
                                    bool placeholder = false,
                                    int32_t position = 2) {
     auto source = dspark_batch_input(rows, decode, placeholder, position);
+    if (!adaptive) {
+      source.sampling_params.logprobs = true;
+      source.sampling_params.max_top_logprobs = 2;
+    }
     auto& params = source.input_params;
     for (uint32_t row = 0; row < rows; ++row) {
       LinearStateCacheOp op;
@@ -4271,7 +4339,15 @@ TEST_F(SpeculativePipelineTest,
   restored_prefills = 0;
   restored_decodes = 0;
   execute(recurrent_input(3, /*decode=*/false));
-  execute(recurrent_input(3, /*decode=*/true));
+  const auto result = execute(recurrent_input(3, /*decode=*/true));
+  if (!adaptive) {
+    ASSERT_TRUE(result.logprobs);
+    EXPECT_EQ(result.sample_output.logprobs.size(0), 3);
+    EXPECT_EQ(result.sample_output.logprobs.size(1), width);
+    EXPECT_TRUE(result.sample_output.logprobs.isfinite().all().item<bool>());
+    EXPECT_EQ(result.sample_output.top_tokens.size(2), 2);
+    EXPECT_TRUE(result.dspark_feedback.confidence.empty());
+  }
   execute(recurrent_input(
       3, /*decode=*/true, /*placeholder=*/true, /*position=*/3));
   EXPECT_EQ(restored_prefills, 1U);
@@ -4282,13 +4358,37 @@ TEST_F(SpeculativePipelineTest,
                    torch::ones({3}, torch::kInt32)));
   EXPECT_TRUE(
       torch::equal(target_->recurrent_accepted_counts[1].narrow(0, 0, 3).cpu(),
-                   torch::full({3}, 8, torch::kInt32)));
+                   torch::full({3}, width, torch::kInt32)));
+  if (!adaptive) {
+    EXPECT_TRUE(draft_->confidence_hidden.empty());
+  }
+  if (dflash2) {
+    ASSERT_FALSE(draft_->dflash2_hidden.empty());
+    const auto& queries = draft_->forward_positions.back();
+    const auto selected = queries.view({-1, width})
+                              .narrow(1, 1, width - 1)
+                              .narrow(0, 0, 3)
+                              .to(target_->options());
+    EXPECT_TRUE(
+        torch::equal(draft_->dflash2_hidden.back().squeeze(-1), selected));
+  }
   pipeline_.reset();
 }
 
-TEST_F(SpeculativePipelineTest,
-       AdaptiveDSparkRecurrentCountsFollowRequestsAcrossSlotsAndRowOrder) {
-  configure_adaptive_dspark(/*profiled=*/false);
+TEST_P(RecurrentBlockPipelineTest,
+       RecurrentCountsFollowRequestsAcrossSlotsAndRowOrder) {
+  const bool adaptive = std::get<0>(GetParam());
+  const uint32_t width = std::get<1>(GetParam()) + 1;
+  if (adaptive) {
+    configure_adaptive_dspark(/*profiled=*/false, width - 1);
+  } else {
+    configure_dspark_batch_graphs();
+    capacity_.num_speculative_tokens = width - 1;
+  }
+  if (std::get<2>(GetParam())) {
+    capacity_.kind = SpeculativeTaskKind::DFLASH2;
+    capacity_.selector_top_k = 1;
+  }
   capacity_.common.enable_mla = false;
   capacity_.sparse_dsa_target = false;
   capacity_.hybrid_recurrent_target = true;
@@ -4340,7 +4440,9 @@ TEST_F(SpeculativePipelineTest,
   const auto second_result = pipeline_->take_result_async(second.task_id).get();
   ASSERT_TRUE(first_result.status.ok()) << first_result.status.message();
   ASSERT_TRUE(second_result.status.ok()) << second_result.status.message();
-  const auto expected = torch::tensor({8, 1, 8}, torch::kInt32);
+  const auto expected = torch::tensor(
+      {static_cast<int32_t>(width), 1, static_cast<int32_t>(width)},
+      torch::kInt32);
   ASSERT_EQ(target_->recurrent_accepted_counts.size(), 2U);
   EXPECT_TRUE(
       torch::equal(target_->recurrent_accepted_counts[0].narrow(0, 0, 3).cpu(),
@@ -4367,11 +4469,25 @@ TEST_F(SpeculativePipelineTest,
   std::swap(host.new_cache_slots[0], host.new_cache_slots[1]);
   execute(reordered);
   ASSERT_EQ(target_->recurrent_accepted_counts.size(), 3U);
-  EXPECT_TRUE(
-      torch::equal(target_->recurrent_accepted_counts[2].narrow(0, 0, 3).cpu(),
-                   torch::tensor({1, 8, 8}, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      target_->recurrent_accepted_counts[2].narrow(0, 0, 3).cpu(),
+      torch::tensor(
+          {1, static_cast<int32_t>(width), static_cast<int32_t>(width)},
+          torch::kInt32)));
+  if (!adaptive) {
+    EXPECT_TRUE(draft_->confidence_hidden.empty());
+  }
   pipeline_.reset();
 }
+
+INSTANTIATE_TEST_SUITE_P(FixedAndAdaptive,
+                         RecurrentBlockPipelineTest,
+                         ::testing::Values(std::make_tuple(false, 5U, false),
+                                           std::make_tuple(false, 7U, false),
+                                           std::make_tuple(true, 5U, false),
+                                           std::make_tuple(true, 7U, false),
+                                           std::make_tuple(false, 5U, true),
+                                           std::make_tuple(false, 7U, true)));
 
 TEST_F(SpeculativePipelineTest, AdaptiveDSparkRejectsUnsupportedAdmission) {
   configure_adaptive_dspark();
