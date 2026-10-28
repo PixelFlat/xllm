@@ -260,6 +260,88 @@ def test_dspark_dp_warmup_recaptures_when_any_rank_is_missing() -> None:
     capture.assert_called_once()
 
 
+@pytest.mark.parametrize("dp_rank", [0, 1])
+def test_block_draft_dp_prewarm_keeps_collectives_aligned_for_unequal_capacities(dp_rank: int) -> None:
+    runner = _block_draft_runner(dp_size=2, dp_rank=dp_rank, block_draft_graph_warmup_max_kv_len=4096)
+    runner.max_model_len = 16384
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 128, dtype=torch.int32))
+    length = 8193 if dp_rank == 0 else 2
+    metadata.kv_seq_lens.fill_(length)
+    metadata.kv_seq_lens_host_values = [length]
+    metadata.dp_execution_token_counts = (2, 2)
+    metadata.dp_is_decode = (1, 1)
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def presence(count: torch.Tensor, *, group_name: str) -> None:
+        assert group_name == "dp"
+        count.mul_(2)
+
+    def prepare(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key)
+        runner._graphs[graph_key] = object()
+
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch(
+            "xllm.python.distributed.all_gather",
+            side_effect=[torch.tensor([1, 1]), torch.tensor([2, 1])],
+        ) as gather,
+        patch("xllm.python.distributed.all_reduce_", side_effect=presence) as reduce,
+        patch.object(runner, "_prepare_graph_entry", side_effect=prepare),
+    ):
+        key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+
+    # Both ranks visit the bounded tier, then their current local capacity.
+    assert gather.call_count == reduce.call_count == 2
+    assert [key[2] for key in captured] == ([32, 128] if dp_rank == 0 else [32, 32])
+    assert [key[-1] for key in captured] == [(1, 1), (2, 1)]
+    assert key == captured[-1]
+
+
+def test_block_draft_dp_prewarmed_capacity_keys_are_reused_at_runtime() -> None:
+    runner = _block_draft_runner(dp_size=2)
+    runner.max_model_len = 16384
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 128, dtype=torch.int32))
+    metadata.kv_seq_lens.fill_(2)
+    metadata.kv_seq_lens_host_values = [2]
+    metadata.dp_execution_token_counts = (2, 2)
+    metadata.dp_is_decode = (1, 1)
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def gather(variant: torch.Tensor, *, dim: int, world_size: int, group_name: str) -> torch.Tensor:
+        assert dim == 0 and world_size == 2 and group_name == "dp"
+        return variant.repeat(world_size)
+
+    def presence(count: torch.Tensor, *, group_name: str) -> None:
+        assert group_name == "dp"
+        count.mul_(2)
+
+    def prepare(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key)
+        runner._graphs[graph_key] = object()
+
+    with (
+        patch("xllm.python.model_executor.runners.decode_acl_graph.dist.is_initialized", return_value=True),
+        patch("xllm.python.distributed.all_gather", side_effect=gather),
+        patch("xllm.python.distributed.all_reduce_", side_effect=presence),
+        patch.object(runner, "_prepare_graph_entry", side_effect=prepare),
+    ):
+        current_key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+        assert current_key == captured[-1]
+        assert [(key[2], key[-1]) for key in captured] == [(128, (1, 1)), (64, (2, 2)), (32, (3, 3))]
+        for length in (2048, 4097, 8193, 2048):
+            metadata.kv_seq_lens.fill_(length)
+            metadata.kv_seq_lens_host_values = [length]
+            assert runner.warmup(tokens, tokens, metadata) in captured
+        runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+
+    assert len(captured) == 3
+
+
 def test_dspark_graph_key_buckets_live_page_table_width() -> None:
     runner = _block_draft_runner()
     input_ids = torch.zeros(2, dtype=torch.int32)
@@ -370,6 +452,37 @@ def test_dspark_warmup_captures_once_per_page_capacity_bucket() -> None:
     assert prepare.call_count == 2
     assert keys[0] == keys[1] == keys[3]
     assert keys[0] != keys[2]
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "expected"),
+    [(128, [2]), (2048, [32]), (8320, [128, 64, 32]), (16384, [128, 64, 32])],
+)
+def test_block_draft_startup_prewarms_large_buckets_with_short_metadata(
+    max_model_len: int, expected: list[int]
+) -> None:
+    runner = _block_draft_runner(block_draft_graph_warmup_max_kv_len=0)
+    runner.max_model_len = max_model_len
+    runner.attention_backend.logical_page_size = 128
+    metadata = _block_draft_metadata(torch.zeros(1, 1, dtype=torch.int32))
+    metadata.kv_seq_lens_host_values = [2]
+    tokens = torch.arange(2, dtype=torch.int32)
+    captured = []
+
+    def prepare_entry(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        captured.append(graph_key[2])
+        runner._graphs[graph_key] = object()
+
+    with patch.object(runner, "_prepare_graph_entry", side_effect=prepare_entry):
+        key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+        runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+    assert captured == expected
+    assert key[2] == expected[-1]
+    metadata.block_table = torch.zeros(1, (max_model_len + 127) // 128, dtype=torch.int32)
+    metadata.kv_seq_lens_host_values[:] = [max_model_len]
+    metadata.kv_seq_lens.fill_(max_model_len)
+    runtime_key = runner._graph_key(tokens, metadata, 1, 2)
+    assert runtime_key in runner._graphs
 
 
 def test_dspark_request_reuses_startup_page_bucket() -> None:

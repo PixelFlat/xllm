@@ -25,7 +25,11 @@ from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInp
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
-from xllm.python.model_executor.runners.kv_capacity import kv_capacity_bucket, kv_capacity_buckets
+from xllm.python.model_executor.runners.kv_capacity import (
+    block_draft_kv_capacity_buckets,
+    kv_capacity_bucket,
+    kv_capacity_buckets,
+)
 
 
 class _PreparedBlockGraphEntry(AclGraphEntry):
@@ -92,6 +96,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         block_draft: bool = False,
         spec_verify_width: int = 1,
         device_kv_lengths: bool = False,
+        block_draft_graph_warmup_max_kv_len: int = 0,
     ) -> None:
         super().__init__(model, attention_backend, device)
         # Launch serializes captures, but native Prepare can still allocate
@@ -107,6 +112,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
         if device_kv_lengths and dp_size != 1:
             raise ValueError("Device-length ACL graphs require DP size one")
         self._device_kv_lengths = device_kv_lengths
+        if type(block_draft_graph_warmup_max_kv_len) is not int or block_draft_graph_warmup_max_kv_len < -1:
+            raise ValueError("Block graph warmup KV limit must be -1, zero or a positive integer")
+        self._block_draft_graph_warmup_max_kv_len = block_draft_graph_warmup_max_kv_len
         self.max_batch = (max_batch + dp_size - 1) // dp_size
         self._prepared_graphs: dict[tuple[object, ...], AclGraphEntry] = {}
         self._prepared_bindings: set[tuple[object, ...]] = set()
@@ -464,6 +472,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         *,
         eplb: EplbRuntimeState | None = None,
         dspark_adaptive: DSparkAdaptiveGraphInputs | None = None,
+        pre_capture_kv_buckets: bool = False,
     ) -> None:
         self._validate_prepared_input(
             input_ids, positions, metadata, input_embedding, mtp_topk_indices, dspark_adaptive=dspark_adaptive
@@ -476,6 +485,24 @@ class PreparedAclGraphRunner(AclGraphRunner):
             if self._device_kv_lengths
             else (self._kv_page_capacity(input_ids, metadata, dspark_adaptive),)
         )
+        # Only block drafts use this policy. Adaptive target verification
+        # retains its existing lazy KV-capacity growth.
+        pre_capture = (
+            pre_capture_kv_buckets
+            and self._block_draft
+            and self._block_draft_graph_warmup_max_kv_len != -1
+            and not self._device_kv_lengths
+        )
+        if pre_capture:
+            page_size = self.attention_backend.page_size
+            query_width = input_ids.numel() // metadata.block_table.shape[0]
+            tiers = block_draft_kv_capacity_buckets(
+                page_size,
+                metadata.block_table.shape[1],
+                query_width,
+                self._block_draft_graph_warmup_max_kv_len,
+            )
+            capacity_pages = tuple(sorted(set((*capacity_pages, *tiers)), reverse=True))
         previous_count = len(self._prepared_graphs)
         for pages in capacity_pages:
             binding = slot_binding
@@ -494,8 +521,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
                 capacity_pages=pages,
                 eplb=eplb,
                 dspark_adaptive=dspark_adaptive,
+                require_exact_capacity=pre_capture,
             )
-        if self._device_kv_lengths and len(self._prepared_graphs) != previous_count:
+        if (self._device_kv_lengths or pre_capture) and len(self._prepared_graphs) != previous_count:
             logger.info(
                 "Python KV capacity warmup: runner=prepared model=%s rows=%d capacity_pages=%s "
                 "capacity_tokens=%s binding_graphs=%d total_graphs=%d",
@@ -520,11 +548,17 @@ class PreparedAclGraphRunner(AclGraphRunner):
         capacity_pages: int,
         eplb: EplbRuntimeState | None,
         dspark_adaptive: DSparkAdaptiveGraphInputs | None,
+        require_exact_capacity: bool = False,
     ) -> None:
         if binding in self._prepared_graphs:
             return
         pages = capacity_pages
-        if pages and not self._device_kv_lengths and self._fitting_kv_entry(slot_binding, pages) is not None:
+        if (
+            pages
+            and not self._device_kv_lengths
+            and not require_exact_capacity
+            and self._fitting_kv_entry(slot_binding, pages) is not None
+        ):
             return
         self._initialize_task_updates()
         if dspark_adaptive is not None:

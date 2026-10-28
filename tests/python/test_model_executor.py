@@ -2915,7 +2915,7 @@ def test_prepared_mtp_graph_receives_bound_hidden_and_topk(dp_size: int, cp_size
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=object())
     executor.warmup_prepared_graph(tokens, positions, metadata, hidden, topk)
     executor.prepared_graph_runner.warmup_prepared.assert_called_once_with(
-        tokens, positions, metadata, hidden, topk, eplb=None
+        tokens, positions, metadata, hidden, topk, eplb=None, pre_capture_kv_buckets=True
     )
     executor.execute(tokens, positions, metadata, hidden, mtp_topk_indices=topk, enable_graph=True)
     executor.prepared_graph_runner.execute.assert_called_once_with(
@@ -3110,7 +3110,7 @@ def test_executor_preserves_block_draft_admission_and_runner_arguments() -> None
 
     runner.prepare_execution.assert_not_called()
     runner.can_execute.assert_called_once_with(tokens, metadata, None)
-    runner.warmup.assert_called_once_with(tokens, tokens, metadata, None, eplb=None)
+    runner.warmup.assert_called_once_with(tokens, tokens, metadata, None, eplb=None, pre_capture_kv_buckets=False)
     runner.execute.assert_called_once_with(tokens, tokens, metadata, None, graph_key="block-key", eplb=None)
     assert output is runner.execute.return_value
 

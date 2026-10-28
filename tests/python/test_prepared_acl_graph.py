@@ -31,10 +31,12 @@ from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRu
 from xllm.python.model_executor.runners.prepared_acl_graph import PreparedAclGraphRunner
 
 
+@pytest.mark.parametrize("limit", [-1, 0, 4096])
 def test_prepared_capacity_selects_warmed_slot_owned_tables(
-    runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch
+    runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch, limit: int
 ) -> None:
     runner._device_kv_lengths = True
+    runner._block_draft_graph_warmup_max_kv_len = limit
     runner.attention_backend.page_size = 128
     runner.attention_backend.prepare_metadata = Mock(
         side_effect=lambda metadata, **_: SimpleNamespace(
@@ -50,7 +52,7 @@ def test_prepared_capacity_selects_warmed_slot_owned_tables(
         metadata.block_table = (torch.arange(130, dtype=torch.int32) + slot * 1000).view(2, 65)
         metadata.kv_seq_lens_host_values = [512, 512]
         metadata.kv_seq_lens.fill_(511)
-        runner.warmup_prepared(tokens, positions, metadata)
+        runner.warmup_prepared(tokens, positions, metadata, pre_capture_kv_buckets=True)
         bindings.append((tokens, positions, metadata))
     assert runner._capture.call_count == 6
     assert len(runner._prepared_graphs) == 6
@@ -157,9 +159,10 @@ def _isolate_graph_pool(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("request_count", [1, 2, 3])
 @pytest.mark.parametrize("cache_pages", [1, 64])
+@pytest.mark.parametrize("warmup_limit", [-1, 0], ids=["lazy", "prewarmed"])
 @torch.inference_mode()
 def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
-    request_count: int, cache_pages: int
+    request_count: int, cache_pages: int, warmup_limit: int
 ) -> None:
     from xllm.python.attention.backend import LayerCache
     from xllm.python.layers.embedding import HiddenParallelEmbedding
@@ -182,6 +185,7 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
         "num_speculative_tokens": 3,
         "python_graph_backend": "aclgraph",
         "enable_task_pipeline": True,
+        "block_draft_graph_warmup_max_kv_len": warmup_limit,
     }
     torch.manual_seed(31)
     model = Qwen3DSparkForCausalLM(config)
@@ -235,7 +239,7 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
             actual = executor.execute(tokens, positions, metadata, enable_graph=True)
             torch.npu.synchronize()
             torch.testing.assert_close(actual, reference)
-        expected_entries = entries + int(cache_pages > 1)
+        expected_entries = entries + int(cache_pages > 1 and warmup_limit == -1)
         assert len(executor.prepared_graph_runner._prepared_graphs) == expected_entries
         assert executor.prepared_graph_runner.prepared_replays == len(lengths_to_test)
         if request_count > 1:
@@ -1035,10 +1039,12 @@ def test_block_graph_grows_kv_buckets_and_reuses_previous_outputs(
 
 
 @pytest.mark.parametrize("dp_rank", [0, 1])
+@pytest.mark.parametrize("pre_capture", [False, True])
 def test_block_dp_empty_and_active_shards_choose_the_same_kv_bucket(
-    runner: PreparedAclGraphRunner, dp_rank: int
+    runner: PreparedAclGraphRunner, dp_rank: int, pre_capture: bool
 ) -> None:
     runner._block_draft = True
+    runner._block_draft_graph_warmup_max_kv_len = 0
     runner.max_batch = 7
     runner.dp_size = 2
     runner.dp_rank = dp_rank
@@ -1050,7 +1056,7 @@ def test_block_dp_empty_and_active_shards_choose_the_same_kv_bucket(
     metadata.dp_global_kv_max_seq_lens = (0, 2048)
     tokens = torch.zeros(7, dtype=torch.int32)
     positions = torch.zeros_like(tokens)
-    runner.warmup_prepared(tokens, positions, metadata)
+    runner.warmup_prepared(tokens, positions, metadata, pre_capture_kv_buckets=pre_capture)
     for global_kv, expected_pages in ((4090, 64), (8190, 128), (2048, 32)):
         metadata.dp_global_kv_max_seq_lens = (0, global_kv)
         metadata.kv_seq_lens_host_values[:] = [7 if dp_rank == 0 else global_kv]
@@ -1058,6 +1064,128 @@ def test_block_dp_empty_and_active_shards_choose_the_same_kv_bucket(
         entry = runner._prepared_graphs[runner._graph_binding(tokens, positions, metadata)]
         assert entry.static_metadata.block_table.shape[1] == expected_pages
     assert runner._capture.call_count == 3
+
+
+@pytest.mark.parametrize(("limit", "expected"), [(0, [128, 64, 32]), (4096, [32]), (-1, [32])])
+@pytest.mark.parametrize("query_width", [5, 7, 8])
+def test_block_startup_prewarms_all_requested_kv_variants_without_changing_inputs(
+    runner: PreparedAclGraphRunner, limit: int, expected: list[int], query_width: int
+) -> None:
+    runner._block_draft = True
+    runner._block_draft_graph_warmup_max_kv_len = limit
+    runner.max_batch = query_width
+    runner.attention_backend.page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    metadata = _block_metadata(1, query_width, pages=128)
+    tokens = torch.arange(query_width, dtype=torch.int32)
+    positions = torch.zeros_like(tokens)
+    original_slots = metadata.slot_mapping.clone()
+    original_bounds = metadata.kv_seq_lens_host_values.copy()
+
+    def capture(entry: AclGraphEntry, stream: object) -> None:
+        assert metadata.slot_mapping.tolist() == [-1] * query_width
+        entry.graph = Mock()
+        entry.static_output = (torch.ones(query_width, 4), torch.ones(query_width, 8))
+
+    runner._capture.side_effect = capture
+    runner.warmup_prepared(tokens, positions, metadata, pre_capture_kv_buckets=True)
+    assert [entry.kv_capacity_pages for entry in runner._prepared_graphs.values()] == expected
+    assert metadata.kv_seq_lens_host_values == original_bounds
+    torch.testing.assert_close(metadata.slot_mapping, original_slots)
+    outputs = [entry.static_output[1] for entry in runner._prepared_graphs.values()]
+    assert len(outputs) == len(expected)
+    assert len({output.data_ptr() for output in outputs}) == len(expected)
+    runner.warmup_prepared(tokens, positions, metadata, pre_capture_kv_buckets=True)
+    assert runner._capture.call_count == len(expected)
+    for length in (2048, 4097, 8193, 2048, 4097):
+        metadata.kv_seq_lens_host_values[:] = [length]
+        runner.execute_block(tokens, positions, metadata)
+    assert runner._capture.call_count == 3
+    assert len(runner._prepared_graphs) == 3
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 4096])
+def test_draft_warmup_limit_does_not_change_recurrent_target_capture(
+    runner: PreparedAclGraphRunner, limit: int
+) -> None:
+    runner.max_batch = 8
+    runner._block_draft_graph_warmup_max_kv_len = limit
+    runner.attention_backend.is_mla = False
+    runner.attention_backend.page_size = runner.attention_backend.logical_page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    tokens, positions, metadata, inputs = _adaptive_inputs(torch.device("cpu"), table_width=128)
+    inputs = replace(
+        inputs,
+        linear_state_indices=torch.arange(1, 4, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(3, dtype=torch.int32),
+    )
+    inputs.control.fill_(3)
+
+    def capture(entry: AclGraphEntry, stream: object) -> None:
+        assert inputs.control.item() == 2**32 + 3
+        entry.graph = Mock()
+        entry.static_output = (torch.ones(8, 4), torch.ones(8, 8))
+
+    runner._capture.side_effect = capture
+    runner.warmup_prepared(tokens, positions, metadata, dspark_adaptive=inputs, pre_capture_kv_buckets=True)
+    assert [entry.kv_capacity for entry in runner._prepared_graphs.values()] == [4096]
+    assert inputs.control.item() == 3
+    for length, captures in ((4097, 2), (8193, 3), (2048, 3)):
+        metadata.kv_seq_lens_host_values[:] = [length] * 8
+        runner.execute(tokens, positions, metadata, dspark_adaptive=inputs)
+        assert runner._capture.call_count == captures
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 4096])
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_draft_warmup_limit_does_not_add_plain_or_mla_mtp_graphs(
+    runner: PreparedAclGraphRunner, limit: int, is_mla: bool
+) -> None:
+    runner._block_draft_graph_warmup_max_kv_len = limit
+    runner.attention_backend.is_mla = is_mla
+    tokens = torch.arange(2, dtype=torch.int32)
+    metadata = _metadata(2)
+    runner.warmup_prepared(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+    runner.warmup_prepared(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+    assert len(runner._prepared_graphs) == 1
+    assert runner._capture.call_count == 1
+    assert next(iter(runner._prepared_graphs.values())).kv_capacity_pages == 0
+
+
+def test_bounded_startup_keeps_the_current_warmup_shape_even_above_the_limit(runner: PreparedAclGraphRunner) -> None:
+    runner._block_draft = True
+    runner._block_draft_graph_warmup_max_kv_len = 4096
+    runner.max_batch = 7
+    runner.attention_backend.page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    metadata = _block_metadata(1, 7, pages=128)
+    metadata.kv_seq_lens_host_values[:] = [8193]
+    tokens = torch.zeros(7, dtype=torch.int32)
+    runner.warmup_prepared(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+    assert [entry.kv_capacity_pages for entry in runner._prepared_graphs.values()] == [128, 32]
+    runner.execute_block(tokens, tokens, metadata)
+    assert runner._capture.call_count == 2
+
+
+@pytest.mark.parametrize("pre_capture", [False, True])
+def test_lazy_startup_reuses_a_fitting_larger_variant(runner: PreparedAclGraphRunner, pre_capture: bool) -> None:
+    runner._block_draft = True
+    runner._block_draft_graph_warmup_max_kv_len = -1
+    runner.max_batch = 7
+    runner.attention_backend.page_size = 128
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    metadata = _block_metadata(1, 7, pages=128)
+    metadata.kv_seq_lens_host_values[:] = [8193]
+    tokens = torch.zeros(7, dtype=torch.int32)
+    runner.warmup_prepared(tokens, tokens, metadata, pre_capture_kv_buckets=pre_capture)
+    original = next(iter(runner._prepared_graphs.values()))
+    assert original.kv_capacity_pages == 128
+
+    metadata.kv_seq_lens_host_values[:] = [128]
+    runner.warmup_prepared(tokens, tokens, metadata, pre_capture_kv_buckets=pre_capture)
+    assert runner._resolve_entry(tokens, tokens, metadata) is original
+    assert runner._capture.call_count == 1
+    assert len(runner._prepared_graphs) == 1
 
 
 def test_recurrent_target_grows_without_capture_writes_and_retains_old_graphs(runner: PreparedAclGraphRunner) -> None:

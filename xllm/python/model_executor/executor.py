@@ -560,6 +560,7 @@ class ModelExecutor:
                     device_kv_lengths=self._prepared_qwen_mtp_target
                     or self._prepared_qwen_mtp_draft
                     or self._prepared_fixed_recurrent_target,
+                    block_draft_graph_warmup_max_kv_len=int(config.get("block_draft_graph_warmup_max_kv_len", 0)),
                 )
             else:
                 if self._independent_block_draft:
@@ -571,6 +572,7 @@ class ModelExecutor:
                         int(config["max_position_embeddings"]),
                         dp_size,
                         dp_rank,
+                        block_draft_graph_warmup_max_kv_len=int(config.get("block_draft_graph_warmup_max_kv_len", 0)),
                     )
                 else:
                     self.decode_graph_runner = DecodeAclGraphRunner(
@@ -956,7 +958,14 @@ class ModelExecutor:
             else EplbRuntimeState(expert_load_data, eplb_decode_token_mask, is_graph_warmup)
         )
         self.prepared_graph_runner.warmup_prepared(
-            input_ids, positions, metadata, input_embedding, mtp_topk_indices, eplb=eplb, **graph_kwargs
+            input_ids,
+            positions,
+            metadata,
+            input_embedding,
+            mtp_topk_indices,
+            eplb=eplb,
+            pre_capture_kv_buckets=True,
+            **graph_kwargs,
         )
 
     def _validate_dspark_graph_metadata(self, metadata: AttentionMetadata) -> None:
@@ -1094,6 +1103,7 @@ class ModelExecutor:
                 input_ids, positions, metadata, input_embedding, layer_synchronizer, eplb=eplb
             )
         if graph_runner is not None or mtp_topk_indices is not None:
+            from xllm.python.model_executor.runners.block_draft_acl_graph import BlockDraftAclGraphRunner
             from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
 
         graph_kwargs = {}
@@ -1121,6 +1131,8 @@ class ModelExecutor:
                 warmup_kwargs = (
                     {"is_graph_warmup": is_graph_warmup} if type(graph_runner) is DecodeAclGraphRunner else {}
                 )
+                if isinstance(graph_runner, BlockDraftAclGraphRunner):
+                    warmup_kwargs["pre_capture_kv_buckets"] = is_graph_warmup
                 graph_key = graph_runner.warmup(
                     input_ids,
                     positions,
