@@ -72,13 +72,22 @@ def test_config_requires_positive_markov_rank() -> None:
         _config(markov_rank=0)
 
 
-@pytest.mark.parametrize("non_causal", [False, True])
-def test_windowed_dspark_keeps_checkpoint_block_visibility(non_causal: bool) -> None:
-    model = Qwen3DSparkForCausalLM(_config_dict(sliding_window=2048, sliding_window_non_causal=non_causal))
+@pytest.mark.parametrize("non_causal", [None, False, True])
+def test_windowed_dspark_keeps_checkpoint_block_visibility(non_causal: bool | None) -> None:
+    config = _config_dict(sliding_window=2048)
+    if non_causal is not None:
+        config["sliding_window_non_causal"] = non_causal
+    model = Qwen3DSparkForCausalLM(config)
     attention = model.model.layers[0].self_attn.attn
     assert attention.causal == (not non_causal)
     assert attention.sliding_window == 2048
     assert attention.fia_sparse_mode == 0
+
+
+@pytest.mark.parametrize("window", [None, 0, -1])
+def test_dspark_without_window_keeps_non_causal_block_visibility(window: int | None) -> None:
+    model = Qwen3DSparkForCausalLM(_config_dict(sliding_window=window, sliding_window_non_causal=False))
+    assert not model.model.layers[0].self_attn.attn.causal
 
 
 @pytest.mark.parametrize("window", [None, 0, -1, 2048])

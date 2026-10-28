@@ -59,7 +59,6 @@ def _load_reference_quarot_rotation(
 class DFlashQwen3Config(Qwen3Config):
     draft_vocab_size: int = 0
     world_size: int = 1
-    sliding_window_non_causal: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlashQwen3Config:
@@ -85,7 +84,6 @@ class DFlashQwen3Config(Qwen3Config):
             **base.__dict__,
             draft_vocab_size=draft_vocab_size,
             world_size=int(d.get("world_size", base.tp_size * base.dp_size)),
-            sliding_window_non_causal=bool(d.get("sliding_window_non_causal", False)),
         )
 
     def validate(self) -> None:
