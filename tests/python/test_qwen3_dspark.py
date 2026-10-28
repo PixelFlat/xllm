@@ -76,9 +76,17 @@ def test_config_requires_positive_markov_rank() -> None:
 def test_windowed_dspark_keeps_checkpoint_block_visibility(non_causal: bool) -> None:
     model = Qwen3DSparkForCausalLM(_config_dict(sliding_window=2048, sliding_window_non_causal=non_causal))
     attention = model.model.layers[0].self_attn.attn
+    assert attention.causal == (not non_causal)
+    assert attention.sliding_window == 2048
+    assert attention.fia_sparse_mode == 0
+
+
+@pytest.mark.parametrize("window", [None, 0, -1, 2048])
+def test_disabled_window_keeps_dspark_full_block_visibility(window: int | None) -> None:
+    model = Qwen3DSparkForCausalLM(_config_dict(sliding_window=window, use_sliding_window=False))
+    attention = model.model.layers[0].self_attn.attn
+    assert attention.sliding_window == 0
     assert not attention.causal
-    assert attention.block_attention_window == 2048
-    assert attention.block_attention_causal == (not non_causal)
 
 
 def test_checkpoint_loads_dspark_heads(monkeypatch: pytest.MonkeyPatch) -> None:

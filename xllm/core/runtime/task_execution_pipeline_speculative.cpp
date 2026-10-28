@@ -53,7 +53,7 @@ bool TaskExecutionPipeline::block_draft() const {
 
 bool TaskExecutionPipeline::block_draft_graphs() const {
   return speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
-         speculative_capacity_->prepared_dflash2_graphs;
+         speculative_capacity_->kind == SpeculativeTaskKind::DFLASH2;
 }
 
 uint32_t TaskExecutionPipeline::draft_calls(const SpeculativeSlot& slot) const {
@@ -331,6 +331,12 @@ Status TaskExecutionPipeline::create(
       static_cast<uint64_t>(capacity.num_speculative_tokens) + 1;
   const uint64_t rows =
       static_cast<uint64_t>(common.model.max_sequences) * width;
+  if (capacity.kind == SpeculativeTaskKind::DFLASH2 &&
+      common.max_graph_batch_size != 0 &&
+      capacity.num_speculative_tokens > 16) {
+    return invalid(
+        "DFlash2 graph execution supports 1..16 speculative tokens.");
+  }
   if (common.model.enable_linear_attention &&
       !capacity.hybrid_recurrent_target &&
       (capacity.kind != SpeculativeTaskKind::MTP ||

@@ -944,13 +944,12 @@ def test_block_graph_replay_matches_eager_after_kv_length_changes(
         is_spec_verify=False,
     )
     layer = SimpleNamespace(
-        causal=False,
+        causal=bool(block_causal),
         fia_use_attention_mask=window is not None,
-        fia_sparse_mode=4 if window is not None else None,
+        fia_sparse_mode=0 if block_causal is not None else (4 if window is not None else None),
         fia_pre_tokens=window - 1 if window is not None else 2147483647,
         fia_next_tokens=width - 1,
-        block_attention_window=window if block_causal is not None else 0,
-        block_attention_causal=block_causal,
+        sliding_window=window if block_causal is not None else 0,
     )
     runner = BlockDraftAclGraphRunner(torch.nn.Identity(), backend, device, 1, capacity)
     entry = runner._allocate_entry(tokens, tokens, metadata)
@@ -1040,6 +1039,54 @@ def test_block_attention_shares_masks_per_forward_and_refreshes_device_lengths(m
     assert metadata.kv_seq_lens_host_values == [6, 4]
 
 
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("causal", [False, True])
+def test_block_mask_matches_speculators_visibility(width: int, causal: bool) -> None:
+    anchors = [0, 2047, 2048, 2049, 8192]
+    capacity = max(anchors) + width + 7
+    lengths = torch.tensor([anchor + width for anchor in anchors], dtype=torch.int32)
+    prepared = SimpleNamespace(device_kv_lengths=lengths, query_lengths=[width] * len(anchors), kv_capacity=capacity)
+    layer = SimpleNamespace(sliding_window=2048, causal=causal, fia_sparse_mode=0)
+    mask = _ordinary_backend()._block_attention_mask(prepared, layer)
+    expected = torch.ones(len(anchors), 1, width, capacity, dtype=torch.bool)
+    for batch, anchor in enumerate(anchors):
+        expected[batch, 0, :, max(0, anchor - 2048) : anchor] = False
+        for row in range(width):
+            block_end = anchor + row + 1 if causal else anchor + width
+            expected[batch, 0, row, anchor:block_end] = False
+    torch.testing.assert_close(mask, expected)
+    assert mask.is_contiguous()
+
+
+def test_windowed_draft_masks_are_cached_by_causality_and_refreshed_each_forward() -> None:
+    backend = _ordinary_backend()
+    metadata = _ordinary_metadata(paged=True)
+    metadata.q_seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = [2, 4]
+    metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=True)
+    prepared = metadata.prepared_attention_state
+    causal = SimpleNamespace(sliding_window=2, causal=True, fia_sparse_mode=0)
+    non_causal = SimpleNamespace(sliding_window=2, causal=False, fia_sparse_mode=0)
+    backend.prepare(metadata)
+    first = backend._block_attention_mask(prepared, causal)
+    assert backend._block_attention_mask(prepared, causal) is first
+    assert backend._block_attention_mask(prepared, non_causal) is not first
+    for row in range(2):
+        assert torch.where(~first[0, 0, row])[0].tolist() == list(range(2, 5 + row))
+
+    metadata.kv_seq_lens.copy_(torch.tensor([4, 3], dtype=torch.int32))
+    backend.prepare(metadata)
+    after = backend._block_attention_mask(prepared, causal)
+    assert after is not first
+    assert torch.where(~after[0, 0, 0])[0].tolist() == [0, 1, 2]
+    assert after[0, :, :, 4:].all()
+
+
+def test_ordinary_sliding_attention_does_not_acquire_block_geometry() -> None:
+    layer = SimpleNamespace(sliding_window=2048, causal=True, fia_sparse_mode=None)
+    assert not NpuPagedAttentionBackend._uses_block_draft_window(layer)
+
+
 @pytest.mark.parametrize("prepared_lengths", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 def test_windowed_draft_uses_explicit_mask_in_eager_and_prepared_paths(
@@ -1064,11 +1111,10 @@ def test_windowed_draft_uses_explicit_mask_in_eager_and_prepared_paths(
     query = torch.zeros(4, 8, 64)
     cache = torch.zeros(4, 128, 2, 64)
     layer = SimpleNamespace(
-        causal=False,
+        causal=causal,
         fia_use_attention_mask=False,
-        fia_sparse_mode=None,
-        block_attention_window=2,
-        block_attention_causal=causal,
+        fia_sparse_mode=0,
+        sliding_window=2,
     )
     backend._prefill(query, query, query, cache, cache, metadata, 4, layer)
     assert calls[0]["input_layout"] == "BNSD"

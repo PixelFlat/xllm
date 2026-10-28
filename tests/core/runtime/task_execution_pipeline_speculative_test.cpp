@@ -50,6 +50,7 @@ limitations under the License.
 #include "core/framework/speculative/mtp_async_input_builder.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/runtime/dflash2_worker_impl.h"
 #include "core/runtime/dflash_worker_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/task_execution_pipeline.h"
@@ -1034,6 +1035,19 @@ class HybridBlockTaskTestWorker final : public DFlashWorkerImpl {
     return draft_impl_.get()->*&HybridBlockTaskTestWorker::options_;
   }
 
+  static const runtime::Options& outer_options(const DFlashWorkerImpl& worker) {
+    return worker.*&HybridBlockTaskTestWorker::options_;
+  }
+  static const runtime::Options& target_options(
+      const DFlashWorkerImpl& worker) {
+    const auto& target = worker.*&HybridBlockTaskTestWorker::impl_;
+    return target.get()->*&HybridBlockTaskTestWorker::options_;
+  }
+  static const runtime::Options& draft_options(const DFlashWorkerImpl& worker) {
+    const auto& draft = worker.*&HybridBlockTaskTestWorker::draft_impl_;
+    return draft.get()->*&HybridBlockTaskTestWorker::options_;
+  }
+
   std::optional<ForwardOutput> step(const LlmForwardInput& input) override {
     observed_tokens = input.json_object_states.front().snapshot().token_ids;
     ForwardOutput output;
@@ -1099,31 +1113,36 @@ TEST_F(HybridBlockWorkerOptionsTest, FixedDflash2LeavesKeepPreparedGraphs) {
     ASSERT_TRUE(write_model_type(model_type));
     runtime::Options config = options();
     config.speculative_algorithm("DFlash2");
-    HybridBlockTaskTestWorker worker(device_, config);
-    EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
-    EXPECT_TRUE(worker.outer_options().enable_schedule_overlap());
-    EXPECT_TRUE(worker.target_options().enable_task_pipeline());
-    EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
-    EXPECT_TRUE(worker.target_options().enable_graph());
-    EXPECT_TRUE(worker.draft_options().enable_graph());
-    EXPECT_TRUE(worker.target_options().enable_graph_aux_hidden_states());
-    EXPECT_FALSE(worker.draft_options().enable_graph_aux_hidden_states());
-    EXPECT_EQ(worker.draft_options().num_decoding_tokens(), 8);
-    EXPECT_EQ(worker.draft_options().num_speculative_tokens(), 0);
+    DFlash2WorkerImpl worker(ParallelArgs(0, 1, 1, nullptr), device_, config);
+    const auto& outer = HybridBlockTaskTestWorker::outer_options(worker);
+    const auto& target = HybridBlockTaskTestWorker::target_options(worker);
+    const auto& draft = HybridBlockTaskTestWorker::draft_options(worker);
+    EXPECT_TRUE(outer.enable_task_pipeline());
+    EXPECT_TRUE(outer.enable_schedule_overlap());
+    EXPECT_TRUE(target.enable_task_pipeline());
+    EXPECT_TRUE(draft.enable_task_pipeline());
+    EXPECT_TRUE(target.enable_graph());
+    EXPECT_TRUE(draft.enable_graph());
+    EXPECT_TRUE(target.enable_graph_aux_hidden_states());
+    EXPECT_FALSE(draft.enable_graph_aux_hidden_states());
+    EXPECT_EQ(draft.num_decoding_tokens(), 8);
+    EXPECT_EQ(draft.num_speculative_tokens(), 0);
   }
 }
 
 TEST_F(HybridBlockWorkerOptionsTest,
        WiderDflash2RecurrentLeavesKeepPreparedGraphs) {
   ASSERT_TRUE(write_model_type("qwen3_5_text"));
-  auto config = options();
+  runtime::Options config = options();
   config.speculative_algorithm("DFlash2").num_speculative_tokens(15);
-  HybridBlockTaskTestWorker worker(device_, config);
-  EXPECT_TRUE(worker.target_options().enable_task_pipeline());
-  EXPECT_TRUE(worker.draft_options().enable_task_pipeline());
-  EXPECT_TRUE(worker.target_options().enable_graph());
-  EXPECT_TRUE(worker.draft_options().enable_graph());
-  EXPECT_EQ(worker.draft_options().num_decoding_tokens(), 16);
+  DFlash2WorkerImpl worker(ParallelArgs(0, 1, 1, nullptr), device_, config);
+  const auto& target = HybridBlockTaskTestWorker::target_options(worker);
+  const auto& draft = HybridBlockTaskTestWorker::draft_options(worker);
+  EXPECT_TRUE(target.enable_task_pipeline());
+  EXPECT_TRUE(draft.enable_task_pipeline());
+  EXPECT_TRUE(target.enable_graph());
+  EXPECT_TRUE(draft.enable_graph());
+  EXPECT_EQ(draft.num_decoding_tokens(), 16);
 }
 
 TEST_F(HybridBlockWorkerOptionsTest,
@@ -2908,9 +2927,24 @@ TEST_F(SpeculativePipelineTest,
   EXPECT_FALSE(draft_->context_warmup.back());
 }
 
+TEST_F(SpeculativePipelineTest, DFlash2RejectsUnsupportedGraphWidth) {
+  capacity_.kind = SpeculativeTaskKind::DFLASH2;
+  capacity_.num_speculative_tokens = 17;
+  capacity_.common.max_graph_batch_size = 18;
+  capacity_.selector_top_k = 1;
+  const Status status = TaskExecutionPipeline::create(
+      state_thread_,
+      {*target_, *target_executor_, target_cache_},
+      {*draft_, *draft_executor_, draft_cache_},
+      capacity_,
+      pipeline_);
+  EXPECT_FALSE(status.ok());
+  EXPECT_NE(status.message().find("1..16"), std::string::npos);
+  EXPECT_EQ(pipeline_, nullptr);
+}
+
 TEST_F(SpeculativePipelineTest, DFlash2GraphsWarmBothSlotsBeforeServing) {
   capacity_.kind = SpeculativeTaskKind::DFLASH2;
-  capacity_.prepared_dflash2_graphs = true;
   capacity_.common.model.max_sequences = 1;
   capacity_.common.slot_count = 2;
   capacity_.common.max_graph_batch_size = 8;
@@ -2956,7 +2990,6 @@ TEST_F(SpeculativePipelineTest,
        DFlash2GraphContextKeepsPaddingAsRequestsRetire) {
   configure_dspark_batch_graphs();
   capacity_.kind = SpeculativeTaskKind::DFLASH2;
-  capacity_.prepared_dflash2_graphs = true;
   capacity_.selector_top_k = 1;
   create();
   ASSERT_NE(pipeline_, nullptr);

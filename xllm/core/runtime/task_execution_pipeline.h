@@ -109,7 +109,6 @@ struct SpeculativeTaskCapacity {
   // Reuse the refreshed final row for the next admitted first proposal.
   bool reuse_prefix_refresh_output = false;
   bool unified_graph = false;
-  bool prepared_dflash2_graphs = false;
   bool adaptive_target_verify = false;
   bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;

@@ -82,6 +82,13 @@ def test_top_level_and_nested_rope_config_formats_are_supported() -> None:
     assert nested_rope.rope_theta == 1e7
 
 
+def test_windowed_dflash_preserves_non_causal_block_visibility() -> None:
+    model = DFlashQwen3Model(_config(sliding_window=2048), torch.float32, torch.device("cpu"))
+    attention = model.layers[0].self_attn.attn
+    assert attention.sliding_window == 2048
+    assert not attention.causal
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

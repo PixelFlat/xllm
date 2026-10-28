@@ -59,6 +59,14 @@ class Qwen3DSparkConfig(DFlashQwen3Config):
 class Qwen3DSparkModel(DFlashQwen3Model):
     """DFlash draft backbone used with DSpark-specific output heads."""
 
+    def __init__(self, cfg: Qwen3DSparkConfig, dtype: torch.dtype, device: torch.device) -> None:
+        super().__init__(
+            cfg,
+            dtype,
+            device,
+            causal=cfg.sliding_window > 0 and not cfg.sliding_window_non_causal,
+        )
+
 
 class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
     model: Qwen3DSparkModel

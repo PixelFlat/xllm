@@ -76,7 +76,7 @@ class DFlashQwen3Config(Qwen3Config):
                 "beta_slow": d["rope_scaling_beta_slow"],
                 "attention_factor": d["rope_scaling_attn_factor"],
             }
-        if normalized_config.get("sliding_window") is None:
+        if normalized_config.get("sliding_window") is None or d.get("use_sliding_window") is False:
             normalized_config["sliding_window"] = 0
 
         base = Qwen3Config.from_dict(normalized_config)
@@ -162,21 +162,6 @@ class DFlashContextProjection(nn.Module):
             self.weight.copy_(rotated_weight)
 
 
-class DFlashQwen3DecoderLayer(Qwen3DecoderLayer):
-    def __init__(
-        self,
-        cfg: DFlashQwen3Config,
-        layer_id: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        causal: bool = False,
-    ) -> None:
-        super().__init__(cfg, layer_id, dtype, device, causal=causal)
-        if cfg.sliding_window > 0:
-            self.self_attn.attn.block_attention_window = cfg.sliding_window
-            self.self_attn.attn.block_attention_causal = not cfg.sliding_window_non_causal
-
-
 class DFlashQwen3Model(Qwen3Model):
     @property
     def context_projection_weight(self) -> torch.Tensor:
@@ -188,19 +173,25 @@ class DFlashQwen3Model(Qwen3Model):
         dtype: torch.dtype,
         device: torch.device,
         *,
-        decoder_layer_type: type[Qwen3DecoderLayer] = DFlashQwen3DecoderLayer,
+        decoder_layer_type: type[Qwen3DecoderLayer] = Qwen3DecoderLayer,
+        causal: bool = False,
     ) -> None:
         super().__init__(
             cfg,
             dtype,
             device,
-            causal=False,
+            causal=causal,
             create_embedding=False,
             decoder_layer_type=decoder_layer_type,
         )
         self.cfg = cfg
         self.dtype = dtype
         self.device = device
+        for layer in self.layers:
+            # Standard block drafts use an explicit mask. Specialized draft
+            # layers retain their own FIA policy, such as DFlash2's band mode.
+            if layer.self_attn.attn.fia_sparse_mode is None:
+                layer.self_attn.attn.fia_sparse_mode = 0
         self.fc = DFlashContextProjection(
             cfg.hidden_size,
             cfg.tp_size,
