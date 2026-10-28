@@ -51,6 +51,11 @@ bool TaskExecutionPipeline::block_draft() const {
   return speculative_capacity_->kind != SpeculativeTaskKind::MTP;
 }
 
+bool TaskExecutionPipeline::block_draft_graphs() const {
+  return speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
+         speculative_capacity_->prepared_dflash2_graphs;
+}
+
 uint32_t TaskExecutionPipeline::draft_calls(const SpeculativeSlot& slot) const {
   return block_draft() ? 1U : slot.draft_steps;
 }
@@ -684,7 +689,7 @@ Status TaskExecutionPipeline::initialize_speculative() {
             max_batch_size / width * rows_per_sequence);
         invocation->captured_graph_batch_sizes.reserve(
             invocation->graph_batch_sizes.size());
-      } else if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
+      } else if (block_draft_graphs() ||
                  speculative_capacity_->hybrid_recurrent_target) {
         invocation->graph_batch_sizes =
             decode_graph_batch_sizes(max_batch_size / width);
@@ -1037,13 +1042,13 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
     return invalid(
         "Adaptive MTP requires prewarmed target/draft graph buckets.");
   }
-  if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
-      capacity_.max_graph_batch_size != 0 && slot.decode && count != 0 &&
-      !input.input_params.meta.is_graph_warmup &&
+  if (block_draft_graphs() && capacity_.max_graph_batch_size != 0 &&
+      slot.decode && count != 0 && !input.input_params.meta.is_graph_warmup &&
       (slot.target_padded_batch_size == 0 ||
        slot.drafts.front()->padded_batch_size == 0)) {
     return invalid(
-        "DSpark graph task requires prewarmed Target and Draft batch buckets.");
+        "Block draft graph task requires prewarmed Target and Draft batch "
+        "buckets.");
   }
   slot.rows = static_cast<uint32_t>(count);
   slot.model_tokens = static_cast<uint32_t>(host.token_ids.size());
@@ -1171,8 +1176,7 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
       return status;
     }
   }
-  if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK &&
-      capacity_.max_graph_batch_size != 0) {
+  if (block_draft_graphs() && capacity_.max_graph_batch_size != 0) {
     const auto& invocation = *slot.drafts.front();
     const uint32_t graph_rows =
         input.input_params.meta.is_graph_warmup
@@ -1181,7 +1185,8 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
             : invocation.padded_batch_size;
     if (!input.input_params.meta.is_graph_warmup &&
         !invocation.captured_graph_kv_capacities.contains(graph_rows)) {
-      return invalid("DSpark graph task requires a warmed Draft Slot binding.");
+      return invalid(
+          "Block draft graph task requires a warmed Draft Slot binding.");
     }
   }
   if (slot.verify) {
@@ -1734,12 +1739,12 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
   // different draft buckets. Always visit the draft bindings independently.
   if (!block_draft()) {
     warmup_draft_graphs(input);
-  } else if ((speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
+  } else if ((block_draft_graphs() ||
               speculative_capacity_->hybrid_recurrent_target) &&
              padded_batch_size != 0) {
     // Prefill and idle warmup do not plan the expanded decode bindings.
-    // Drafts own non-causal query blocks (N rows for DSpark, N+1 for DFlash2),
-    // independently of the target's padded (N+1)-wide verification shape.
+    // DSpark has N query rows; DFlash2 includes its anchor for N+1 rows.
+    // Capture each final draft Slot binding independently of target padding.
     for (auto& task_slot : slots_) {
       auto& slot = *task_slot->speculative;
       auto& binding = *slot.drafts.front()->input;
@@ -2573,7 +2578,7 @@ Status TaskExecutionPipeline::prepare_speculative(
       slot.context_slots = prefix(
           slot.context_slots_storage,
           slot.verify || speculative_capacity_->hybrid_recurrent_target ||
-                  speculative_capacity_->kind == SpeculativeTaskKind::DSPARK
+                  block_draft_graphs()
               ? slot.validate_input->tokens().numel()
               : slot.rows * width);
     }
@@ -2590,7 +2595,7 @@ Status TaskExecutionPipeline::prepare_speculative(
       auto& binding = *invocation.input;
       if (block_draft()) {
         binding.model_params().embedding.input_embedding = torch::Tensor();
-        if (speculative_capacity_->kind == SpeculativeTaskKind::DSPARK ||
+        if (block_draft_graphs() ||
             speculative_capacity_->hybrid_recurrent_target) {
           binding.model_params().enable_graph =
               capacity_.max_graph_batch_size != 0;
@@ -3201,7 +3206,7 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   slot.target_output.hidden_states = slot.target_output.hidden_states.narrow(
       /*dim=*/0, /*start=*/0, slot.rows * width);
   if (block_draft()) {
-    if (speculative_capacity_->kind != SpeculativeTaskKind::DSPARK &&
+    if (!block_draft_graphs() &&
         !speculative_capacity_->hybrid_recurrent_target) {
       slot.target_output.aux_hidden_states =
           slot.target_output.aux_hidden_states.narrow(

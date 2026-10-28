@@ -37,6 +37,7 @@ from xllm.python.attention.backend import (
     has_rope_dim,
     resolve_linear_state_io_indices,
 )
+from xllm.python.attention.block_draft_mask import build_block_draft_mask
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
 )
@@ -979,6 +980,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 )
             return self._prefill_cp(q_3d, k_3d, v_3d, metadata, cp_context, k_cache, v_cache)
 
+        if getattr(layer, "block_attention_window", 0) > 0 and metadata.block_table is None:
+            raise ValueError("windowed block drafts require a paged KV block table")
         kernels.reshape_paged_cache(metadata.slot_mapping, k_3d, v_3d, k_cache, v_cache)
 
         prepared = getattr(metadata, "prepared_attention_state", None)
@@ -989,7 +992,12 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         ):
             return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
         device_lengths = isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None
-        if metadata.is_prefill or metadata.is_chunked_prefill or device_lengths:
+        if (
+            metadata.is_prefill
+            or metadata.is_chunked_prefill
+            or device_lengths
+            or getattr(layer, "block_attention_window", 0) > 0
+        ):
             if self._use_expanded_decode:
                 return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
             return self._prefill(
@@ -1898,6 +1906,20 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
     # ------------------------------------------------------------------
 
     def _block_attention_mask(self, prepared: _PreparedPagedAttention, layer: Attention) -> torch.Tensor:
+        block_window = getattr(layer, "block_attention_window", 0)
+        if block_window > 0:
+            policy = ("block", block_window, int(layer.block_attention_causal))
+            mask = self._block_attention_masks.get(policy)
+            if mask is None:
+                mask = build_block_draft_mask(
+                    prepared.device_kv_lengths,
+                    prepared.query_lengths[0],
+                    prepared.kv_capacity,
+                    block_window,
+                    layer.block_attention_causal,
+                )
+                self._block_attention_masks[policy] = mask
+            return mask
         policy = (layer.fia_pre_tokens, layer.fia_next_tokens) if layer.fia_sparse_mode == 4 else None
         mask = self._block_attention_masks.get(policy)
         if mask is None:
@@ -2034,6 +2056,10 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             k_flat = k_cache.view(k_cache.size(0), block_size, -1)
             v_flat = v_cache.view(v_cache.size(0), block_size, -1)
             prepared = getattr(metadata, "prepared_attention_state", None)
+            if getattr(layer, "block_attention_window", 0) > 0 and (
+                not isinstance(prepared, _PreparedPagedAttention) or prepared.device_kv_lengths is None
+            ):
+                prepared = self.prepare_metadata(metadata, device_kv_lengths=True)
             if isinstance(prepared, _PreparedPagedAttention) and prepared.device_kv_lengths is not None:
                 if layer.causal and prepared.query_lengths[0] != 1:
                     raise ValueError("causal device-length attention requires singleton packed queries")

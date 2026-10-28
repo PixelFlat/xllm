@@ -109,6 +109,7 @@ struct SpeculativeTaskCapacity {
   // Reuse the refreshed final row for the next admitted first proposal.
   bool reuse_prefix_refresh_output = false;
   bool unified_graph = false;
+  bool prepared_dflash2_graphs = false;
   bool adaptive_target_verify = false;
   bool adaptive_draft_step = false;
   bool sparse_dsa_target = false;
@@ -382,6 +383,7 @@ class TaskExecutionPipeline final {
                               bool& run_models,
                               bool& decode);
   bool block_draft() const;
+  bool block_draft_graphs() const;
   Status prepare_recurrent_state(SpeculativeSlot& slot,
                                  const LlmForwardInput& input);
   uint32_t context_hidden_size() const;

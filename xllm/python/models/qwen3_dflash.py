@@ -59,6 +59,7 @@ def _load_reference_quarot_rotation(
 class DFlashQwen3Config(Qwen3Config):
     draft_vocab_size: int = 0
     world_size: int = 1
+    sliding_window_non_causal: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> DFlashQwen3Config:
@@ -84,6 +85,7 @@ class DFlashQwen3Config(Qwen3Config):
             **base.__dict__,
             draft_vocab_size=draft_vocab_size,
             world_size=int(d.get("world_size", base.tp_size * base.dp_size)),
+            sliding_window_non_causal=bool(d.get("sliding_window_non_causal", False)),
         )
 
     def validate(self) -> None:
@@ -160,6 +162,21 @@ class DFlashContextProjection(nn.Module):
             self.weight.copy_(rotated_weight)
 
 
+class DFlashQwen3DecoderLayer(Qwen3DecoderLayer):
+    def __init__(
+        self,
+        cfg: DFlashQwen3Config,
+        layer_id: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        causal: bool = False,
+    ) -> None:
+        super().__init__(cfg, layer_id, dtype, device, causal=causal)
+        if cfg.sliding_window > 0:
+            self.self_attn.attn.block_attention_window = cfg.sliding_window
+            self.self_attn.attn.block_attention_causal = not cfg.sliding_window_non_causal
+
+
 class DFlashQwen3Model(Qwen3Model):
     @property
     def context_projection_weight(self) -> torch.Tensor:
@@ -171,7 +188,7 @@ class DFlashQwen3Model(Qwen3Model):
         dtype: torch.dtype,
         device: torch.device,
         *,
-        decoder_layer_type: type[Qwen3DecoderLayer] = Qwen3DecoderLayer,
+        decoder_layer_type: type[Qwen3DecoderLayer] = DFlashQwen3DecoderLayer,
     ) -> None:
         super().__init__(
             cfg,

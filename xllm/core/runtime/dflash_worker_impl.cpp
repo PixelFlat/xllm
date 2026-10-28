@@ -69,7 +69,8 @@ bool uses_prepared_dflash2_graphs(const runtime::Options& options) {
   }
   const std::string model_type =
       get_model_type(options.model_path(), options.backend());
-  return model_type == "qwen3_5" || model_type == "qwen3_5_text";
+  return model_type == "glm_moe_dsa" || model_type == "qwen3_5" ||
+         model_type == "qwen3_5_text";
 }
 
 // Unsupported prepared block geometries retain the worker-owned hybrid path.
@@ -462,6 +463,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
   capacity.selector_top_k = draft_args.dflash2_selector_top_k();
   capacity.common.sampling_group = sampling_process_group_;
   capacity.is_probabilistic_draft = is_probabilistic_draft_;
+  capacity.prepared_dflash2_graphs = uses_prepared_dflash2_graphs(options_);
   capacity.unified_graph =
       Platform::is_npu() && options_.enable_graph() &&
       ExecutionConfig::get_instance().enable_unified_mtp_graph() &&

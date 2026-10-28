@@ -1092,9 +1092,9 @@ class HybridBlockWorkerOptionsTest : public ::testing::Test {
   std::filesystem::path model_path_;
 };
 
-TEST_F(HybridBlockWorkerOptionsTest,
-       FixedDflash2RecurrentLeavesKeepPreparedGraphs) {
-  for (const std::string model_type : {"qwen3_5", "qwen3_5_text"}) {
+TEST_F(HybridBlockWorkerOptionsTest, FixedDflash2LeavesKeepPreparedGraphs) {
+  for (const std::string model_type :
+       {"glm_moe_dsa", "qwen3_5", "qwen3_5_text"}) {
     SCOPED_TRACE(model_type);
     ASSERT_TRUE(write_model_type(model_type));
     runtime::Options config = options();
@@ -2906,6 +2906,87 @@ TEST_F(SpeculativePipelineTest,
       torch::tensor({{12, 13, 14, 15, 16, 17, 18, 19}}, torch::kInt64)));
   ASSERT_EQ(draft_->context_slots.size(), 6U);
   EXPECT_FALSE(draft_->context_warmup.back());
+}
+
+TEST_F(SpeculativePipelineTest, DFlash2GraphsWarmBothSlotsBeforeServing) {
+  capacity_.kind = SpeculativeTaskKind::DFLASH2;
+  capacity_.prepared_dflash2_graphs = true;
+  capacity_.common.model.max_sequences = 1;
+  capacity_.common.slot_count = 2;
+  capacity_.common.max_graph_batch_size = 8;
+  capacity_.num_speculative_tokens = 7;
+  capacity_.context_hidden_size = 2;
+  capacity_.mask_token_id = 0;
+  capacity_.selector_top_k = 1;
+  draft_->block_draft = true;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+
+  auto prefill = input(false);
+  prefill.input_params.meta.is_graph_warmup = true;
+  EXPECT_TRUE(execute(prefill).is_graph_warmup);
+  EXPECT_TRUE(draft_->forward_inputs.empty());
+
+  auto warmup = input(true);
+  warmup.input_params.meta.is_graph_warmup = true;
+  EXPECT_TRUE(execute(warmup).is_graph_warmup);
+  ASSERT_EQ(draft_->context_slots.size(), 4U);
+  for (uint32_t slot = 1; slot < 3; ++slot) {
+    EXPECT_TRUE(draft_->context_warmup[slot]);
+    EXPECT_TRUE(torch::equal(draft_->context_slots[slot].cpu(),
+                             torch::full({8}, -1, torch::kInt32)));
+  }
+  ASSERT_EQ(draft_->forward_inputs.size(), 1U);
+  EXPECT_EQ(draft_->forward_inputs.front().numel(), 8);
+  const auto target_bindings = target_->graph_warmup_bindings;
+  const auto draft_bindings = draft_->graph_warmup_bindings;
+  ASSERT_EQ(draft_bindings.size(), 2U);
+
+  const auto next = execute(input(true, /*token=*/-1, /*position=*/3));
+  EXPECT_FALSE(next.is_graph_warmup);
+  EXPECT_TRUE(torch::equal(
+      next.sample_output.next_tokens,
+      torch::tensor({{12, 13, 14, 15, 16, 17, 18, 19}}, torch::kInt64)));
+  EXPECT_FALSE(draft_->context_warmup.back());
+  EXPECT_EQ(target_->graph_warmup_bindings, target_bindings);
+  EXPECT_EQ(draft_->graph_warmup_bindings, draft_bindings);
+}
+
+TEST_F(SpeculativePipelineTest,
+       DFlash2GraphContextKeepsPaddingAsRequestsRetire) {
+  configure_dspark_batch_graphs();
+  capacity_.kind = SpeculativeTaskKind::DFLASH2;
+  capacity_.prepared_dflash2_graphs = true;
+  capacity_.selector_top_k = 1;
+  create();
+  ASSERT_NE(pipeline_, nullptr);
+  warmup_dspark_batch_graphs();
+  const auto warmed_context = draft_->context_bindings;
+  const auto target_bindings = target_->graph_warmup_bindings;
+  const auto draft_bindings = draft_->graph_warmup_bindings;
+
+  for (const uint32_t batch_size : {3U, 2U, 1U, 3U}) {
+    execute(dspark_batch_input(batch_size, /*decode=*/false));
+    const auto output =
+        execute(dspark_batch_input(batch_size, /*decode=*/true));
+    EXPECT_EQ(output.sample_output.next_tokens.size(0), batch_size);
+    EXPECT_EQ(output.sample_output.next_tokens.size(1), 8);
+    const int64_t physical_rows = batch_size == 3 ? 32 : batch_size * 8;
+    EXPECT_EQ(draft_->context_hidden.back().size(0), physical_rows);
+    EXPECT_EQ(draft_->context_positions.back().numel(), physical_rows);
+    EXPECT_EQ(draft_->context_slots.back().numel(), physical_rows);
+    EXPECT_NE(std::find(warmed_context.begin(),
+                        warmed_context.end(),
+                        draft_->context_bindings.back()),
+              warmed_context.end());
+    EXPECT_TRUE(draft_->context_slots.back()
+                    .narrow(0, batch_size * 8, physical_rows - batch_size * 8)
+                    .eq(-1)
+                    .all()
+                    .item<bool>());
+    EXPECT_EQ(target_->graph_warmup_bindings, target_bindings);
+    EXPECT_EQ(draft_->graph_warmup_bindings, draft_bindings);
+  }
 }
 
 TEST_F(SpeculativePipelineTest,

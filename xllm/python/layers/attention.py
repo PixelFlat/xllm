@@ -67,6 +67,10 @@ class Attention(nn.Module):
         self.fia_pre_tokens = fia_pre_tokens
         self.fia_next_tokens = fia_next_tokens
         self.fia_use_attention_mask = fia_use_attention_mask
+        # Block drafts use one fixed context window at the block's anchor,
+        # independently of the visibility between synthetic block positions.
+        self.block_attention_window = 0
+        self.block_attention_causal = False
         # External transfers update framework-owned caches only. Derived
         # model-local caches must be reconstructed from those tensors.
         self.cache_transfer_enabled = False

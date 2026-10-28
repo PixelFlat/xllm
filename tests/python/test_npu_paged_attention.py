@@ -907,9 +907,11 @@ def test_block_attention_reads_accepted_device_lengths(width: int, window: int |
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("window", [None, 64])
+@pytest.mark.parametrize("window,block_causal", [(None, None), (64, None), (64, False), (64, True)])
 @torch.inference_mode()
-def test_block_graph_replay_matches_eager_after_kv_length_changes(window: int | None) -> None:
+def test_block_graph_replay_matches_eager_after_kv_length_changes(
+    window: int | None, block_causal: bool | None
+) -> None:
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
     from xllm.python.model_executor.runners.block_draft_acl_graph import BlockDraftAclGraphRunner
@@ -947,6 +949,8 @@ def test_block_graph_replay_matches_eager_after_kv_length_changes(window: int | 
         fia_sparse_mode=4 if window is not None else None,
         fia_pre_tokens=window - 1 if window is not None else 2147483647,
         fia_next_tokens=width - 1,
+        block_attention_window=window if block_causal is not None else 0,
+        block_attention_causal=block_causal,
     )
     runner = BlockDraftAclGraphRunner(torch.nn.Identity(), backend, device, 1, capacity)
     entry = runner._allocate_entry(tokens, tokens, metadata)
@@ -1034,6 +1038,46 @@ def test_block_attention_shares_masks_per_forward_and_refreshes_device_lengths(m
     assert torch.where(~calls[5]["atten_mask"][0, 0, 0])[0].tolist() == [0, 1, 2, 3]
     assert torch.where(~calls[5]["atten_mask"][0, 0, 1])[0].tolist() == [1, 2, 3]
     assert metadata.kv_seq_lens_host_values == [6, 4]
+
+
+@pytest.mark.parametrize("prepared_lengths", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_windowed_draft_uses_explicit_mask_in_eager_and_prepared_paths(
+    prepared_lengths: bool, causal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = _ordinary_backend()
+    metadata = _ordinary_metadata(paged=True)
+    metadata.q_seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+    metadata.q_cu_seq_lens_host_values = [2, 4]
+    metadata.block_table = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
+    metadata.is_chunked_prefill = True
+    metadata.prepared_attention_state = backend.prepare_metadata(metadata, device_kv_lengths=prepared_lengths)
+    metadata.kv_seq_lens.copy_(torch.tensor([5, 3], dtype=torch.int32))
+    backend.prepare(metadata)
+    calls: list[dict] = []
+
+    def _attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs: object) -> tuple:
+        calls.append(kwargs)
+        return query.clone(), torch.empty(0)
+
+    monkeypatch.setattr(torch.ops.npu, "npu_fused_infer_attention_score", _attention)
+    query = torch.zeros(4, 8, 64)
+    cache = torch.zeros(4, 128, 2, 64)
+    layer = SimpleNamespace(
+        causal=False,
+        fia_use_attention_mask=False,
+        fia_sparse_mode=None,
+        block_attention_window=2,
+        block_attention_causal=causal,
+    )
+    backend._prefill(query, query, query, cache, cache, metadata, 4, layer)
+    assert calls[0]["input_layout"] == "BNSD"
+    mask = calls[0]["atten_mask"]
+    assert torch.where(~mask[0, 0, 0])[0].tolist() == ([1, 2, 3] if causal else [1, 2, 3, 4])
+    assert torch.where(~mask[0, 0, 1])[0].tolist() == [1, 2, 3, 4]
+    assert torch.where(~mask[1, 0, 0])[0].tolist() == ([0, 1] if causal else [0, 1, 2])
+    assert mask[0, :, :, 5:].all()
+    assert mask[1, :, :, 3:].all()
 
 
 def test_paged_graph_requires_an_execution_owner() -> None:
