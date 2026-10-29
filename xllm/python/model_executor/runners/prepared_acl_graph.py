@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata, LinearVerifyGraphInputs
+from xllm.python.attention.block_draft_window import block_draft_model_window_context
 from xllm.python.model_executor.dspark_graph_input import DSparkAdaptiveGraphInputs
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState, LayerSynchronizer
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
@@ -74,7 +75,9 @@ class PreparedAclGraphRunner(AclGraphRunner):
     Native Slots own bucket selection and padding. Launch looks up the captured
     binding, uses the caller's task stream and returns a borrowed output whose
     readers must retire before reuse. New Slot bindings require warmup; a warmed
-    block binding may acquire larger compact KV variants on serialized Launch.
+    full-attention block binding may acquire larger compact KV variants on
+    serialized Launch. Window-only drafts retain one complete source-table
+    binding and select a fixed local attention span inside the graph.
     Ordinary device-length decode retains its startup-only capacity tiers.
 
     Block drafts contain one complete equal-width query per request row.
@@ -106,6 +109,11 @@ class PreparedAclGraphRunner(AclGraphRunner):
         self.dp_rank = dp_rank
         self._enable_mega_moe_token_mask = enable_mega_moe_token_mask
         self._block_draft = block_draft
+        self._windowed_block_draft = (
+            block_draft
+            and not getattr(attention_backend, "is_mla", False)
+            and block_draft_model_window_context(model) is not None
+        )
         if not 1 <= spec_verify_width <= 17 or (block_draft and spec_verify_width != 1):
             raise ValueError("Speculative verify graph width must be in [1, 17], with width one for block drafts")
         self._spec_verify_width = spec_verify_width
@@ -212,6 +220,11 @@ class PreparedAclGraphRunner(AclGraphRunner):
             upper = global_upper
         if upper > table_width * page_size:
             raise ValueError("prepared graph KV bounds exceed block-table capacity")
+        if self._windowed_block_draft:
+            # Borrow the complete logical source table, not a growing prefix.
+            # Each windowed layer gathers only its fixed local FIA page span
+            # inside the graph; no full-context mask or KV copy is created.
+            return table_width
         required_pages = (upper + page_size - 1) // page_size
         minimum_pages = 16 + (query_width + page_size - 1) // page_size
         return min(1 << (max(required_pages, minimum_pages) - 1).bit_length(), table_width)
@@ -490,6 +503,7 @@ class PreparedAclGraphRunner(AclGraphRunner):
         pre_capture = (
             pre_capture_kv_buckets
             and self._block_draft
+            and not self._windowed_block_draft
             and self._block_draft_graph_warmup_max_kv_len != -1
             and not self._device_kv_lengths
         )
@@ -695,11 +709,12 @@ class PreparedAclGraphRunner(AclGraphRunner):
             self._prepared_kv_graphs.setdefault(slot_binding, {})[pages] = entry
         if self._block_draft or recurrent_verify:
             logger.info(
-                "Python prepared ACL KV bucket captured: model=%s rows=%d pages=%d capacity=%d",
+                "Python prepared ACL KV bucket captured: model=%s rows=%d pages=%d capacity=%d windowed_draft=%s",
                 type(self.model).__name__,
                 entry.batch_size,
                 pages,
                 pages * page_size,
+                self._windowed_block_draft,
             )
 
     def get_prepared_aux_hidden_states(

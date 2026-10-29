@@ -37,6 +37,11 @@ from xllm.python.attention.backend import (
     has_rope_dim,
     resolve_linear_state_io_indices,
 )
+from xllm.python.attention.block_draft_window import (
+    WindowedBlockTable,
+    block_draft_window_context,
+    prepare_windowed_block_table,
+)
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
 )
@@ -267,7 +272,8 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         self._graph_metadata_updated_in_place = False
         self._use_expanded_decode = False
         self._block_table_i32: torch.Tensor | None = None
-        self._block_attention_masks: dict[tuple[int, int] | tuple[str, int, int] | None, torch.Tensor] = {}
+        self._block_attention_masks: dict[tuple[object, ...], torch.Tensor] = {}
+        self._windowed_block_tables: dict[int, WindowedBlockTable] = {}
         self._actual_seq_lens: list[int] | None = None
         self._actual_seq_q: list[int] = []
         self._actual_seq_kv: list[int] = []
@@ -577,6 +583,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
         # Device KV lengths can change between forwards while the prepared
         # Slot binding stays the same. Masks are shared only within a forward.
         self._block_attention_masks.clear()
+        self._windowed_block_tables.clear()
         self._kda_validated_query_shape = None
         self._graph_metadata_updated_in_place = False
         prepared = getattr(metadata, "prepared_attention_state", None)
@@ -1927,7 +1934,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             mask = mask | (keys > anchors + rows)
         return mask
 
-    def _block_attention_mask(self, prepared: _PreparedPagedAttention, layer: Attention) -> torch.Tensor:
+    def _block_attention_mask(
+        self, prepared: _PreparedPagedAttention, layer: Attention, keys: torch.Tensor | None = None
+    ) -> torch.Tensor:
         block_window = self._uses_block_draft_window(layer)
         if block_window:
             policy = ("block", layer.sliding_window, layer.causal)
@@ -1935,11 +1944,13 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
             policy = ("band", layer.fia_pre_tokens, layer.fia_next_tokens)
         else:
             policy = None
-        mask = self._block_attention_masks.get(policy)
+        cache_key = (policy, prepared.kv_capacity if keys is None else keys.shape[-1], keys is not None)
+        mask = self._block_attention_masks.get(cache_key)
         if mask is None:
             width = prepared.query_lengths[0]
             lengths = prepared.device_kv_lengths.view(-1, 1, 1, 1)
-            keys = torch.arange(prepared.kv_capacity, device=lengths.device).view(1, 1, 1, -1)
+            if keys is None:
+                keys = torch.arange(prepared.kv_capacity, device=lengths.device).view(1, 1, 1, -1)
             mask = keys >= lengths
             if block_window:
                 mask = mask | self._build_block_draft_mask(lengths, keys, width, layer)
@@ -1949,8 +1960,21 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 mask = mask | (keys < query_positions - layer.fia_pre_tokens)
                 mask = mask | (keys > query_positions + layer.fia_next_tokens)
             mask = mask.expand(-1, 1, width, -1).contiguous()
-            self._block_attention_masks[policy] = mask
+            self._block_attention_masks[cache_key] = mask
         return mask
+
+    def _windowed_block_table(self, prepared: _PreparedPagedAttention, left_context: int) -> WindowedBlockTable:
+        table = self._windowed_block_tables.get(left_context)
+        if table is None:
+            table = prepare_windowed_block_table(
+                prepared.block_table,
+                prepared.device_kv_lengths,
+                prepared.query_lengths[0],
+                self.page_size,
+                left_context,
+            )
+            self._windowed_block_tables[left_context] = table
+        return table
 
     def _bounded_paged_graph_attention(
         self,
@@ -2087,7 +2111,16 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 # Slot accepts its prefix. Mask that bounded tail using the
                 # exact device lengths; never read acceptance back to Host.
                 widths = prepared.query_lengths
-                atten_mask = self._block_attention_mask(prepared, layer)
+                left_context = block_draft_window_context(layer)
+                if left_context is None:
+                    atten_mask = self._block_attention_mask(prepared, layer)
+                    block_table = self._block_table_i32
+                    kv_lengths = prepared.actual_seq_kv
+                else:
+                    window = self._windowed_block_table(prepared, left_context)
+                    atten_mask = self._block_attention_mask(prepared, layer, window.key_positions)
+                    block_table = window.block_table
+                    kv_lengths = [window.capacity] * len(widths)
                 # CANN's TND split-fuse interface only accepts compressed
                 # causal masks. BNSD supports the explicit non-causal tail
                 # mask and the same paged KV without a Host length readback.
@@ -2095,6 +2128,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 query = query.transpose(1, 2).contiguous()
                 if (
                     getattr(metadata, "linear_verify_graph", None) is not None
+                    and left_context is None
                     and in_acl_graph()
                     and get_forward_context().acl_graph is not None
                 ):
@@ -2107,9 +2141,9 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                     k_flat,
                     v_flat,
                     atten_mask=atten_mask,
-                    block_table=self._block_table_i32,
+                    block_table=block_table,
                     actual_seq_lengths=widths,
-                    actual_seq_lengths_kv=prepared.actual_seq_kv,
+                    actual_seq_lengths_kv=kv_lengths,
                     num_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     scale=self.scale,

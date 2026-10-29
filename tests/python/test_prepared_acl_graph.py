@@ -158,11 +158,11 @@ def _isolate_graph_pool(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
 @pytest.mark.parametrize("request_count", [1, 2, 3])
-@pytest.mark.parametrize("cache_pages", [1, 64])
+@pytest.mark.parametrize("cache_pages,sliding_window", [(1, 0), (64, 0), (64, 2048), (514, 2048)])
 @pytest.mark.parametrize("warmup_limit", [-1, 0], ids=["lazy", "prewarmed"])
 @torch.inference_mode()
 def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
-    request_count: int, cache_pages: int, warmup_limit: int
+    request_count: int, cache_pages: int, sliding_window: int, warmup_limit: int
 ) -> None:
     from xllm.python.attention.backend import LayerCache
     from xllm.python.layers.embedding import HiddenParallelEmbedding
@@ -178,6 +178,7 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
         "head_dim": 64,
         "intermediate_size": 128,
         "max_position_embeddings": cache_pages * 128,
+        "sliding_window": sliding_window,
         "vocab_size": 8,
         "markov_rank": 2,
         "dtype": "bfloat16",
@@ -227,7 +228,12 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
         executor.prepare_metadata(metadata)
         executor.warmup_prepared_graph(tokens, positions, metadata)
         entries = len(executor.prepared_graph_runner._prepared_graphs)
-        lengths_to_test = (8, 13, 6, 16) if cache_pages == 1 else (8, 4090, 4097, 6112, 16)
+        if cache_pages == 1:
+            lengths_to_test = (8, 13, 6, 16)
+        elif cache_pages == 64:
+            lengths_to_test = (8, 4090, 4097, 6112, 16)
+        else:
+            lengths_to_test = (8, 4090, 4097, 16383, 16385, 32767, 32769, 65535, 65537, 16)
         for length in lengths_to_test:
             lengths = torch.arange(request_count, dtype=torch.int32, device="npu:0") + length
             positions.copy_((lengths.view(-1, 1) - 3 + torch.arange(3, device="npu:0")).flatten())
@@ -239,8 +245,11 @@ def test_real_dspark_prepared_graph_matches_eager_with_changing_device_lengths(
             actual = executor.execute(tokens, positions, metadata, enable_graph=True)
             torch.npu.synchronize()
             torch.testing.assert_close(actual, reference)
-        expected_entries = entries + int(cache_pages > 1 and warmup_limit == -1)
+        expected_entries = entries + int(sliding_window == 0 and cache_pages > 1 and warmup_limit == -1)
         assert len(executor.prepared_graph_runner._prepared_graphs) == expected_entries
+        assert executor.prepared_graph_runner._windowed_block_draft == (sliding_window > 0)
+        if sliding_window > 0:
+            assert entries == 1
         assert executor.prepared_graph_runner.prepared_replays == len(lengths_to_test)
         if request_count > 1:
             previous = actual.clone()
@@ -361,6 +370,52 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> PreparedAclGraphRunner:
     result._allocate_entry = Mock(side_effect=AssertionError("owned input allocation"))
     result._fill_entry = Mock(side_effect=AssertionError("whole input copy"))
     return result
+
+
+def test_windowed_block_graph_keeps_full_source_binding_across_context_boundaries(
+    runner: PreparedAclGraphRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner._block_draft = True
+    runner._windowed_block_draft = True
+    runner.max_batch = 16
+    runner.attention_backend.page_size = runner.attention_backend.logical_page_size = 128
+    runner.attention_backend.is_mla = False
+    runner.attention_backend.prepare_metadata = Mock(return_value=object())
+    bindings = []
+    for slot in range(2):
+        tokens = torch.arange(14, dtype=torch.int32)
+        positions = torch.zeros_like(tokens)
+        metadata = _metadata(2)
+        metadata.slot_mapping = torch.full((14,), -1, dtype=torch.int32)
+        metadata.q_seq_lens.fill_(7)
+        metadata.q_cu_seq_lens = torch.tensor([7, 14], dtype=torch.int32)
+        metadata.q_cu_seq_lens_host_values = [7, 14]
+        metadata.block_table = (torch.arange(1026, dtype=torch.int32) + slot * 1026).view(2, 513)
+        metadata.kv_seq_lens_host_values = [16, 16]
+        metadata.kv_seq_lens.fill_(7)
+        metadata.is_chunked_prefill = True
+        runner.warmup_prepared(tokens, positions, metadata, pre_capture_kv_buckets=True)
+        bindings.append((tokens, positions, metadata))
+    assert runner._capture.call_count == 2
+
+    def reject_readback(*args: object, **kwargs: object) -> None:
+        raise AssertionError("window graph admission must not read Device lengths")
+
+    for tokens, positions, metadata in bindings:
+        for bound in (16, 4097, 16385, 32769, 65537, 16):
+            metadata.kv_seq_lens_host_values[:] = [bound, bound]
+            with monkeypatch.context() as guard:
+                for name in ("item", "tolist", "cpu"):
+                    guard.setattr(torch.Tensor, name, reject_readback)
+                entry = runner._resolve_entry(tokens, positions, metadata)
+            assert entry.kv_capacity_pages == 513
+            assert entry.static_metadata.block_table.data_ptr() == metadata.block_table.data_ptr()
+            assert entry.static_metadata.block_table.shape == (2, 513)
+    assert runner._capture.call_count == 2
+    assert len(runner._prepared_graphs) == 2
+    metadata.kv_seq_lens_host_values[:] = [65665, 16]
+    with pytest.raises(ValueError, match="capacity"):
+        runner._resolve_entry(tokens, positions, metadata)
 
 
 @pytest.mark.parametrize("draft_width", [5, 7])

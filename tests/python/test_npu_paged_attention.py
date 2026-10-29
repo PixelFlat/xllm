@@ -1019,8 +1019,11 @@ def test_block_attention_shares_masks_per_forward_and_refreshes_device_lengths(m
     assert calls[0]["atten_mask"] is calls[1]["atten_mask"]
     assert calls[2]["atten_mask"] is calls[3]["atten_mask"]
     assert calls[0]["atten_mask"] is not calls[2]["atten_mask"]
-    assert all(call["block_table"] is calls[0]["block_table"] for call in calls)
+    assert calls[0]["block_table"] is calls[1]["block_table"]
+    assert calls[2]["block_table"] is calls[3]["block_table"]
+    assert calls[0]["block_table"] is not calls[2]["block_table"]
     torch.testing.assert_close(calls[0]["block_table"], torch.tensor([[0], [1]], dtype=torch.int32))
+    torch.testing.assert_close(calls[2]["block_table"], torch.tensor([[0, 0], [1, 1]], dtype=torch.int32))
     assert (~calls[0]["atten_mask"]).sum(dim=-1).tolist() == [[[5, 5]], [[3, 3]]]
     assert torch.where(~calls[2]["atten_mask"][0, 0, 0])[0].tolist() == [1, 2, 3, 4]
     assert torch.where(~calls[2]["atten_mask"][0, 0, 1])[0].tolist() == [2, 3, 4]

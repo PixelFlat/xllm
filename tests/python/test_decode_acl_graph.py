@@ -407,6 +407,32 @@ def test_dspark_graph_capacity_does_not_use_model_maximum() -> None:
     assert entry.static_metadata.kv_seq_lens_host_values == [4096]
 
 
+@pytest.mark.parametrize("sparse_mode", [0, 4], ids=["dspark", "dflash2"])
+def test_windowed_block_draft_reuses_one_source_capacity_across_contexts(sparse_mode: int) -> None:
+    from xllm.python.layers.attention import Attention
+
+    model = nn.ModuleList([Attention(4, 1, 64, 0.125, 2048, 0, fia_sparse_mode=sparse_mode, fia_pre_tokens=2047)])
+    backend = _FakeBlockDraftAttentionBackend()
+    backend.logical_page_size = 128
+    runner = BlockDraftAclGraphRunner(model, backend, torch.device("cpu"), max_batch=1, max_model_len=65537)
+    tokens = torch.arange(2, dtype=torch.int32)
+
+    def prepare_entry(*args: object, graph_key: tuple[object, ...], eplb: object = None) -> None:
+        runner._graphs[graph_key] = object()
+
+    with patch.object(runner, "_prepare_graph_entry", side_effect=prepare_entry) as prepare:
+        for length in (16, 4097, 16385, 32769, 65537, 16):
+            columns = (length + 127) // 128
+            metadata = _block_draft_metadata(torch.zeros(1, columns, dtype=torch.int32))
+            metadata.kv_seq_lens_host_values[:] = [length]
+            metadata.kv_seq_lens.fill_(length)
+            key = runner.warmup(tokens, tokens, metadata, pre_capture_kv_buckets=True)
+            assert key[2] == 513
+    assert prepare.call_count == 1
+    entry = runner._allocate_entry(tokens, tokens, metadata)
+    assert entry.static_metadata.block_table.shape == (1, 513)
+
+
 @pytest.mark.parametrize(("sequence_count", "padded_count"), [(1, 1), (2, 4)])
 def test_block_draft_graph_compacts_reserved_pages_with_live_lengths(sequence_count: int, padded_count: int) -> None:
     runner = _block_draft_runner(max_batch=4)

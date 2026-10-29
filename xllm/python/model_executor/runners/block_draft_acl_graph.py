@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from scripts.logger import logger
 from xllm.python.attention.backend import AttentionBackend, AttentionMetadata
+from xllm.python.attention.block_draft_window import block_draft_model_window_context
 from xllm.python.model_executor.forward_context import AclGraphExecutionState, EplbRuntimeState
 from xllm.python.model_executor.runners.acl_graph import (
     AclGraphEntry,
@@ -40,9 +41,9 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
     decode runner intentionally rejects this packed layout because its graph
     metadata has one row per sequence.  This runner keeps one row per request
     in the paged attention metadata and uses device KV lengths to mask the
-    changing accepted prefix during replay. Page capacity grows in powers of
-    two so FIA avoids planning for the model's full context length while the
-    graph remains reusable across individual page boundaries.
+    changing accepted prefix during replay. Full-attention page capacity grows
+    in powers of two. Window-only drafts keep one full logical source table;
+    FIA receives a fixed small window table selected on Device instead.
 
     Under DP, all ranks pad to the same whole-request bucket and coordinate
     capture/cache presence. The paired key retains each rank's page-capacity
@@ -75,6 +76,9 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         if type(block_draft_graph_warmup_max_kv_len) is not int or block_draft_graph_warmup_max_kv_len < -1:
             raise ValueError("Block graph warmup KV limit must be -1, zero or a positive integer")
         self._block_draft_graph_warmup_max_kv_len = block_draft_graph_warmup_max_kv_len
+        self._windowed_block_draft = (
+            not getattr(attention_backend, "is_mla", False) and block_draft_model_window_context(model) is not None
+        )
 
     def can_execute(
         self,
@@ -216,7 +220,7 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         assert padded_sequences is not None
         local_key = self._graph_key(input_ids, metadata, padded_sequences, query_width)
         capacities = (int(local_key[2]),)
-        if pre_capture_kv_buckets:
+        if pre_capture_kv_buckets and not self._windowed_block_draft:
             page_size = self._logical_page_size
             # The owned-table runner pads its last capacity to a power of two,
             # unlike the prepared runner's clamped source-table view. Include
@@ -266,6 +270,10 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         page_size = self._logical_page_size
         if page_size <= 0:
             raise ValueError("DSpark ACL graph page size must be positive")
+        if self._windowed_block_draft:
+            # Only the logical source table spans the model. The attention
+            # operator receives a small Device-selected window on each replay.
+            return max(1, (self.max_model_len + page_size - 1) // page_size)
         if host_kv_lens is None or len(host_kv_lens) != sequence_count:
             required_cols = int(metadata.block_table.shape[1])
         else:
@@ -315,9 +323,10 @@ class BlockDraftAclGraphRunner(DecodeAclGraphRunner):
         first_capture = entry is None
         if first_capture:
             logger.info(
-                "DSpark ACL graph page-table bucket: capacity=%d source_cols=%d",
+                "DSpark ACL graph page-table bucket: capacity=%d source_cols=%d windowed_draft=%s",
                 page_table_capacity,
                 metadata.block_table.shape[1],
+                self._windowed_block_draft,
             )
             entry = self._allocate_entry(
                 input_ids,
