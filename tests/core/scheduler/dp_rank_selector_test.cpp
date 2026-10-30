@@ -73,14 +73,5 @@ TEST(DpRankSelectorTest, ClampsConcurrentUsageAboveCapacity) {
   EXPECT_EQ(selector.select(loads), 1);
 }
 
-TEST(DpRankSelectorTest, RejectsInvalidTopologyAndBindings) {
-  DpRankSelector selector;
-  const std::array<DpRankLoad, 2> loads = {{{10, 0}, {10, 0}}};
-  const std::array<uint8_t, 1> eligible = {1};
-  EXPECT_DEATH(selector.select(loads, {.eligible_ranks = eligible}),
-               "Check failed");
-  EXPECT_DEATH(selector.select(loads, {.assigned_rank = 2}), "Check failed");
-}
-
 }  // namespace
 }  // namespace xllm

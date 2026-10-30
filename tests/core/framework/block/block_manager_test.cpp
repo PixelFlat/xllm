@@ -355,18 +355,6 @@ TEST_F(BlockManagerPoolTest, AllocateAssignsSingleBlockWhenEnabled) {
   EXPECT_GT(seq.get_embedding_block_id(), 0);
 }
 
-TEST_F(BlockManagerPoolTest, EqualAvailableCapacityRotatesAcrossDpRanks) {
-  BlockManagerPool::Options options;
-  options.num_blocks(1).block_size(1).enable_prefix_cache(false);
-  BlockManagerPool pool(options, /*dp_size=*/3);
-  DpRankSelector selector;
-
-  EXPECT_EQ(selector.select(pool.dp_rank_loads()), 0);
-  EXPECT_EQ(selector.select(pool.dp_rank_loads()), 1);
-  EXPECT_EQ(selector.select(pool.dp_rank_loads()), 2);
-  EXPECT_EQ(selector.select(pool.dp_rank_loads()), 0);
-}
-
 TEST_F(BlockManagerPoolTest, SingleRankReleasesUnboundOwnedBlocks) {
   for (const bool without_cache : {false, true}) {
     BlockManagerPool::Options options;

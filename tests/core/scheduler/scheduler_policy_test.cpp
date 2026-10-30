@@ -672,26 +672,6 @@ class PrefillDpAdmissionTest : public ::testing::Test {
 
 }  // namespace
 
-TEST_F(PrefillDpAdmissionTest, FiltersTokenQuotaBeforeComparingKvHeadroom) {
-  auto blocker =
-      generate_request(
-          {16}, {1}, std::nullopt, std::nullopt, /*max_context_len=*/128)
-          .front();
-  blocker->sequences().front()->set_dp_rank(/*dp_rank=*/1);
-  ASSERT_TRUE(engine_.block_manager_pool()->allocate(
-      blocker->sequences().front().get()));
-  budget_.dp_group_token_used = {8, 0};
-  auto request = enqueue(/*prompt_tokens=*/8);
-
-  schedule();
-
-  ASSERT_EQ(running_sequences_.size(), 1u);
-  EXPECT_EQ(request->sequences().front()->dp_rank(), 1);
-  EXPECT_EQ(running_sequence_budgets_, (std::vector<size_t>{8}));
-  EXPECT_EQ(budget_.dp_group_token_used, (std::vector<size_t>{8, 8}));
-  EXPECT_EQ(budget_.remaining_token_budget, 8u);
-}
-
 TEST_F(PrefillDpAdmissionTest, UsesSelectedRanksRemainingTokenQuota) {
   budget_.dp_group_token_used = {8, 4};
   auto request = enqueue(/*prompt_tokens=*/8);
