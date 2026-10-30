@@ -121,6 +121,11 @@ class ScopedDpRankAssignment final {
 
   ~ScopedDpRankAssignment() {
     if (!committed_ && !sequence_.has_any_blocks()) {
+      if (sequence_.dp_rank() != original_rank_) {
+        sequence_.kv_state().set_prefix_cache_matched(/*matched=*/false);
+        sequence_.host_kv_state().set_prefix_cache_matched(/*matched=*/false);
+        sequence_.clear_host_cache_match();
+      }
       sequence_.set_dp_rank(original_rank_);
     }
   }
@@ -158,12 +163,14 @@ SchedulerPolicy::PrefillPlacement SchedulerPolicy::prepare_prefill_placement(
     return {.status = PrefillPlacementStatus::BUDGET_EXHAUSTED};
   }
 
-  int32_t dp_rank = sequence->dp_rank();
+  const int32_t assigned_rank = sequence->dp_rank();
+  int32_t dp_rank = assigned_rank;
+  std::vector<DpRankLoad> loads;
+  std::vector<uint8_t> prefix_probe_ranks;
   const int32_t max_prefills =
       state.model_args.max_concurrent_prefills_per_dp();
   if (max_prefills > 0 || !budget.dp_group_token_caps.empty()) {
-    const std::vector<DpRankLoad> loads =
-        state.kv_cache_manager->dp_rank_loads();
+    loads = state.kv_cache_manager->dp_rank_loads();
     const size_t dp_size = loads.size();
     CHECK(budget.dp_group_token_caps.empty() ||
           budget.dp_group_token_caps.size() == dp_size);
@@ -211,7 +218,6 @@ SchedulerPolicy::PrefillPlacement SchedulerPolicy::prepare_prefill_placement(
     }
 
     std::vector<uint8_t> eligible_ranks(dp_size, /*value=*/0);
-    std::vector<uint8_t> prefix_probe_ranks;
     if (can_match_prefix) {
       prefix_probe_ranks.resize(dp_size, /*value=*/0);
     }
@@ -253,33 +259,54 @@ SchedulerPolicy::PrefillPlacement SchedulerPolicy::prepare_prefill_placement(
       return {.status = PrefillPlacementStatus::DEFERRED};
     }
   } else if (dp_rank < 0) {
-    dp_rank =
-        state.dp_rank_selector.select(state.kv_cache_manager->dp_rank_loads());
+    loads = state.kv_cache_manager->dp_rank_loads();
+    dp_rank = state.dp_rank_selector.select(loads);
     CHECK_GE(dp_rank, 0);
   }
 
-  sequence->set_dp_rank(dp_rank);
-  allocate_shared_blocks_for(sequence, state);
-  size_t available_tokens = budget.remaining_token_budget;
-  if (!budget.dp_group_token_caps.empty()) {
-    available_tokens = std::min(available_tokens,
-                                budget.dp_group_token_caps[dp_rank] -
-                                    budget.dp_group_token_used[dp_rank]);
+  PrefillPlacementStatus blocked_status =
+      PrefillPlacementStatus::BUDGET_EXHAUSTED;
+  while (true) {
+    sequence->set_dp_rank(dp_rank);
+    allocate_shared_blocks_for(sequence, state);
+    size_t available_tokens = budget.remaining_token_budget;
+    if (!budget.dp_group_token_caps.empty()) {
+      available_tokens = std::min(available_tokens,
+                                  budget.dp_group_token_caps[dp_rank] -
+                                      budget.dp_group_token_used[dp_rank]);
+    }
+    const size_t num_tokens =
+        compute_prefill_tokens(sequence, available_tokens, state);
+    if (num_tokens > 0 && num_tokens <= available_tokens) {
+      return {PrefillPlacementStatus::READY, dp_rank, num_tokens};
+    }
+    const size_t global_needed =
+        compute_prefill_tokens(sequence, budget.remaining_token_budget, state);
+    if (global_needed > 0 && global_needed <= budget.remaining_token_budget &&
+        (batch_mode_.enable_chunked_prefill ||
+         budget.dp_group_token_caps.empty() ||
+         global_needed <= budget.dp_group_token_caps[dp_rank])) {
+      // Any rank that can fit next round keeps the request eligible to wait.
+      blocked_status = PrefillPlacementStatus::DEFERRED;
+    }
+    if (assigned_rank >= 0 || !can_match_prefix) {
+      return {.status = blocked_status};
+    }
+
+    // These are temporary prefix aliases, not an admitted request's cache.
+    // Release them and their probe state before considering another rank.
+    if (prefix_probe_ranks.empty()) {
+      prefix_probe_ranks.resize(loads.size(), /*value=*/1);
+    }
+    prefix_probe_ranks[dp_rank] = 0;
+    state.kv_cache_manager->deallocate(sequence);
+    sequence->set_dp_rank(assigned_rank);
+    dp_rank = state.dp_rank_selector.select(
+        loads, {.eligible_ranks = prefix_probe_ranks});
+    if (dp_rank < 0) {
+      return {.status = blocked_status};
+    }
   }
-  const size_t num_tokens =
-      compute_prefill_tokens(sequence, available_tokens, state);
-  if (num_tokens > 0 && num_tokens <= available_tokens) {
-    return {PrefillPlacementStatus::READY, dp_rank, num_tokens};
-  }
-  const size_t global_needed =
-      compute_prefill_tokens(sequence, budget.remaining_token_budget, state);
-  if (global_needed == 0 || global_needed > budget.remaining_token_budget ||
-      (!batch_mode_.enable_chunked_prefill &&
-       !budget.dp_group_token_caps.empty() &&
-       global_needed > budget.dp_group_token_caps[dp_rank])) {
-    return {.status = PrefillPlacementStatus::BUDGET_EXHAUSTED};
-  }
-  return {.status = PrefillPlacementStatus::DEFERRED};
 }
 
 void SchedulerPolicy::adjust_latency_budget_and_reorder(

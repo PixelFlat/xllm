@@ -31,6 +31,7 @@ limitations under the License.
 #include <vector>
 
 #include "continuous_scheduler.h"
+#include "core/framework/block/hierarchy_block_manager_pool.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/kv_cache_store_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -103,6 +104,9 @@ class FakeEngine : public Engine {
   const Tokenizer* tokenizer() const { return fake_tokenizer_.get(); }
   BlockManagerPool* block_manager_pool() const {
     return fake_block_manager_.get();
+  }
+  void set_block_manager_pool(std::unique_ptr<BlockManagerPool> pool) {
+    fake_block_manager_ = std::move(pool);
   }
   const ModelArgs& model_args() const override { return model_args_; }
   void set_max_concurrent_prefills_per_dp(int32_t limit) {
@@ -833,6 +837,133 @@ TEST_F(PrefillDpAdmissionTest, PrefixHitFitsFullPrefillBeyondRoundBudget) {
   EXPECT_EQ(running_sequence_budgets_, (std::vector<size_t>{1}));
   EXPECT_EQ(budget_.dp_group_token_used, (std::vector<size_t>{1, 0}));
   EXPECT_EQ(budget_.remaining_token_budget, 7u);
+}
+
+TEST_F(PrefillDpAdmissionTest, ProbesOtherRanksAfterInsufficientPrefixHit) {
+  state_.enable_prefix_cache = true;
+  cache_prefix(/*prompt_tokens=*/9, /*dp_rank=*/0);
+  cache_prefix(/*prompt_tokens=*/17, /*dp_rank=*/1);
+  budget_.remaining_token_budget = 8;
+  RequestOutputDispatcher dispatcher(
+      engine_.tokenizer(),
+      /*enable_service_routing=*/false,
+      /*disable_log_stats=*/true,
+      [](std::shared_ptr<Request> /*request*/) {});
+  state_.output_dispatcher = &dispatcher;
+  auto request = enqueue(/*prompt_tokens=*/17);
+  std::optional<Status> failure;
+  request->state().output_func = [&failure](const RequestOutput& output) {
+    failure = output.status;
+    return true;
+  };
+
+  schedule(/*chunked=*/false);
+  dispatcher.wait_completion();
+
+  EXPECT_FALSE(failure.has_value());
+  EXPECT_TRUE(prefill_queue_.empty());
+  ASSERT_EQ(running_sequences_.size(), 1u);
+  EXPECT_EQ(request->sequences().front()->dp_rank(), 1);
+  EXPECT_EQ(request->sequences().front()->kv_cache_tokens_num(), 16u);
+  EXPECT_EQ(running_sequence_budgets_, (std::vector<size_t>{1}));
+  EXPECT_EQ(budget_.dp_group_token_used, (std::vector<size_t>{0, 1}));
+  EXPECT_EQ(budget_.remaining_token_budget, 7u);
+  EXPECT_EQ(engine_.block_manager_pool()->num_used_blocks()[0], 0u);
+}
+
+TEST_F(PrefillDpAdmissionTest, ProbesOtherRanksWithoutRankTokenQuotas) {
+  state_.enable_prefix_cache = true;
+  cache_prefix(/*prompt_tokens=*/9, /*dp_rank=*/1);
+  budget_.remaining_token_budget = 8;
+  budget_.dp_group_token_caps.clear();
+  budget_.dp_group_token_used.clear();
+  RequestOutputDispatcher dispatcher(
+      engine_.tokenizer(),
+      /*enable_service_routing=*/false,
+      /*disable_log_stats=*/true,
+      [](std::shared_ptr<Request> /*request*/) {});
+  state_.output_dispatcher = &dispatcher;
+  auto request = enqueue(/*prompt_tokens=*/9);
+  std::optional<Status> failure;
+  request->state().output_func = [&failure](const RequestOutput& output) {
+    failure = output.status;
+    return true;
+  };
+
+  schedule(/*chunked=*/false);
+  dispatcher.wait_completion();
+
+  EXPECT_FALSE(failure.has_value());
+  EXPECT_TRUE(prefill_queue_.empty());
+  ASSERT_EQ(running_sequences_.size(), 1u);
+  EXPECT_EQ(request->sequences().front()->dp_rank(), 1);
+  EXPECT_EQ(request->sequences().front()->kv_cache_tokens_num(), 8u);
+  EXPECT_EQ(running_sequence_budgets_, (std::vector<size_t>{1}));
+  EXPECT_EQ(budget_.remaining_token_budget, 7u);
+}
+
+TEST_F(PrefillDpAdmissionTest, RankRollbackAllowsAnotherHierarchyPrefixProbe) {
+  BlockManagerPool::Options options;
+  options.num_blocks(32).host_num_blocks(32).block_size(4).enable_prefix_cache(
+      true);
+  engine_.set_block_manager_pool(std::make_unique<HierarchyBlockManagerPool>(
+      options, /*transfer_coordinator=*/nullptr, /*dp_size=*/2));
+  state_.kv_cache_manager = engine_.block_manager_pool();
+  state_.enable_prefix_cache = true;
+  auto running = enqueue(/*prompt_tokens=*/1, /*dp_rank=*/1);
+  schedule(/*chunked=*/false);
+  ASSERT_EQ(running_requests_.size(), 1u);
+  EXPECT_EQ(running_requests_.front(), running);
+  auto waiting = enqueue(/*prompt_tokens=*/9);
+  reserved_full_footprint_[0] =
+      engine_.block_manager_pool()->admission_capacity(/*dp_rank=*/0);
+
+  schedule();
+
+  ASSERT_EQ(prefill_queue_.size(), 1u);
+  Sequence* sequence = waiting->sequences().front().get();
+  EXPECT_EQ(sequence->dp_rank(), -1);
+  EXPECT_FALSE(sequence->has_any_blocks());
+  EXPECT_FALSE(sequence->kv_state().prefix_cache_matched());
+  EXPECT_FALSE(sequence->host_kv_state().prefix_cache_matched());
+
+  cache_prefix(/*prompt_tokens=*/9, /*dp_rank=*/1);
+  reserved_full_footprint_[0] = 0;
+  budget_.remaining_token_budget = 8;
+  budget_.dp_group_token_used = {8, 0};
+  schedule();
+
+  EXPECT_TRUE(prefill_queue_.empty());
+  ASSERT_EQ(running_requests_.size(), 2u);
+  EXPECT_EQ(running_requests_.back(), waiting);
+  EXPECT_EQ(sequence->dp_rank(), 1);
+  EXPECT_EQ(sequence->kv_cache_tokens_num(), 8u);
+  EXPECT_EQ(running_sequence_budgets_.back(), 1u);
+  EXPECT_EQ(budget_.dp_group_token_used, (std::vector<size_t>{8, 1}));
+}
+
+TEST_F(PrefillDpAdmissionTest, PrefixProbeWaitsIfAnyRankFitsNextRoundsQuota) {
+  state_.enable_prefix_cache = true;
+  budget_.dp_group_token_caps = {8, 7};
+  budget_.dp_group_token_used = {7, 0};
+  auto request = enqueue(/*prompt_tokens=*/8);
+
+  schedule(/*chunked=*/false);
+
+  ASSERT_EQ(prefill_queue_.size(), 1u);
+  EXPECT_EQ(prefill_queue_.top(), request);
+  EXPECT_TRUE(running_sequences_.empty());
+  EXPECT_EQ(request->sequences().front()->dp_rank(), -1);
+  EXPECT_FALSE(request->sequences().front()->has_any_blocks());
+  EXPECT_EQ(budget_.dp_group_token_used, (std::vector<size_t>{7, 0}));
+
+  budget_.dp_group_token_used = {0, 0};
+  schedule(/*chunked=*/false);
+
+  EXPECT_TRUE(prefill_queue_.empty());
+  ASSERT_EQ(running_sequences_.size(), 1u);
+  EXPECT_EQ(request->sequences().front()->dp_rank(), 0);
+  EXPECT_EQ(running_sequence_budgets_, (std::vector<size_t>{8}));
 }
 
 TEST_F(PrefillDpAdmissionTest, PrefixHitEnablesShortFinalLinearChunk) {
