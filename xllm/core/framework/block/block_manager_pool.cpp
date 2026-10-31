@@ -511,7 +511,7 @@ void BlockManagerPool::cache(Sequence* sequence, size_t num_tokens) {
   }
   int32_t dp_rank = get_dp_rank(sequence);
   // Fan out the in-batch publish to the prefix leaf (KV); the composite no-ops
-  // for shapes without a prefix-capable KV leaf (DSV4 / virtual memory).
+  // for shapes without a prefix-capable KV leaf (DSV4).
   static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get())
       ->cache_for_sequence(sequence, num_tokens);
 }

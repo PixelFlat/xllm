@@ -22,6 +22,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/config/kv_cache_config.h"
 #include "core/kv_cache/layout/deepseek_v4_cache_policy.h"
 #include "framework/model/model_args.h"
 #include "runtime/options.h"
@@ -35,6 +36,18 @@ namespace xllm {
 namespace {
 
 class DcpIndexerEstimationTest : public test::DcpIndexerConfigTest {};
+
+class VirtualMemoryPrefixEstimationTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    KVCacheConfig::get_instance().enable_vmm_kvcache(true);
+  }
+
+  void TearDown() override { KVCacheConfig::get_instance() = saved_config_; }
+
+ private:
+  KVCacheConfig saved_config_ = KVCacheConfig::get_instance();
+};
 
 ModelArgs make_standard_args() {
   ModelArgs model_args;
@@ -828,6 +841,39 @@ TEST(KVCacheEstimationTest, MultimodalMtpReservesPerTokenRecurrentCheckpoints) {
   EXPECT_GT(speculative.linear_cache_size_in_bytes(),
             ordinary.linear_cache_size_in_bytes());
   EXPECT_LT(speculative.n_blocks(), ordinary.n_blocks());
+}
+
+TEST_F(VirtualMemoryPrefixEstimationTest, ReservesReusableLinearStateSlots) {
+  ModelArgs model_args = make_standard_args();
+  model_args.model_type("qwen3_5")
+      .full_attention_interval(2)
+      .linear_num_key_heads(2)
+      .linear_num_value_heads(2)
+      .linear_key_head_dim(4)
+      .linear_value_head_dim(8)
+      .linear_conv_kernel_dim(3);
+  runtime::Options options;
+  options.block_size(16)
+      .max_seqs_per_batch(4)
+      .max_tokens_per_batch(64)
+      .max_linear_state_cache_slots(0)
+      .enable_prefix_cache(false)
+      .num_speculative_tokens(0);
+  KVCacheEstimateContext context;
+  context.dtype = torch::kFloat16;
+  context.world_size = 1;
+  context.virtual_memory_cache_size = 1LL << 20;
+  const KVCacheCapacity without_prefix =
+      KVCacheEstimator(model_args).estimate(options, context);
+  options.enable_prefix_cache(true);
+  const KVCacheCapacity with_prefix =
+      KVCacheEstimator(model_args).estimate(options, context);
+
+  EXPECT_GT(with_prefix.num_linear_state_blocks(),
+            without_prefix.num_linear_state_blocks());
+  EXPECT_GT(with_prefix.linear_cache_size_in_bytes(),
+            without_prefix.linear_cache_size_in_bytes());
+  EXPECT_LT(with_prefix.n_blocks(), without_prefix.n_blocks());
 }
 
 #if defined(USE_NPU)

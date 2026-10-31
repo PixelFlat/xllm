@@ -13,6 +13,12 @@ xLLM 可以分别为 KV Cache 和模型权重启用虚拟内存管理（VMM）�
 
 两个开关可以单独启用，也可以同时启用，使 KV Cache 和模型权重共享 VMM 池。仅启用 KV VMM 时继续使用配置的权重加载器，不会隐式启用 `enable_manual_loader`；仅启用权重 VMM 时继续使用物理 KV Cache。权重 VMM 目前仅支持 LLM 后端。模型休眠、唤醒和 fork 需要设置 `enable_vmm_weights=true`。仅启用权重 VMM 时要求 `vmm_elastic=true`，避免固定权重页池占用物理 KV Cache 所需的显存。所有开关和默认值见 [CLI 参数参考](/zh/cli_reference/)。
 
+## 虚拟 KV Cache 的前缀缓存
+
+同时设置 `enable_prefix_cache=true` 和 `enable_vmm_kvcache=true`，可在请求之间复用完整的 KV block。请求结束后，缓存中的 block 保留虚拟地址和物理页。新页分配达到实时显存预算时，管理器会按 LRU 顺序淘汰无人使用的前缀 block，再次尝试分配。仍被请求或 KV 传输使用的 block 会保持驻留；页面上的最后一个 block 被淘汰或归还后，空页才会释放。
+
+前缀匹配沿用物理 KV Cache 的 token 与多模态哈希。Chunked prefill 只发布完整 block；混合注意力模型还需要可恢复的线性状态检查点。此选项不会启用 VMM 的 KV Cache 事件发布。
+
 ## MTP 与虚拟 KV Cache
 
 部署在相同设备上的 MTP target 和 draft 模型可以同时开启 `enable_vmm_kvcache=true`。调度器会一起映射和释放两者的缓存，也支持 target 与 draft 的 KV 张量宽度不同。对于混合注意力模型，只有全注意力层的 KV 张量使用 VMM；卷积与循环状态保持常驻，提前从物理 KV 页池的预算中预留。

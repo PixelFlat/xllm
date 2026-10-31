@@ -120,7 +120,6 @@ std::unique_ptr<BlockManager> maybe_concurrent(
 }
 
 // Choose the paged virtual memory manager or the flat free-list manager.
-// The paged manager does not support prefix caching.
 std::unique_ptr<BlockManager> make_kv_leaf(const BlockManager::Options& kv_opts,
                                            int32_t dp_rank,
                                            VmmKVPageAllocator* page_allocator) {
@@ -372,12 +371,10 @@ CompositeBlockManager::LeafMap build_composite_leaves(
   }
 
   if (options.manager_types().empty()) {
-    // Normal / Qwen / virtual memory: a single KV leaf. Prefix cache is on only
-    // for the flat (non-virtual memory) KV leaf.
+    // Normal / Qwen / virtual memory: a single KV leaf.
     BlockManager::Options kv_opts = options;
     kv_opts.block_type(BlockType::KV);
-    const bool kv_prefix_cache =
-        prefix_cache_on && !options.enable_vmm_kvcache() && kv_participates;
+    const bool kv_prefix_cache = prefix_cache_on && kv_participates;
     kv_opts.enable_prefix_cache(kv_prefix_cache);
     leaves.emplace(
         BlockType::KV,

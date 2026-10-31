@@ -13,6 +13,12 @@ xLLM can use virtual memory management (VMM) independently for the KV Cache and 
 
 Enable either option on its own, or enable both to share the VMM pool between the KV Cache and model weights. KV-only VMM keeps the configured weight loader and does not imply `enable_manual_loader`. Weight-only VMM keeps the physical KV Cache implementation. Weight VMM currently supports the LLM backend. Model sleep, wakeup and fork require `enable_vmm_weights=true`. Weight-only VMM requires `vmm_elastic=true`; a fixed weight pool would consume memory needed by the physical KV Cache. See the [CLI Reference](/en/cli_reference/) for all flags and defaults.
 
+## Prefix caching with virtual KV Cache
+
+Set `enable_prefix_cache=true` together with `enable_vmm_kvcache=true` to reuse complete KV blocks across requests. Cached blocks retain their virtual addresses and physical pages after a request completes. When a new page allocation reaches the live memory budget, the manager evicts unused prefix blocks in LRU order and retries allocation. Blocks still used by a request or KV transfer remain pinned. An empty page is released after its last block is evicted or returned.
+
+Prefix matching uses the same token and multimodal hashes as the physical KV Cache. Chunked prefill publishes only complete blocks; hybrid attention also requires a recoverable linear-state checkpoint. This option does not enable KV Cache event publishing for VMM.
+
 ## MTP with virtual KV Cache
 
 Co-located MTP target and draft models can use `enable_vmm_kvcache=true`. The scheduler maps and releases both caches together, including models whose target and draft KV tensors have different widths. For hybrid attention models, only full-attention KV tensors use VMM; convolution and recurrent states remain resident and are reserved separately from the physical KV page pool.

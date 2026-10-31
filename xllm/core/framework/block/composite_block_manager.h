@@ -60,8 +60,7 @@ class CompositeBlockManager : public BlockManager {
   //                  budget and select its deepest checkpoint.
   //   SWA_COMPRESSED SWA + C4 + C128. Cross-leaf min, C128-stride clamp,
   //                  SWA tail-continuity, exact-repeat pop.
-  //   UNSUPPORTED    Prefix cache off (virtual memory /
-  //   --enable_prefix_cache=false).
+  //   UNSUPPORTED    No prefix-capable leaf or --enable_prefix_cache=false.
   enum class LeafCombination : int8_t {
     FLAT_KV,
     FLAT_KV_LINEAR,

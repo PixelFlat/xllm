@@ -46,11 +46,6 @@ KVCacheManagerFactoryResult KVCacheManagerFactory::create(
           host_validation_options->host_blocks_factor <= 1.0)))
       << "Virtual memory does not support host KV cache offload; set "
          "--host_blocks_factor=0.";
-  if (options.enable_vmm_kvcache() && options.enable_prefix_cache()) {
-    LOG(WARNING) << "Virtual memory does not support prefix caching; "
-                    "disabling prefix caching for this KV cache manager.";
-    options.enable_prefix_cache(false);
-  }
   KVCacheShape shape(kv_cache_capacity, model_args, world_size);
   CHECK(shape.has_key_cache_shape())
       << "KV cache shape must contain a key cache shape";

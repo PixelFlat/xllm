@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <set>
@@ -249,6 +250,21 @@ class TestVmmKVPageAllocator final : public VmmKVPageAllocator {
   std::vector<size_t> admission_page_limits_;
   size_t max_pages_per_dp_;
 };
+
+std::unique_ptr<VmmKVBlockManager> make_vmm_prefix_manager(
+    TestVmmKVPageAllocator& allocator,
+    BlockHasherType hasher_type = BlockHasherType::TEXT) {
+  BlockManager::Options options;
+  options.num_blocks(16).block_size(4).enable_prefix_cache(true).hasher_type(
+      hasher_type);
+  return std::make_unique<VmmKVBlockManager>(options,
+                                             allocator,
+                                             /*num_layers=*/2,
+                                             /*block_mem_size=*/16,
+                                             /*page_size=*/64,
+                                             /*dp_rank=*/0,
+                                             "prefix-cache");
+}
 
 }  // namespace
 
@@ -1254,6 +1270,259 @@ TEST(CompositeBlockManagerTest, PagedShortageReturnsPagesToInjectedAllocator) {
   EXPECT_EQ(allocator.released_pages.size(), 2u);
 }
 
+TEST(CompositeBlockManagerTest, VirtualPrefixRetainsPagesAndReusesBlockIds) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  {
+    VmmKVBlockManager leaf(options,
+                           allocator,
+                           /*num_layers=*/2,
+                           /*block_mem_size=*/16,
+                           /*page_size=*/64,
+                           /*dp_rank=*/0,
+                           "prefix-cache");
+    const std::vector<int32_t> tokens = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<Block> blocks = leaf.allocate(/*num_blocks=*/2);
+    ASSERT_EQ(blocks.size(), 2u);
+    const std::vector<int32_t> block_ids = {blocks[0].id(), blocks[1].id()};
+    leaf.cache(tokens, blocks);
+    leaf.deallocate(blocks);
+    blocks.clear();
+
+    EXPECT_EQ(leaf.num_blocks_in_prefix_cache(), 2u);
+    EXPECT_EQ(leaf.num_used_blocks(), 0u);
+    EXPECT_EQ(leaf.num_free_blocks(), 4u);
+    EXPECT_EQ(allocator.get_num_inuse_virt_pages("prefix-cache", /*dp_rank=*/0),
+              1u);
+    EXPECT_TRUE(allocator.released_pages.empty());
+
+    std::vector<Block> matched = leaf.allocate_shared(tokens);
+    ASSERT_EQ(matched.size(), 2u);
+    EXPECT_EQ(matched[0].id(), block_ids[0]);
+    EXPECT_EQ(matched[1].id(), block_ids[1]);
+    EXPECT_EQ(leaf.num_used_blocks(), 2u);
+    EXPECT_EQ(allocator.allocation_requests.size(), 1u);
+    leaf.deallocate(matched);
+    matched.clear();
+    EXPECT_EQ(leaf.num_used_blocks(), 0u);
+  }
+  EXPECT_EQ(allocator.released_pages.size(), 1u);
+}
+
+TEST(CompositeBlockManagerTest, VirtualPrefixEvictsIdleBlocksUnderPressure) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "prefix-cache");
+  const std::vector<int32_t> tokens(16, 7);
+  std::vector<Block> cached = leaf.allocate(/*num_blocks=*/4);
+  ASSERT_EQ(cached.size(), 4u);
+  const std::vector<int32_t> prefix_ids = {cached[0].id(), cached[1].id()};
+  leaf.cache(tokens, cached);
+  leaf.deallocate(cached);
+  cached.clear();
+  ASSERT_EQ(leaf.num_blocks_in_prefix_cache(), 4u);
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+
+  std::vector<Block> replacement = leaf.allocate(/*num_blocks=*/2);
+  ASSERT_EQ(replacement.size(), 2u);
+  EXPECT_EQ(leaf.num_blocks_in_prefix_cache(), 2u);
+  EXPECT_EQ(leaf.num_used_blocks(), 2u);
+  EXPECT_EQ(allocator.get_num_inuse_virt_pages("prefix-cache", /*dp_rank=*/0),
+            1u);
+  EXPECT_TRUE(allocator.released_pages.empty());
+  std::vector<Block> matched = leaf.allocate_shared(tokens);
+  ASSERT_EQ(matched.size(), 2u);
+  EXPECT_EQ(matched[0].id(), prefix_ids[0]);
+  EXPECT_EQ(matched[1].id(), prefix_ids[1]);
+  leaf.deallocate(matched);
+  matched.clear();
+  leaf.deallocate(replacement);
+  replacement.clear();
+}
+
+TEST(CompositeBlockManagerTest, VirtualPrefixCannotEvictBlocksUsedByASequence) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "prefix-cache");
+  const std::vector<int32_t> tokens(16, 7);
+  std::vector<Block> cached = leaf.allocate(/*num_blocks=*/4);
+  ASSERT_EQ(cached.size(), 4u);
+  leaf.cache(tokens, cached);
+  std::vector<Block> active =
+      leaf.allocate_shared(Slice<int32_t>(tokens, /*size=*/8));
+  ASSERT_EQ(active.size(), 2u);
+  const std::vector<int32_t> active_ids = {active[0].id(), active[1].id()};
+  leaf.deallocate(cached);
+  cached.clear();
+  EXPECT_EQ(leaf.num_used_blocks(), 2u);
+
+  // Only the two idle blocks are evictable; rollback must restore any partial
+  // allocation while preserving the active sequence's virtual addresses.
+  EXPECT_TRUE(leaf.allocate(/*num_blocks=*/3).empty());
+  EXPECT_EQ(leaf.num_blocks_in_prefix_cache(), 2u);
+  EXPECT_EQ(leaf.num_used_blocks(), 2u);
+  EXPECT_EQ(active[0].id(), active_ids[0]);
+  EXPECT_EQ(active[1].id(), active_ids[1]);
+  EXPECT_TRUE(allocator.released_pages.empty());
+
+  leaf.deallocate(active);
+  active.clear();
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+  std::vector<Block> replacement = leaf.allocate(/*num_blocks=*/4);
+  ASSERT_EQ(replacement.size(), 4u);
+  EXPECT_EQ(leaf.num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(leaf.num_used_blocks(), 4u);
+  leaf.deallocate(replacement);
+  replacement.clear();
+}
+
+TEST(CompositeBlockManagerTest, VirtualPrefixHonorsPrecomputedHashAndResume) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "prefix-cache");
+  const std::vector<int32_t> tokens(12, 7);
+  std::vector<XXH3Key> hashes;
+  extend_prefix_hashes(BlockHasherType::TEXT,
+                       MMData(),
+                       tokens,
+                       /*block_size=*/4,
+                       /*boundary_blocks=*/3,
+                       hashes);
+  std::vector<Block> cached = leaf.allocate(/*num_blocks=*/3);
+  ASSERT_EQ(cached.size(), 3u);
+  leaf.cache(tokens, cached, /*existed_shared_blocks_num=*/0, MMData(), hashes);
+  leaf.deallocate(cached);
+  cached.clear();
+
+  std::vector<Block> first = leaf.allocate_shared(
+      Slice<int32_t>(tokens, /*size=*/4), {}, MMData(), hashes);
+  ASSERT_EQ(first.size(), 1u);
+  std::vector<Block> resumed =
+      leaf.allocate_shared(tokens, first, MMData(), hashes);
+  ASSERT_EQ(resumed.size(), 3u);
+  EXPECT_EQ(resumed.front().id(), first.front().id());
+  leaf.deallocate(first);
+  first.clear();
+  EXPECT_EQ(leaf.num_used_blocks(), 3u);
+  leaf.deallocate(resumed);
+  resumed.clear();
+  EXPECT_EQ(leaf.num_used_blocks(), 0u);
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualPrefixIncludesMultimodalContentIdentity) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManager::Options options;
+  options.num_blocks(8).block_size(4).enable_prefix_cache(true).hasher_type(
+      BlockHasherType::MM);
+  VmmKVBlockManager leaf(options,
+                         allocator,
+                         /*num_layers=*/2,
+                         /*block_mem_size=*/16,
+                         /*page_size=*/64,
+                         /*dp_rank=*/0,
+                         "prefix-cache");
+  MMData mm_data;
+  auto& image = mm_data.add(MMType::IMAGE);
+  image.mutable_state().mutable_token_pos() = {1, 1};
+  std::memset(image.mutable_state().mutable_schedule_data().key.data,
+              1,
+              XXH3_128BITS_HASH_VALUE_LEN);
+  const std::vector<int32_t> tokens(8, 7);
+  std::vector<Block> cached = leaf.allocate(/*num_blocks=*/2);
+  ASSERT_EQ(cached.size(), 2u);
+  leaf.cache(tokens, cached, /*existed_shared_blocks_num=*/0, mm_data);
+  leaf.deallocate(cached);
+  cached.clear();
+
+  std::vector<Block> matched = leaf.allocate_shared(tokens, {}, mm_data);
+  ASSERT_EQ(matched.size(), 2u);
+  leaf.deallocate(matched);
+  matched.clear();
+  image.mutable_state().mutable_schedule_data().key.data[0] = 2;
+  EXPECT_TRUE(leaf.allocate_shared(tokens, {}, mm_data).empty());
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualPrefixExactRepeatReleasesRecomputedBlockUsage) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  auto manager = make_vmm_prefix_manager(allocator);
+  const std::vector<int32_t> tokens(8, 1);
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/2);
+  ASSERT_EQ(blocks.size(), 2u);
+  manager->cache(tokens, blocks);
+  manager->deallocate(blocks);
+  blocks.clear();
+  ASSERT_EQ(manager->num_used_blocks(), 0u);
+
+  KVCacheState state;
+  state.add_shared_blocks(
+      BlockType::KV, manager->allocate_shared(tokens), tokens.size());
+  ASSERT_EQ(state.num_blocks(BlockType::KV), 1u);
+  EXPECT_EQ(manager->num_used_blocks(), 1u);
+  EXPECT_EQ(state.kv_cache_tokens_num(), 4u);
+  manager->deallocate(state.blocks(BlockType::KV));
+  state.reset();
+  EXPECT_EQ(manager->num_used_blocks(), 0u);
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 2u);
+}
+
+TEST(CompositeBlockManagerTest, VirtualMemoryPoolReusesCompletedPromptPrefix) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  BlockManagerPool::Options options;
+  options.num_blocks(8)
+      .block_size(4)
+      .enable_vmm_kvcache(true)
+      .enable_prefix_cache(true)
+      .num_layers(2)
+      .slot_size(36)
+      .virtual_block_bytes(16)
+      .model_id("prefix-cache");
+  BlockManagerPool pool(options, /*dp_size=*/1, &allocator);
+  const std::vector<int32_t> tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+  Sequence producer = MakeTestSequence(0, tokens);
+  ASSERT_TRUE(pool.allocate(&producer));
+  producer.kv_state().set_kv_cache_tokens_num(tokens.size());
+  const Slice<Block> produced = producer.kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(produced.size(), 3u);
+  const std::vector<int32_t> prefix_ids = {produced[0].id(), produced[1].id()};
+  pool.deallocate(&producer);
+  EXPECT_EQ(pool.num_blocks_in_prefix_cache()[0], 2u);
+
+  Sequence consumer = MakeTestSequence(1, tokens);
+  ASSERT_TRUE(pool.allocate(&consumer));
+  EXPECT_EQ(consumer.kv_cache_tokens_num(), 8u);
+  EXPECT_EQ(consumer.kv_state().shared_blocks_num(BlockType::KV), 2u);
+  const Slice<Block> consumed = consumer.kv_state().blocks(BlockType::KV);
+  ASSERT_EQ(consumed.size(), 3u);
+  EXPECT_EQ(consumed[0].id(), prefix_ids[0]);
+  EXPECT_EQ(consumed[1].id(), prefix_ids[1]);
+  EXPECT_EQ(allocator.allocation_requests.size(), 1u);
+  pool.deallocate_without_cache(&consumer);
+}
+
 TEST(CompositeBlockManagerTest,
      TotalCapacityChecksEveryAdmissionLeafInCompressedLayout) {
   const BlockManager::Options composite_options =
@@ -1551,6 +1820,111 @@ TEST(CompositeBlockManagerTest,
   allocator.before_available = {};
   EXPECT_EQ(leaf.num_used_blocks(), 0u);
 }
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryPrefixCachePublishesOnlyCompleteChunkBlocks) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  auto manager = make_vmm_prefix_manager(allocator);
+  const std::vector<int32_t> tokens(13, 7);
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/3);
+  ASSERT_EQ(blocks.size(), 3u);
+
+  manager->cache(Slice<int32_t>(tokens, /*size=*/6), blocks);
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 1u);
+  manager->cache(Slice<int32_t>(tokens, /*size=*/9),
+                 blocks,
+                 /*existed_shared_blocks_num=*/1);
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 2u);
+  manager->cache(tokens, blocks, /*existed_shared_blocks_num=*/2);
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 3u);
+
+  std::vector<Block> first =
+      manager->allocate_shared(Slice<int32_t>(tokens, /*size=*/6));
+  ASSERT_EQ(first.size(), 1u);
+  std::vector<Block> resumed = manager->allocate_shared(tokens, first);
+  ASSERT_EQ(resumed.size(), 3u);
+  for (size_t index = 0; index < resumed.size(); ++index) {
+    EXPECT_EQ(resumed[index].id(), blocks[index].id());
+  }
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryPrefixCachePreservesBlocksHeldByTransferLease) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  auto manager = make_vmm_prefix_manager(allocator);
+  const std::vector<int32_t> tokens(16, 7);
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/4);
+  ASSERT_EQ(blocks.size(), 4u);
+  manager->cache(tokens, blocks);
+  std::optional<KVCacheBlockLease> transfer_lease;
+  transfer_lease.emplace(blocks);
+  transfer_lease->release_owner();
+  manager->deallocate(blocks);
+  blocks.clear();
+
+  EXPECT_EQ(manager->num_used_blocks(), 4u);
+  EXPECT_EQ(manager->num_free_blocks(), 0u);
+  EXPECT_TRUE(manager->allocate(/*num_blocks=*/1).empty());
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 4u);
+  EXPECT_TRUE(allocator.released_pages.empty());
+  transfer_lease.reset();
+  EXPECT_EQ(manager->num_used_blocks(), 0u);
+  EXPECT_EQ(manager->num_free_blocks(), 4u);
+  EXPECT_EQ(manager->allocate(/*num_blocks=*/1).size(), 1u);
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryReservationReclaimsCachedOnlyBlocks) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  auto manager = make_vmm_prefix_manager(allocator);
+  const std::vector<int32_t> tokens(16, 7);
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/4);
+  ASSERT_EQ(blocks.size(), 4u);
+  manager->cache(tokens, blocks);
+  manager->deallocate(blocks);
+  blocks.clear();
+
+  ASSERT_TRUE(manager->try_to_reserve(/*need_size=*/4));
+  EXPECT_EQ(manager->num_blocks_in_prefix_cache(), 0u);
+  EXPECT_EQ(manager->num_used_blocks(), 0u);
+  EXPECT_EQ(manager->num_free_blocks(), 4u);
+  const size_t allocation_requests = allocator.allocation_requests.size();
+  std::vector<Block> reserved = manager->allocate(/*num_blocks=*/4);
+  ASSERT_EQ(reserved.size(), 4u);
+  EXPECT_EQ(allocator.allocation_requests.size(), allocation_requests);
+  EXPECT_EQ(manager->num_used_blocks(), 4u);
+}
+
+TEST(CompositeBlockManagerTest,
+     VirtualMemoryPrefixCacheSeparatesImagesWithIdenticalTokenIds) {
+  TestVmmKVPageAllocator allocator(/*dp_size=*/1);
+  auto manager = make_vmm_prefix_manager(allocator, BlockHasherType::MM);
+  const std::vector<int32_t> tokens(12, 7);
+  MMData mm_data;
+  auto& image = mm_data.add(MMType::IMAGE);
+  image.mutable_state().mutable_token_pos() = {4, 4};
+  image.mutable_state().mutable_schedule_data().key.data[0] = 1;
+  std::vector<XXH3Key> hashes;
+  extend_prefix_hashes(BlockHasherType::MM,
+                       mm_data,
+                       tokens,
+                       /*block_size=*/4,
+                       /*boundary_blocks=*/3,
+                       hashes);
+  std::vector<Block> blocks = manager->allocate(/*num_blocks=*/3);
+  ASSERT_EQ(blocks.size(), 3u);
+  manager->cache(
+      tokens, blocks, /*existed_shared_blocks_num=*/0, mm_data, hashes);
+
+  EXPECT_EQ(manager->allocate_shared(tokens, {}, mm_data).size(), 3u);
+  EXPECT_EQ(manager->allocate_shared(tokens, {}, mm_data, hashes).size(), 3u);
+  image.mutable_state().mutable_schedule_data().key.data[0] = 2;
+  std::vector<Block> different_image =
+      manager->allocate_shared(tokens, {}, mm_data);
+  ASSERT_EQ(different_image.size(), 1u);
+  EXPECT_EQ(different_image.front().id(), blocks.front().id());
+}
+
 namespace {
 
 class LinearStateWindowTest : public ::testing::TestWithParam<bool> {
